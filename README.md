@@ -42,7 +42,7 @@ cmake --build build -j 5
 ./build/liftasm
 ```
 
-If you would like to enable CPU-specific optimizations (e.g., -march=native), you can compile with:
+If you would like to enable CPU-specific optimizations (e.g., `-march=native`), you can compile with:
 
 ```shell
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLIFTASM_ENABLE_NATIVE=ON
