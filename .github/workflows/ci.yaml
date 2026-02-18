@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-ubuntu:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            libomp-dev || true
+          # On ubuntu-latest with GCC, OpenMP runtime is usually in libgomp (no extra pkg needed)
+          # Core deps often needed by htslib/curl
+          sudo apt-get install -y --no-install-recommends \
+            zlib1g-dev \
+            libbz2-dev \
+            liblzma-dev \
+            libcurl4-openssl-dev \
+            libssl-dev
+
+      - name: Configure
+        run: |
+          rm -rf build
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          cmake --build build -j 2
+
+      # Optional sanity run (remove if you don't have --help)
+      - name: Run (sanity)
+        run: |
+          ./build/liftasm --help || true

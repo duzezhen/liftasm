@@ -8,10 +8,14 @@ Alignment-based coordinate liftover for assemblies and GFA graphs.
 
 Please note the following requirements before building and running the software:
 
-* `Linux` operating system
-<!-- * cmake version `3.12` or higher
-* Python version `3.6` or higher
-* C++ compiler that supports `C++17` or higher, and the `zlib` library installed (we recommend using GCC version `"7.3.0"` or newer) for building `SynDic_c` -->
+- `Linux` operating system
+- GCC with `C++20` support (GCC ≥ 8)
+- `CMake ≥ 3.20`
+- `zlib`, `bzip2`, `liblzma` (xz)
+- `Git` (for submodules)
+
+Optional:
+- `libcurl` (`htslib` will be built without `libcurl` support if not available)
 
 ## Installation
 

@@ -29,7 +29,10 @@ add_executable(liftasm
 )
 
 target_include_directories(liftasm PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/external/WFA2-lib"
+  "${CMAKE_CURRENT_SOURCE_DIR}/external/minimap2"
+  "${CMAKE_CURRENT_SOURCE_DIR}/external/htslib"
 )
 
 target_link_libraries(liftasm PRIVATE OpenMP::OpenMP_CXX)
