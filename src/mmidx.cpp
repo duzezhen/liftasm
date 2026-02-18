@@ -1,5 +1,5 @@
 #include "../include/mmidx.hpp"
-#include "./include/ThreadPool.hpp"
+#include "../include/ThreadPool.hpp"
 #include "../include/kseq.h"
 #include "../include/progress_tracker.hpp"
 #include "../include/gfa_parser.hpp"
