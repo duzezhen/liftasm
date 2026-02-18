@@ -9,6 +9,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <mutex>
 
 #include "logger.hpp"
 #include "gfa_parser.hpp"

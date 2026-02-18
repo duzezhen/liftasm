@@ -1,6 +1,21 @@
 cmake_minimum_required(VERSION 3.20)
 project(liftasm LANGUAGES C CXX)
 
+# GCC >= 12.2.0
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS "12.2.0")
+    message(FATAL_ERROR
+      "GCC >= 12.2.0 is required, but found ${CMAKE_CXX_COMPILER_VERSION} "
+      "(${CMAKE_CXX_COMPILER}). Please load a newer GCC module (e.g. GCC/12.2.0)."
+    )
+  endif()
+else()
+  message(FATAL_ERROR
+    "This project requires GCC >= 12.2.0. Detected compiler: "
+    "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} (${CMAKE_CXX_COMPILER})."
+  )
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

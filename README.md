@@ -9,7 +9,7 @@ Alignment-based coordinate liftover for assemblies and GFA graphs.
 Please note the following requirements before building and running the software:
 
 - `Linux` operating system
-- GCC with `C++20` support (GCC ≥ 8)
+- `GCC ≥ 12.2.0` (with `C++20` support)
 - `CMake ≥ 3.20`
 - `zlib`, `bzip2`, `liblzma` (xz)
 - `Git` (for submodules)
