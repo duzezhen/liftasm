@@ -1,0 +1,9 @@
+[submodule "external/htslib"]
+	path = external/htslib
+	url = https://github.com/samtools/htslib.git
+[submodule "external/minimap2"]
+	path = external/minimap2
+	url = https://github.com/lh3/minimap2.git
+[submodule "external/WFA2-lib"]
+	path = external/WFA2-lib
+	url = https://github.com/smarco/WFA2-lib.git
