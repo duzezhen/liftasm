@@ -16,10 +16,9 @@ if (LIFTASM_ENABLE_NATIVE)
   add_compile_options($<$<COMPILE_LANGUAGE:C>:-march=native>  $<$<COMPILE_LANGUAGE:CXX>:-march=native>)
 endif()
 
-# OpenMP
 find_package(OpenMP REQUIRED)
 
-# liftasm sources
+# sources
 file(GLOB LIFTASM_SRC CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
 )
@@ -35,7 +34,7 @@ target_include_directories(liftasm PRIVATE
 
 target_link_libraries(liftasm PRIVATE OpenMP::OpenMP_CXX)
 
-# Submodules
+# submodules
 set(EXTERNAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external")
 
 if (NOT EXISTS "${EXTERNAL_DIR}/minimap2/Makefile")
@@ -51,6 +50,13 @@ endif()
 include(ExternalProject)
 set(EXTERNAL_BUILD_DIR "${CMAKE_BINARY_DIR}/external_build")
 
+set(LIFTASM_JOBS_DEFAULT 5)
+if(DEFINED ENV{LIFTASM_JOBS})
+  set(LIFTASM_JOBS "$ENV{LIFTASM_JOBS}")
+else()
+  set(LIFTASM_JOBS "${LIFTASM_JOBS_DEFAULT}")
+endif()
+
 # 1) minimap2 -> libminimap2.a
 set(MINIMAP2_SRC "${EXTERNAL_DIR}/minimap2")
 set(MINIMAP2_LIB "${MINIMAP2_SRC}/libminimap2.a")
@@ -58,7 +64,7 @@ set(MINIMAP2_LIB "${MINIMAP2_SRC}/libminimap2.a")
 ExternalProject_Add(ext_minimap2
   SOURCE_DIR        "${MINIMAP2_SRC}"
   CONFIGURE_COMMAND ""
-  BUILD_COMMAND     ${CMAKE_MAKE_PROGRAM} -C "${MINIMAP2_SRC}" libminimap2.a
+  BUILD_COMMAND     ${CMAKE_MAKE_PROGRAM} -C "${MINIMAP2_SRC}" -j ${LIFTASM_JOBS} libminimap2.a
   INSTALL_COMMAND   ""
   BUILD_BYPRODUCTS  "${MINIMAP2_LIB}"
 )
@@ -83,7 +89,7 @@ ExternalProject_Add(ext_wfa2
     -DCMAKE_BUILD_TYPE=Release
     -DBUILD_SHARED_LIBS=OFF
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-  BUILD_COMMAND     ${CMAKE_COMMAND} --build "${WFA_BUILD}" --config Release
+  BUILD_COMMAND     ${CMAKE_COMMAND} --build "${WFA_BUILD}" --config Release -- -j ${LIFTASM_JOBS}
   INSTALL_COMMAND   ""
   BUILD_BYPRODUCTS  "${WFA2CPP_LIB}" "${WFA2_LIB}"
 )
@@ -100,31 +106,32 @@ set_target_properties(wfa2_static PROPERTIES
 )
 add_dependencies(wfa2_static ext_wfa2)
 
-# 3) htslib -> build static lib
+# 3) htslib -> custom build libhts.a
 set(HTS_SRC "${EXTERNAL_DIR}/htslib")
 set(HTS_LIB "${HTS_SRC}/libhts.a")
 
-ExternalProject_Add(ext_htslib
-  SOURCE_DIR "${HTS_SRC}"
-  BINARY_DIR "${EXTERNAL_BUILD_DIR}/htslib"
-  CONFIGURE_COMMAND ""
-  BUILD_COMMAND
-    /bin/sh -c
+add_custom_command(
+  OUTPUT "${HTS_LIB}"
+  COMMAND /bin/sh -c
     "set -e; cd '${HTS_SRC}'; \
-     ${CMAKE_MAKE_PROGRAM} libhts.a || ${CMAKE_MAKE_PROGRAM}"
-  INSTALL_COMMAND ""
-  BUILD_BYPRODUCTS "${HTS_LIB}"
+     (${CMAKE_MAKE_PROGRAM} -j ${LIFTASM_JOBS} libhts.a) || \
+     (${CMAKE_MAKE_PROGRAM} -j ${LIFTASM_JOBS} && ${CMAKE_MAKE_PROGRAM} -j ${LIFTASM_JOBS} libhts.a)"
+  BYPRODUCTS "${HTS_LIB}"
+  WORKING_DIRECTORY "${HTS_SRC}"
+  COMMENT "Building htslib (libhts.a) in ${HTS_SRC}"
+  VERBATIM
 )
+
+add_custom_target(htslib_build ALL DEPENDS "${HTS_LIB}")
 
 add_library(hts_static STATIC IMPORTED GLOBAL)
 set_target_properties(hts_static PROPERTIES
   IMPORTED_LOCATION "${HTS_LIB}"
-  # htslib headers are under ${HTS_SRC}/htslib/*.h
   INTERFACE_INCLUDE_DIRECTORIES "${HTS_SRC}"
 )
-add_dependencies(hts_static ext_htslib)
+add_dependencies(hts_static htslib_build)
 
-# Link
+# link
 target_link_libraries(liftasm PRIVATE
   minimap2_static
   wfa2cpp_static
@@ -142,4 +149,4 @@ if (NOT HAVE_STD_FILESYSTEM)
   target_link_libraries(liftasm PRIVATE stdc++fs)
 endif()
 
-add_dependencies(liftasm ext_minimap2 ext_wfa2 ext_htslib)
+add_dependencies(liftasm ext_minimap2 ext_wfa2 htslib_build)
