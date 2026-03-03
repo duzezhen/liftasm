@@ -25,8 +25,6 @@ jobs:
             cmake \
             pkg-config \
             libomp-dev || true
-          # On ubuntu-latest with GCC, OpenMP runtime is usually in libgomp (no extra pkg needed)
-          # Core deps often needed by htslib/curl
           sudo apt-get install -y --no-install-recommends \
             zlib1g-dev \
             libbz2-dev \
@@ -43,7 +41,6 @@ jobs:
         run: |
           cmake --build build -j 2
 
-      # Optional sanity run (remove if you don't have --help)
       - name: Run (sanity)
         run: |
           ./build/liftasm --help || true
