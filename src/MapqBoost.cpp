@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 #include <string>
+#include <iomanip>
+#include <sstream>
 
 namespace mapqboost {
 
@@ -167,16 +169,17 @@ static inline uint32_t match_len_cigar(std::string_view s)
     return m;
 }
 
-// ---------------- ctor ----------------
 MapqBooster::MapqBooster(
     const coordmap::CoordMap& map, 
     std::size_t batch_size, uint8_t mapq_low, uint8_t mapq_new, double min_frac, int min_equiv_contigs, bool name_check, 
     int cm_max_hops, uint32_t cm_max_fanout, uint32_t cm_min_len, double cm_min_frac, uint32_t cm_max_total_hits, 
+    double sub_ovlp_frac,
     int threads, int io_threads
 )
     : map_(map)
     , batch_size_(batch_size >= 1 ? batch_size : 20000), mapq_low_(mapq_low), mapq_new_(mapq_new), min_frac_(min_frac), min_equiv_contigs_(min_equiv_contigs), name_check_(name_check)
     , cm_max_hops_(cm_max_hops), cm_max_fanout_(cm_max_fanout), cm_min_len_(cm_min_len), cm_min_frac_(cm_min_frac), cm_max_total_hits_(cm_max_total_hits)
+    , sub_ovlp_frac_(sub_ovlp_frac)
     , threads_((threads <= 0) ? (int)std::max(1u, std::thread::hardware_concurrency()) : threads) , io_threads_(std::max(1, io_threads))
 {}
 
@@ -197,6 +200,19 @@ static inline int32_t get_nm(const bam1_t* b) {
         return (v >= 0) ? v : -1;
     }
     return -1;
+}
+static inline std::string cigar_to_string(const bam1_t* b)
+{
+    const uint32_t* c = bam_get_cigar(b);
+    const uint32_t n = b->core.n_cigar;
+    if (!c || n == 0) return "*";
+    std::string s;
+    s.reserve(n * 5);
+    for (uint32_t i = 0; i < n; ++i) {
+        s += std::to_string(bam_cigar_oplen(c[i]));
+        s += bam_cigar_opchr(bam_cigar_op(c[i]));
+    }
+    return s;
 }
 
 static inline void merge_inplace(std::vector<std::pair<uint32_t,uint32_t>>& ivs) {
@@ -236,9 +252,287 @@ static inline uint32_t overlapped_len(const std::vector<std::pair<uint32_t,uint3
     return tot;
 }
 
+bool MapqBooster::get_query_interval_fwd(const bam1_t* r, uint32_t& qb, uint32_t& qe) const
+{
+    qb = 0; qe = 0;
+    if (!r) return false;
+
+    const uint32_t* cg = bam_get_cigar(r);
+    const uint32_t n   = r->core.n_cigar;
+    if (!cg || n == 0) return false;
+
+    auto aln_q  = [](int op) {
+        return op==BAM_CMATCH || op==BAM_CINS || op==BAM_CEQUAL || op==BAM_CDIFF;
+    };
+    auto read_q = [](int op) {
+        return op==BAM_CMATCH || op==BAM_CINS || op==BAM_CEQUAL || op==BAM_CDIFF || op==BAM_CSOFT_CLIP || op==BAM_CHARD_CLIP;
+    };
+
+    uint32_t qpos = 0;
+    uint32_t L0   = 0;
+    bool started  = false;
+    uint32_t qb_st = 0, qe_st = 0;
+
+    for (uint32_t i = 0; i < n; ++i){
+        const uint32_t len = bam_cigar_oplen(cg[i]);
+        const int       op = bam_cigar_op(cg[i]);
+
+        if (read_q(op)) L0 += len;
+
+        if (aln_q(op)) {
+            if (!started) { qb_st = qpos; started = true; }
+            qpos += len;
+            qe_st = qpos;
+        } else {
+            if (read_q(op)) qpos += len;
+        }
+    }
+
+    if (!started || qb_st >= qe_st) return false;
+
+    if (bam_is_rev(r)) {
+        qb = L0 - qe_st;
+        qe = L0 - qb_st;
+    } else {
+        qb = qb_st;
+        qe = qe_st;
+    }
+    return qb < qe;
+}
+
+bool MapqBooster::query_overlap(uint32_t b1, uint32_t e1, uint32_t b2, uint32_t e2) const
+{
+    return (b1 < e2) && (b2 < e1);
+}
+
+double MapqBooster::query_overlap_frac(uint32_t b1, uint32_t e1, uint32_t b2, uint32_t e2) const
+{
+    if (!(b1 < e2 && b2 < e1)) return 0.0;
+
+    const uint32_t ob = std::max(b1, b2);
+    const uint32_t oe = std::min(e1, e2);
+    const uint32_t ov = oe - ob;
+
+    const uint32_t l1 = e1 - b1;
+    const uint32_t l2 = e2 - b2;
+    const uint32_t den = std::min(l1, l2);
+
+    return den ? (double)ov / (double)den : 0.0;
+}
+
+void MapqBooster::build_subgroups_by_query_overlap(
+    const std::vector<bam1_t*>& group,
+    std::vector<std::vector<bam1_t*>>& out_subgroups, 
+    const sam_hdr_t* hdr
+) const
+{
+    struct Item { bam1_t* b; int end_id; uint32_t qb, qe; };
+
+    std::vector<Item> items;
+    items.reserve(group.size());
+
+    for (bam1_t* b : group) {
+        if (!b) continue;
+        if (!is_mapped(b)) continue;
+
+        uint32_t qb=0, qe=0;
+        if (!get_query_interval_fwd(b, qb, qe)) continue;
+
+        items.push_back(Item{b, read_end_id(b), qb, qe});
+    }
+
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b){
+        if (a.end_id != b.end_id) return a.end_id < b.end_id;
+        if (a.qb != b.qb) return a.qb < b.qb;
+        return a.qe < b.qe;
+    });
+
+    auto find_primary_for_end = [&](int end_id) -> bam1_t* {
+        for (bam1_t* b : group) {
+            if (!b) continue;
+            if (!is_mapped(b)) continue;
+            if (b->core.flag & BAM_FSUPPLEMENTARY) continue;
+            if (read_end_id(b) != end_id) continue;
+            if (is_primary_like(b)) return b;
+        }
+        return nullptr;
+    };
+
+    auto better = [&](bam1_t* a, bam1_t* b) -> bool {
+        // Match length
+        uint32_t mla = match_len_cigar(a);
+        uint32_t mlb = match_len_cigar(b);
+        if (mla != mlb) return mla > mlb;
+
+        // MAPQ
+        if (a->core.qual != b->core.qual) return a->core.qual > b->core.qual;
+
+        // NM
+        int32_t na = get_nm(a); if (na < 0) na = INT32_MAX/2;
+        int32_t nb = get_nm(b); if (nb < 0) nb = INT32_MAX/2;
+        if (na != nb) return na < nb;
+
+        // final stable tiebreak
+        if (a->core.tid != b->core.tid) return a->core.tid < b->core.tid;
+        return a->core.pos < b->core.pos;
+    };
+
+    out_subgroups.clear();
+    if (items.empty()) return;
+
+    std::vector<char> used(items.size(), 0);
+
+    bam1_t* pri = nullptr;
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (used[i]) continue;
+
+        const int cur_end_id = items[i].end_id;
+
+        if (!pri || read_end_id(pri) != cur_end_id) {
+            pri = find_primary_for_end(cur_end_id);
+        }
+
+        used[i] = 1;
+        std::vector<bam1_t*> sub;
+        sub.reserve(8);
+        sub.push_back(items[i].b);
+
+        uint32_t sub_beg = items[i].qb;
+        uint32_t sub_end = items[i].qe;
+
+        for (size_t j = i + 1; j < items.size(); ++j) {
+            if (used[j]) continue;
+
+            if (items[j].end_id != cur_end_id) {
+                if (items[j].end_id > cur_end_id) break;
+                continue;
+            }
+
+            if (items[j].qb >= sub_end) break;
+
+            if (sub_ovlp_frac_ > 0.0) {
+                const double f = query_overlap_frac(sub_beg, sub_end, items[j].qb, items[j].qe);
+                if (f < sub_ovlp_frac_) continue;
+            }
+
+            sub.push_back(items[j].b);
+            used[j] = 1;
+        }
+
+        out_subgroups.push_back(std::move(sub));
+    }
+
+    // Re-rank each subgroup and put the best alignment at sub[0] (2026-03-03)
+    MapqBooster::select_best_per_subgroup(out_subgroups, hdr);
+
+    if (DEBUG_ENABLED) {print_group(group, out_subgroups, hdr);}
+}
+
+void MapqBooster::select_best_per_subgroup(std::vector<std::vector<bam1_t*>>& out_subgroups, const sam_hdr_t* hdr) const
+{
+    if (!hdr) return;
+
+    auto find_primary_for_end = [&](int end_id) -> bam1_t* {
+        for (auto& sub : out_subgroups) {
+            for (bam1_t* b : sub) {
+                if (!b || !is_mapped(b)) continue;
+                if (b->core.flag & BAM_FSUPPLEMENTARY) continue;
+                if (read_end_id(b) != end_id) continue;
+                if (is_primary_like(b)) return b;
+            }
+        }
+        return nullptr;
+    };
+
+    auto get_as = [&](bam1_t* b) -> int32_t {
+        if (!b) return INT32_MIN;
+        if (const uint8_t* as_tmp = bam_aux_get(b, "AS")) return (int32_t)bam_aux2i(as_tmp);
+        return INT32_MIN;
+    };
+
+    auto get_nm_norm = [&](bam1_t* b) -> int32_t {
+        int32_t nm = get_nm(b);
+        return (nm >= 0) ? nm : INT32_MAX/2;
+    };
+
+    auto tid_hap = [&](int32_t tid) -> int {
+        if (tid < 0) return 0;
+        const char* rn = sam_hdr_tid2name(const_cast<sam_hdr_t*>(hdr), tid);
+        if (!rn) return 0;
+        if (rn[0]=='h' && (rn[1]=='1' || rn[1]=='2')) return rn[1]-'0';
+        return 0;
+    };
+
+    for (auto& sub : out_subgroups) {
+        if (sub.empty()) continue;
+
+        const int end_id = read_end_id(sub[0]);
+        bam1_t* pri = find_primary_for_end(end_id);
+
+        const int32_t pri_tid = pri ? pri->core.tid : -1;
+        const int32_t pri_pos = pri ? pri->core.pos : 0;
+        const int     pri_hap = pri ? tid_hap(pri_tid) : 0;
+
+        auto better_than = [&](bam1_t* x, bam1_t* y) -> bool {
+            if (!x) return false;
+            if (!y) return true;
+
+            // 0. primary
+            if (pri) {
+                if (x == pri) return true;
+                if (y == pri) return false;
+            }
+
+            // 1. AS
+            const int32_t ax = get_as(x), ay = get_as(y);
+            if (ax != ay) return ax > ay;
+
+            // 2. MAPQ
+            if (x->core.qual != y->core.qual) return x->core.qual > y->core.qual;
+
+            // 3. ML
+            const uint32_t mlx = match_len_cigar(x), mly = match_len_cigar(y);
+            if (mlx != mly) return mlx > mly;
+
+            // 4. NM
+            const int32_t nx = get_nm_norm(x), ny = get_nm_norm(y);
+            if (nx != ny) return nx < ny;
+
+            // 5. same hap as primary
+            if (pri_hap != 0) {
+                const bool x_h = (is_mapped(x) && tid_hap(x->core.tid) == pri_hap);
+                const bool y_h = (is_mapped(y) && tid_hap(y->core.tid) == pri_hap);
+                if (x_h != y_h) return x_h;
+            }
+
+            // 6. closer to primary
+            if (pri) {
+                const bool x_on = (x->core.tid == pri_tid);
+                const bool y_on = (y->core.tid == pri_tid);
+                if (x_on && y_on) {
+                    const long long dx = llabs((long long)x->core.pos - (long long)pri_pos);
+                    const long long dy = llabs((long long)y->core.pos - (long long)pri_pos);
+                    if (dx != dy) return dx < dy;
+                } else if (x_on != y_on) {
+                    return x_on;
+                }
+            }
+
+            // 7. smaller tid/pos
+            if (x->core.tid != y->core.tid) return x->core.tid < y->core.tid;
+            return x->core.pos < y->core.pos;
+        };
+
+        std::stable_sort(sub.begin(), sub.end(), [&](bam1_t* a, bam1_t* b){ return better_than(a, b); });
+    }
+}
+
 // XA-based boosting
 bool MapqBooster::should_boost_with_XA_(const bam1_t* b, const sam_hdr_t* hdr) const
 {
+    if (!is_primary_like(b)) return false;
+
     const uint8_t* xa = bam_aux_get(b, "XA");
     if (!xa || bam_aux_type(xa) != 'Z') return false;
 
@@ -252,7 +546,7 @@ bool MapqBooster::should_boost_with_XA_(const bam1_t* b, const sam_hdr_t* hdr) c
     if (!span_pri) return false;
     const uint32_t end_pri  = beg_pri + span_pri;
 
-    /* build equivalence map for the primary interval */
+    // liftover
     std::unordered_map<std::string, std::vector<std::pair<uint32_t,uint32_t>>> eq;
     eq[r_pri].push_back({beg_pri, end_pri});
     auto hits = map_.map_range(r_pri, beg_pri, end_pri, cm_max_hops_, cm_max_fanout_, cm_min_len_, cm_min_frac_, cm_max_total_hits_, true);
@@ -261,13 +555,11 @@ bool MapqBooster::should_boost_with_XA_(const bam1_t* b, const sam_hdr_t* hdr) c
 
     const uint32_t min_cov = (uint32_t)std::ceil(min_frac_ * span_pri);
 
-    /* scan XA segments */
+    // XA tag format: <rname>,<+|-><pos>,<cigar>,<NM>;
     const char* p = bam_aux2Z(xa);
     int ok_ctg = 0;
 
     while (*p) {
-        /* <rname>,<+|-><pos>,<cigar>,<NM>; */
-
         // rname
         const char* rbeg = p;
         while (*p && *p != ',') ++p;
@@ -323,7 +615,6 @@ bool MapqBooster::should_boost_from_group_(const bam1_t* cand, const std::vector
     // filter
     if (!cand || !hdr)                return false;
     if (!is_mapped(cand))             return false;
-    if (!is_primary_like(cand))       return false;
     if (cand->core.qual > mapq_low_)  return false;
 
     // XA-based check
@@ -332,7 +623,7 @@ bool MapqBooster::should_boost_from_group_(const bam1_t* cand, const std::vector
         return should_boost_with_XA_(cand, hdr);
     }
 
-    /* candidate reference interval & NM */
+    // candidate reference interval and NM
     const char* ref_c = sam_hdr_tid2name(const_cast<sam_hdr_t*>(hdr), cand->core.tid);
     if (!ref_c) return false;
 
@@ -340,10 +631,8 @@ bool MapqBooster::should_boost_from_group_(const bam1_t* cand, const std::vector
     const uint32_t span  = ref_span_from_cigar(cand);
     if (!span) return false;
     const uint32_t end_c = beg_c + span;
-    const int32_t  nm_c  = get_nm(cand);  // NM
-    const uint32_t ml_c   = match_len_cigar(cand);  // Match length
 
-    /* equivalence intervals on every contig */
+    // Liftover
     std::unordered_map<std::string,std::vector<std::pair<uint32_t,uint32_t>>> eq;
     eq[ref_c].push_back({beg_c, end_c});
     auto hits = map_.map_range(ref_c, beg_c, end_c, cm_max_hops_, cm_max_fanout_, cm_min_len_, cm_min_frac_, cm_max_total_hits_, true);
@@ -352,78 +641,29 @@ bool MapqBooster::should_boost_from_group_(const bam1_t* cand, const std::vector
 
     const uint32_t min_cov = (uint32_t)std::ceil(min_frac_ * span);
 
-    // query interval of candidate (0-based, closed-open)
-    auto query_interval = [](const bam1_t* r, uint32_t& qb, uint32_t& qe){
-        qb = 0; qe = 0;
-        if (!r) return;
-        const uint32_t* cg = bam_get_cigar(r);
-        const uint32_t n   = r->core.n_cigar;
-        auto aln_q  = [](int op) {return op==BAM_CMATCH || op==BAM_CINS || op==BAM_CEQUAL || op==BAM_CDIFF;};
-        auto read_q = [](int op) {return op==BAM_CMATCH || op==BAM_CINS || op==BAM_CEQUAL || op==BAM_CDIFF || op==BAM_CSOFT_CLIP || op==BAM_CHARD_CLIP;};
-
-        uint32_t qpos = 0;
-        uint32_t L0   = 0;
-        bool started  = false;
-        uint32_t qb_st = 0, qe_st = 0;
-
-        for (uint32_t i = 0; i < n; ++i){
-            const uint32_t len = bam_cigar_oplen(cg[i]);
-            const int op       = bam_cigar_op(cg[i]);
-            if (read_q(op)) L0 += len;
-            if (aln_q(op)) {
-                if (!started) { qb_st = qpos; started = true; }
-                qpos += len;
-                qe_st = qpos;
-            } else {
-                if (read_q(op)) qpos += len;
-            }
-        }
-        if (!started) { qb = 0; qe = 0; return; }
-        if (bam_is_rev(r)) {
-            qb = L0 - qe_st;
-            qe = L0 - qb_st;
-        } else {
-            qb = qb_st;
-            qe = qe_st;
-        }
-    };
-    uint32_t qbeg_c=0,qend_c=0; query_interval(cand,qbeg_c,qend_c);
-
     const int end_id_c = read_end_id(cand);   /* 0/1/2 */
 
-    /* contigs that support homology */
+    // contigs that support homology
     std::unordered_set<std::string_view> supported; supported.reserve(16);
 
     for (const bam1_t* o : group)
     {
         if (!o || o==cand) continue;
-        if (!is_mapped(o) || (o->core.flag & BAM_FSUPPLEMENTARY)) continue;
+        if (!is_mapped(o)) continue;
         if (read_end_id(o) != end_id_c) continue;  // opposite mate
-
-        // Filtering by NM and match length
-        if (nm_c >= 0 && get_nm(o) != nm_c) continue;
-        if (match_len_cigar(o) != ml_c) continue;
-
-        // query-overlap
-        uint32_t qb=0,qe=0; query_interval(o, qb, qe);
-        if (!(qbeg_c < qe && qb < qend_c)) continue;  // no overlap
 
         // reference homology check
         const char* r2 = sam_hdr_tid2name(const_cast<sam_hdr_t*>(hdr), o->core.tid);
-        if (!r2) return false;  // mapped to unknown
-
-        // Filter same ref as candidate
-        if (std::string_view(r2) == std::string_view(ref_c)) return false;
+        if (!r2) continue;  // mapped to unknown
 
         const uint32_t obeg = o->core.pos;
         const uint32_t ospan= ref_span_from_cigar(o);
-        if (!ospan) return false;
+        if (!ospan) continue;
         const uint32_t oend = obeg + ospan;
 
-        auto it = eq.find(r2);
-        if (it == eq.end()) return false;  // ref not equivalent
+        auto it = eq.find(r2); if (it == eq.end()) continue;  // ref not equivalent
 
-        if (overlapped_len(it->second, obeg, oend) < min_cov) return false;  // non-homologous
+        if (overlapped_len(it->second, obeg, oend) < min_cov) continue;  // non-homologous
 
         supported.insert(std::string_view(r2));
     }
@@ -432,13 +672,21 @@ bool MapqBooster::should_boost_from_group_(const bam1_t* cand, const std::vector
 }
 
 void MapqBooster::process_group_(std::vector<bam1_t*>& group, const sam_hdr_t* hdr, Stats& st_local) const {
-    for (bam1_t* b : group) {
-        if (!b) continue;
-        if (!is_primary_like(b)) continue;
-        if (!is_mapped(b)) continue;
-        if (b->core.qual > mapq_low_) continue;
+    if (!hdr) return;
 
-        if (should_boost_from_group_(b, group, hdr)) {
+    // 1. split into subgroups by (same end_id) and (query-overlap)
+    std::vector<std::vector<bam1_t*>> subgroups;  // First record in each subgroup is the "best" record by match length, MAPQ, and NM, and closest to primary if possible
+    subgroups.reserve(8);
+    build_subgroups_by_query_overlap(group, subgroups, hdr);
+
+    // 2. Boost for each subgroup
+    for (auto& sub : subgroups) {
+        if (sub.empty()) continue;
+
+        bam1_t* b = sub[0];  // best record in subgroup
+        if (b->core.qual > mapq_low_) continue;  // Record which need to be boost.
+
+        if (should_boost_from_group_(b, sub, hdr)) {
             if (b->core.qual != mapq_new_) {
                 b->core.qual = mapq_new_;
                 ++st_local.changed;
@@ -595,6 +843,97 @@ int MapqBooster::run(const std::string& in_path_, const std::string& out_path_) 
 
     log_stream() << "processed=" << st.written << " changed=" << st.changed << "\n";
     return 0;
+}
+
+void MapqBooster::print_group(
+    const std::vector<bam1_t*>& group,
+    const std::vector<std::vector<bam1_t*>>& subs,
+    const sam_hdr_t* hdr
+) const
+{
+    if (!hdr || group.empty()) return;
+
+    constexpr int W_IDX   = 10;
+    constexpr int W_QINT  = 16;
+    constexpr int W_FLAG  = 8;
+    constexpr int W_MAPQ  = 6;
+    constexpr int W_PRI   = 10;
+    constexpr int W_AS    = 8;
+    constexpr int W_ML    = 10;
+    constexpr int W_NM    = 8;
+    constexpr int W_RNAME = 15;
+    constexpr int W_RPOS  = 13;
+
+    auto print_header = [&]() {
+        debug_stream() << "  "
+           << std::left
+           << std::setw(W_IDX)   << "group"
+           << std::setw(W_QINT)  << "q_interval"
+           << std::setw(W_FLAG)  << "flag"
+           << std::setw(W_MAPQ)  << "MAPQ"
+           << std::setw(W_PRI)   << "primary"
+           << std::setw(W_AS)    << "AS"
+           << std::setw(W_ML)    << "ML"
+           << std::setw(W_NM)    << "NM"
+           << std::setw(W_RNAME) << "r_name"
+           << std::setw(W_RPOS)  << "r_pos"
+           << "cigar"
+           << "\n";
+    };
+
+    auto print_one = [&](const bam1_t* b, int idx, int subidx){
+        if (!b) return;
+
+        const bool mapped = is_mapped(b);
+        const bool pri_like = is_primary_like(b);
+
+        const char* rname = mapped
+            ? sam_hdr_tid2name(const_cast<sam_hdr_t*>(hdr), b->core.tid)
+            : "*";
+        const int32_t pos0 = mapped ? b->core.pos : -1;
+
+        uint32_t qb=0, qe=0;
+        get_query_interval_fwd(b, qb, qe);
+
+        const uint8_t mq = b->core.qual;
+
+        const std::string cig = cigar_to_string(b);
+        int32_t as = INT32_MIN;
+        if (const uint8_t* as_tmp = bam_aux_get(b, "AS")) as = (int32_t)bam_aux2i(as_tmp);
+        const int32_t nm = get_nm(b);
+        const uint32_t ml = match_len_cigar(b);
+
+        if (idx == 0 && subidx == 0) print_header();
+
+        std::string idxss_str = "(" + std::to_string(idx) + "," + std::to_string(subidx) + ")";
+        std::string qiss_str = "[" + std::to_string(qb) + "," + std::to_string(qe) + ")";
+
+        debug_stream() << "  " << std::left
+           << std::setw(W_IDX)   << idxss_str
+           << std::setw(W_QINT)  << qiss_str
+           << std::setw(W_FLAG)  << b->core.flag
+           << std::setw(W_MAPQ)  << (int)mq
+           << std::setw(W_PRI)   << (pri_like ? "T" : "F")
+           << std::setw(W_AS)    << as
+           << std::setw(W_ML)    << ml
+           << std::setw(W_NM)    << nm
+           << std::setw(W_RNAME) << (rname ? rname : "*")
+           << std::setw(W_RPOS)  << pos0
+           << cig
+           << "\n";
+    };
+
+    const char* qn0 = bam_get_qname(group[0]);
+    debug_stream() << "QNAME: " << (qn0 ? qn0 : "") << "  (records=" << group.size() << ")" << "  (subgroups=" << subs.size() << ")" << "\n";
+
+    for (size_t si = 0; si < subs.size(); ++si) {
+        const auto& sub = subs[si];
+        for (size_t k = 0; k < sub.size(); ++k) {
+            print_one(sub[k], (int)si, (int)k);
+        }
+    }
+
+    debug_stream() << "\n";
 }
 
 } // namespace mapqboost

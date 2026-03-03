@@ -26,6 +26,9 @@ void GfaDepth::build_segment_offsets_(
     }
 }
 
+
+// ----------------------- count depth from k-mer index -----------------------
+
 void GfaDepth::fill_pos_depth_from_index_(
     const mmidx::MinimizerIndex& GIndex,
     const std::vector<uint32_t>& seg_offsets,
@@ -122,6 +125,8 @@ void GfaDepth::write_kmer_depth_bed_(
         saver.save(line);
     }
 
+    if (!base_depth_) return;
+
     // Base-level section: chrom  pos  depth  freq
     saver.save("## chrom\tpos\tdepth\tfreq\n");
     for (size_t s = 0; s < nodes_.size(); ++s) {
@@ -184,6 +189,8 @@ bool GfaDepth::count_from_kmer(
     return true;
 }
 
+
+// ----------------------- count depth from GAF alignments -----------------------
 
 bool GfaDepth::pass_gaf_filters_(const kgaf::Record& rec) {
     if (min_mapq_ > 0) {
@@ -308,12 +315,12 @@ bool GfaDepth::accumulate_cigar_(
 }
 
 void GfaDepth::write_gaf_depth_bed_(
-    const std::string& out_bed,
+    const std::string& out_file,
     const std::vector<uint32_t>& seg_offsets,
     const std::vector<uint8_t>& coverage
 ) {
     const size_t n = nodes_.size();
-    SAVE saver(out_bed, 10 * 1024 * 1024);
+    SAVE saver(out_file, 10 * 1024 * 1024);
     std::string line; line.reserve(256);
 
     // header like k-mer version
@@ -339,6 +346,8 @@ void GfaDepth::write_gaf_depth_bed_(
         saver.save(line);
     }
 
+    if (!base_depth_) return;
+
     // run-length coverage per segment: chrom  start  depth
     saver.save("## chrom\tpos\tdepth\n");
     for (size_t seg_id = 0; seg_id < n; ++seg_id) {
@@ -361,7 +370,7 @@ void GfaDepth::write_gaf_depth_bed_(
     }
 }
 
-bool GfaDepth::count_from_gaf(const std::string& gaf_path, const std::string& out_bed)
+bool GfaDepth::count_from_gaf(const std::string& gaf_path, const std::string& out_file)
 {
     log_stream() << "Computing node depth from GAF alignments ..." << "\n";
 
@@ -372,8 +381,7 @@ bool GfaDepth::count_from_gaf(const std::string& gaf_path, const std::string& ou
     build_segment_offsets_(seg_offsets, total_len);
     std::vector<uint8_t> coverage(seg_offsets.back(), 0);
     
-
-    // ---- open GAF ----
+    // I/O
     kgaf::ReaderAuto reader(gaf_path);
     if (!reader.good()) {
         error_stream() << gaf_path << ": No such file or directory\n";
@@ -396,7 +404,7 @@ bool GfaDepth::count_from_gaf(const std::string& gaf_path, const std::string& ou
         if (!pass_gaf_filters_(rec)) {continue;}
         if (rec.path.empty() || rec.cg.empty()) continue;
 
-        // 1) parse path: each step name is used as segment name AS-IS (no ow)
+        // 1. parse path: each step name is used as segment name AS-IS (no ow)
         steps.clear();
         kgaf::parse_path(rec.path, steps);
 
@@ -404,18 +412,114 @@ bool GfaDepth::count_from_gaf(const std::string& gaf_path, const std::string& ou
         if (!build_concatenated_path_(steps, P, path_len)) continue;
         if (rec.tstart >= path_len) continue;
 
-        // 2) parse CIGAR
+        // 2. parse CIGAR
         ops.clear();
         kgaf::parse_cigar(rec.cg, ops);
         if (ops.empty()) continue;
 
-        // 3) accumulate CIGAR ops onto segments in P
+        // 3. accumulate CIGAR ops onto segments in P
         accumulate_cigar_(rec, ops, P, path_len, seg_offsets, coverage);
     }
-    tracker.finish();  // finish progress
+    tracker.finish();
 
-    // ---- write BED (avg depth + run-length intervals) ----
-    write_gaf_depth_bed_(out_bed, seg_offsets, coverage);
+    // Save
+    write_gaf_depth_bed_(out_file, seg_offsets, coverage);
 
+    return true;
+}
+
+
+// ----------------------- Count from A-lines -----------------------
+
+void GfaDepth::write_A_depth_bed_(
+    const std::string& out_file,
+    const std::vector<uint32_t>& seg_offsets,
+    const std::vector<uint32_t>& depth
+) {
+    const size_t n = nodes_.size();
+    SAVE saver(out_file, 10 * 1024 * 1024);
+    std::string line; line.reserve(256);
+
+    saver.save("## liftasm depth (from GFA A-lines)\n");
+    saver.save("## Segment\tLength\tAvgDepth\n");
+
+    // average depth per segment
+    for (size_t s = 0; s < n; ++s) {
+        const uint32_t len = nodes_[s].length;
+        uint64_t sum = 0;
+        if (len) {
+            const uint32_t* p = depth.data() + seg_offsets[s];
+            for (uint32_t i = 0; i < len; ++i) sum += p[i];
+        }
+        const double avg = (len ? (double)sum / (double)len : 0.0);
+
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.2f", avg);
+
+        line.clear();
+        line += "# ";
+        line += nodes_[s].name;          line += '\t';
+        line += std::to_string(len);     line += '\t';
+        line += buf;                     line += '\n';
+        saver.save(line);
+    }
+
+    if (!base_depth_) return;
+
+    // base-level depth per segment
+    saver.save("## chrom\tpos\tdepth\n");
+    for (size_t s = 0; s < n; ++s) {
+        const uint32_t len = nodes_[s].length;
+        if (!len) continue;
+
+        const uint32_t* base = depth.data() + seg_offsets[s];
+        const std::string& chrom = nodes_[s].name;
+
+        for (uint32_t p = 0; p < len; ++p) {
+            line.clear();
+            line += chrom;                    line += '\t';
+            line += std::to_string(p);        line += '\t';
+            line += std::to_string(base[p]);  line += '\n';
+            saver.save(line);
+        }
+    }
+}
+
+bool GfaDepth::count_from_A(const std::string& out_file)
+{
+    log_stream() << "Computing node depth from GFA A-lines ..." << "\n";
+
+    // Segment offsets
+    std::vector<uint32_t> seg_offsets;
+    uint64_t total_len = 0;
+    build_segment_offsets_(seg_offsets, total_len);
+
+    std::vector<uint32_t> depth(total_len, 0);
+
+    for (const auto& a : alignments_) {
+        const uint32_t seg_id = (uint32_t)a.unitig_node_id;
+        if (seg_id >= nodes_.size()) continue;
+
+        const uint32_t seg_len = nodes_[seg_id].length;
+        if (seg_len == 0) continue;
+
+        const uint32_t u_beg = a.position_on_unitig;
+        if (u_beg >= seg_len) continue;
+
+        uint32_t aln_len = 0;
+        if (a.read_end_pos > a.read_start_pos) aln_len = a.read_end_pos - a.read_start_pos;
+        if (aln_len == 0) continue;
+
+        uint32_t u_end = u_beg + aln_len;
+        if (u_end > seg_len) u_end = seg_len;
+
+        const uint32_t base0 = seg_offsets[seg_id];
+        for (uint32_t p = u_beg; p < u_end; ++p) {
+            depth[base0 + p] += 1;
+        }
+    }
+
+    // Save
+    write_A_depth_bed_(out_file, seg_offsets, depth);
     return true;
 }

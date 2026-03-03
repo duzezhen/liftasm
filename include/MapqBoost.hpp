@@ -24,6 +24,7 @@ public:
         const coordmap::CoordMap& map, 
         std::size_t batch_size, std::uint8_t mapq_low, std::uint8_t mapq_new, double min_frac, int min_equiv_contigs, bool name_check, 
         int cm_max_hops, uint32_t cm_max_fanout, uint32_t cm_min_len, double cm_min_frac, uint32_t cm_max_total_hits,
+        double sub_ovlp_frac,
         int threads, int io_threads
     );
 
@@ -46,10 +47,28 @@ private:
     double   cm_min_frac_;
     uint32_t cm_max_total_hits_;
 
+    // Record cluster parameters
+    double sub_ovlp_frac_;
+
     const int          threads_;
     const int          io_threads_;
 
 private:
+    // query interval on read in forward coordinates (0-based, [qb,qe)), returns false if no aligned query span
+    bool get_query_interval_fwd(const bam1_t* r, uint32_t& qb, uint32_t& qe) const;
+    // overlap for [b1,e1) and [b2,e2)
+    bool query_overlap(uint32_t b1, uint32_t e1, uint32_t b2, uint32_t e2) const;
+    double query_overlap_frac(uint32_t b1, uint32_t e1, uint32_t b2, uint32_t e2) const;
+    // Build subgroups for one read group:
+    // 1. same read_end_id (0/1/2), 2. query intervals overlap (on forward read coordinates)
+    void build_subgroups_by_query_overlap(
+        const std::vector<bam1_t*>& group,
+        std::vector<std::vector<bam1_t*>>& out_subgroups, 
+        const sam_hdr_t* hdr
+    ) const;
+    // Re-rank each subgroup and put the chosen alignment at sub[0].
+    void select_best_per_subgroup(std::vector<std::vector<bam1_t*>>& out_subgroups, const sam_hdr_t* hdr) const;
+
     // XA-based decision; returns true = boost, false = undecided/fail
     bool should_boost_with_XA_(const bam1_t* b, const sam_hdr_t* hdr) const;
 
@@ -63,6 +82,13 @@ private:
     MapqBooster& operator=(const MapqBooster&) = delete;
     MapqBooster(MapqBooster&&) = delete;
     MapqBooster& operator=(MapqBooster&&) = delete;
+
+    // Debug
+    void print_group(
+        const std::vector<bam1_t*>& group,
+        const std::vector<std::vector<bam1_t*>>& subs,
+        const sam_hdr_t* hdr
+    ) const;
 };
 
 } // namespace mapqboost

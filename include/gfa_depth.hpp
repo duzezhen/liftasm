@@ -17,8 +17,9 @@
 
 class GfaDepth : public GfaGraph {
 public:
-    GfaDepth(int min_mapq, double min_align_frac) {
-        set_forbid_overlap(true);
+    GfaDepth(int min_mapq, double min_align_frac, bool base_depth = false, bool forbid_overlap = true) {
+        set_forbid_overlap(forbid_overlap);
+        base_depth_ = base_depth;
         min_mapq_ = min_mapq;
         min_align_frac_ = min_align_frac;
     }
@@ -26,9 +27,12 @@ public:
 public:
     bool count_from_kmer(const mmidx::MinimizerIndex& GIndex, const std::string& out_file);
 
-    bool count_from_gaf(const std::string& gaf_path, const std::string& out_bed);
+    bool count_from_gaf(const std::string& gaf_path, const std::string& out_file);
+
+    bool count_from_A(const std::string& out_file);
     
 protected:
+    bool  base_depth_;               // whether to compute base-level depth instead of segment-level depth
     // filters for GAF alignments
     int    min_mapq_        = 0;     // minimum mapping quality (MAPQ) to consider an alignment
     double min_align_frac_  = 0.0;   // minimum aligned fraction (aln_len / qlen) to consider an alignment
@@ -78,8 +82,14 @@ protected:
         std::vector<uint8_t>& coverage
     );
     void write_gaf_depth_bed_(
-        const std::string& out_bed,
+        const std::string& out_file,
         const std::vector<uint32_t>& seg_offsets,
         const std::vector<uint8_t>& coverage
+    );
+
+    void write_A_depth_bed_(
+        const std::string& out_file,
+        const std::vector<uint32_t>& seg_offsets,
+        const std::vector<uint32_t>& depth
     );
 };

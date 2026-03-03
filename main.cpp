@@ -1,4 +1,3 @@
-// g++ main.cpp src/*.cpp -o liftasm -std=c++20 -march=native -O3 -lhts -lwfa2cpp -lz -lbz2 -lcrypto -lssl -lpthread -fopenmp -lstdc++fs -I /home/zd233/zd233/00-software/00-project/liftasm/minimap2 /home/zd233/zd233/00-software/00-project/liftasm/minimap2/libminimap2.a
 // g++ main.cpp src/*.cpp -o liftasm -std=c++20 -march=native -O3 -fopenmp -I /home/zd233/zd233/00-software/00-project/liftasm/minimap2 /home/zd233/zd233/00-software/00-project/liftasm/minimap2/libminimap2.a /home/zd233/zd233/00-software/WFA2-lib/build/libwfa2cpp.a /home/zd233/zd233/00-software/WFA2-lib/build/libwfa2.a /home/zd233/zd233/00-software/htslib-1.22.1/build/libhts.a -lz -lbz2 -lcrypto -lssl -lpthread -ldl -lstdc++fs
 
 #include <iostream>
@@ -53,7 +52,7 @@ int main(int argc, char** argv) {
         GfaBubble::GfaBubbleFinder finder(
             G, cfg.bubble.max_depth, cfg.bubble.max_paths, cfg.bubble.DFS_guard, 
             cfg.bubble.cx_depth, cfg.bubble.cx_nodes, cfg.bubble.cx_branches, cfg.bubble.cx_deg_branch, cfg.bubble.cx_deg_hub, cfg.bubble.cx_deg_cap, 
-            cfg.bubble.path_diff, /*skip_comp=*/false, cfg.global.threads
+            cfg.bubble.path_diff, /*skip_comp=*/false, cfg.bubble.keep_nested, cfg.global.threads
         );
         finder.find_bubbles();
         const auto& bubbles = finder.get_bubbles();
@@ -79,9 +78,10 @@ int main(int argc, char** argv) {
         );
 
         // Load graph
-        GfaDepth G(cfg.depth.min_mapq, cfg.depth.min_frac);
+        bool forbid_overlap = (!cfg.in.reads.empty() || !cfg.in.gafFile.empty());
+        GfaDepth G(cfg.depth.min_mapq, cfg.depth.min_frac, cfg.depth.base_depth, forbid_overlap);
         G.load_from_GFA(cfg.in.gfaFile);
-        
+
         if (cfg.in.reads.size() > 0) {
             auto name_seqs = G.getSeqVec(cfg.global.kmerLen);
             mmidx::MinimizerIndex GIndex(name_seqs.names, name_seqs.seqs, name_seqs.right_seqs, chainOpts, anchorOpts);
@@ -91,6 +91,8 @@ int main(int argc, char** argv) {
             G.count_from_kmer(GIndex, cfg.out.gfaDepth);
         } else if (cfg.in.gafFile.size() > 0) {
             G.count_from_gaf(cfg.in.gafFile, cfg.out.gfaDepth);
+        } else {
+            G.count_from_A(cfg.out.gfaDepth);
         }
     } else if (sub == "deoverlap") {
         AppConfig cfg = main_deoverlap(argc, argv);
@@ -135,16 +137,16 @@ int main(int argc, char** argv) {
         G.collapse_unitigs();
         G.save_to_disk(cfg.out.prefix + ".collapse.unitig.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/true);
 
-        // Detect Fork
+        // Detect Bubbles and Forks
         GfaBubble::GfaBubbleFinder finder(
             G, cfg.bubble.max_depth, cfg.bubble.max_paths, cfg.bubble.DFS_guard, 
             cfg.bubble.cx_depth, cfg.bubble.cx_nodes, cfg.bubble.cx_branches, cfg.bubble.cx_deg_branch, cfg.bubble.cx_deg_hub, cfg.bubble.cx_deg_cap, 
-            cfg.bubble.path_diff, /*skip_comp=*/false, cfg.global.threads
+            cfg.bubble.path_diff, /*skip_comp=*/false, /*keep_nested=*/true, cfg.global.threads
         );
         finder.find_forks();
         const auto& forks = finder.get_forks();
 
-        finder.find_bubbles(/*filter_nonlocal=*/false);
+        finder.find_bubbles();
         const auto& bubbles = finder.get_bubbles();
         G.collapse_bubbles(bubbles, forks, cfg.out.prefix, finder);
         G.collapse_unitigs(); // collapse again after bubble collapse
@@ -214,6 +216,7 @@ int main(int argc, char** argv) {
             map, 
             cfg.homq.batch_size, cfg.homq.mapq_low, cfg.homq.mapq_new, cfg.homq.min_frac, cfg.homq.min_equiv, cfg.homq.name_check,
             cfg.coordmap.max_hops, cfg.coordmap.max_fanout, cfg.coordmap.min_len, cfg.coordmap.min_frac, cfg.coordmap.max_total_hits,
+            cfg.homq.sub_ovlp_frac,
             cfg.global.threads, cfg.global.IOthreads
         );
         booster.run(cfg.homq.in_bam, cfg.homq.out_bam);

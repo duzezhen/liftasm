@@ -60,11 +60,14 @@ struct BubbleOpts {
     int      cx_deg_cap     = 12;   // stop counting degree after this
 
     // path clustering (pick_representative_paths)
-    double   path_diff = 0.05;  // small than this is same cluster; larger than this is different haplotype
+    double path_diff = 0.05;        // small than this is same cluster; larger than this is different haplotype
+
+    bool keep_nested = false;       // whether to keep bubbles contained within larger bubbles
 };
 
 /* ===================== Depth options ===================== */
 struct DepthOpts {
+    bool   base_depth = false;  // whether to compute base-level depth instead of segment-level depth
     int    min_mapq = 20;      // minimum mapping quality to keep
     double min_frac = 0.7;     // minimum aligned-length / read-length ratio to keep
 };
@@ -138,6 +141,7 @@ struct MapqBoostOpts {
     double min_frac = 0.95;
     int min_equiv = 1;
     bool name_check = false;
+    double sub_ovlp_frac = 0.95;
 };
 
 /* ===================== Tool mode ===================== */
@@ -180,7 +184,7 @@ void help_stat(char** argv);
 
 // identify bubble in graph
 AppConfig main_bubble(int argc, char** argv);
-void help_bubble(char** argv);
+void help_bubble(char** argv, bool print_all=false);
 
 // Extract sequences along paths from a GFA
 AppConfig main_seq(int argc, char** argv);
@@ -196,7 +200,7 @@ void help_deoverlap(char** argv);
 
 // collapse unitigs and bubbles (requires no-overlap graph, output by deoverlap)
 AppConfig main_collapse(int argc, char** argv);
-void help_collapse(char** argv);
+void help_collapse(char** argv, bool print_all=false);
 
 // align reads to graph (requires no-overlap graph, output by collapse)
 AppConfig main_align(int argc, char** argv);
@@ -216,4 +220,4 @@ void help_liftover(char** argv, const AppConfig& cfg, bool print_all=false);
 
 // adjust mapping quality
 AppConfig main_mapq_boost(int argc, char** argv);
-void help_mapq_boost(char** argv);
+void help_mapq_boost(char** argv, bool print_all=false);

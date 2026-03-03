@@ -84,6 +84,7 @@ static void validate_and_print(AppConfig& cfg) {
             kv("Path diff threshold",      cfg.bubble.path_diff);
             kv("Minimum length",           cfg.bubble.min_len);
             kv("Minimum number of nodes",  cfg.bubble.min_num);
+            kv("Keep nested bubbles",      onoff(cfg.bubble.keep_nested));
             break;
 
         case ToolMode::seq:
@@ -97,11 +98,11 @@ static void validate_and_print(AppConfig& cfg) {
         case ToolMode::depth:
             ensure(!cfg.in.gfaFile.empty(), "--gfa is required");
             ensure(!( !cfg.in.gafFile.empty() && !cfg.in.reads.empty() ), "Options --gaf and --read are mutually exclusive");
-            ensure(!( cfg.in.gafFile.empty() && cfg.in.reads.empty() ), "You must provide either --gaf or --read");
             ensure(cfg.depth.min_frac >= 0.0 && cfg.depth.min_frac <= 1.0, "--min_frac must be in [0,1]");
             ensure(cfg.depth.min_mapq >= 0   && cfg.depth.min_mapq <= 60,  "--min_mapq must be in [0,60]");
             kv("K-mer size",        cfg.global.kmerLen);
             kv("Minimizer window",  cfg.global.minimizerW);
+            kv("Base depth",        onoff(cfg.depth.base_depth));
             kv("Minimum MAPQ",      cfg.depth.min_mapq);
             kv("Minimum fraction",  cfg.depth.min_frac);
             break;
@@ -250,6 +251,7 @@ static void validate_and_print(AppConfig& cfg) {
             ensure(cfg.coordmap.min_len        >= 1, "--cm_min_len must be >= 1");
             ensure(cfg.coordmap.min_frac       >= 0.0 && cfg.coordmap.min_frac <= 1.0, "--cm_min_frac must be in [0,1]");
             ensure(cfg.coordmap.max_total_hits >= 1, "--cm_max_hits must be >= 1");
+            ensure(cfg.homq.sub_ovlp_frac >= 0.0 && cfg.homq.sub_ovlp_frac <= 1.0, "--sub_ovlp_frac must be in [0,1]");
             kv("Coordinate map",          cfg.in.mapFile);
             kv("Input BAM",               cfg.homq.in_bam);
             kv("Output BAM",              cfg.homq.out_bam);
@@ -266,6 +268,7 @@ static void validate_and_print(AppConfig& cfg) {
             kv("Min keep length",         cfg.coordmap.min_len);
             kv("Min keep fraction",       cfg.coordmap.min_frac);
             kv("Max total hits",          cfg.coordmap.max_total_hits);
+            kv("Sub-overlap fraction",    cfg.homq.sub_ovlp_frac);
             break;
     }
 }
@@ -327,7 +330,7 @@ AppConfig main_stat(int argc, char** argv) {
     return cfg;
 }
 
-void help_bubble(char** argv) {
+void help_bubble(char** argv, bool print_all) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE -o FILE [options]\n\n"
         << "Detect bubbles in a GFA graph and write them to a GFA file\n\n"
@@ -335,22 +338,29 @@ void help_bubble(char** argv) {
         << "  -g, --gfa           FILE    input GFA file\n"
         << "  -o, --output        FILE    output GFA containing detected bubbles [stdout]\n\n"
         << "Detection Options:\n"
-        << "      --depth         INT     maximum depth for bubble detection [" << BubbleOpts().max_depth << "]\n"
-        << "      --paths         INT     maximum number of paths to enumerate per bubble [" << BubbleOpts().max_paths << "]\n"
-        << "      --DFS_guard     INT     max DFS states [" << BubbleOpts().DFS_guard << "]\n"
-        << "      --cx_depth      INT     local BFS depth for complexity check [" << BubbleOpts().cx_depth << "]\n"
-        << "      --cx_nodes      INT     local visited node cap [" << BubbleOpts().cx_nodes << "]\n"
-        << "      --cx_branches   INT     local branching node cap [" << BubbleOpts().cx_branches << "]\n"
-        << "      --cx_deg_branch INT     degree>=this counts as branching [" << BubbleOpts().cx_deg_branch << "]\n"
-        << "      --cx_deg_hub    INT     degree>=this counts as hub (complex) [" << BubbleOpts().cx_deg_hub << "]\n"
-        << "      --cx_deg_cap    INT     stop counting degree after this [" << BubbleOpts().cx_deg_cap << "]\n"
+        << "      --depth         INT     maximum DFS depth for path exploration inside a bubble [" << BubbleOpts().max_depth << "]\n"
+        << "      --paths         INT     maximum number of DFS paths to explore per bubble [" << BubbleOpts().max_paths << "]\n";
+    if (print_all) {
+        std::cerr
+            << "      --DFS_guard     INT     max DFS states [" << BubbleOpts().DFS_guard << "]\n"
+            << "      --cx_depth      INT     local BFS depth for complexity check [" << BubbleOpts().cx_depth << "]\n"
+            << "      --cx_nodes      INT     local visited node cap [" << BubbleOpts().cx_nodes << "]\n"
+            << "      --cx_branches   INT     local branching node cap [" << BubbleOpts().cx_branches << "]\n"
+            << "      --cx_deg_branch INT     degree>=this counts as branching [" << BubbleOpts().cx_deg_branch << "]\n"
+            << "      --cx_deg_hub    INT     degree>=this counts as hub (complex) [" << BubbleOpts().cx_deg_hub << "]\n"
+            << "      --cx_deg_cap    INT     stop counting degree after this [" << BubbleOpts().cx_deg_cap << "]\n";
+    }
+    std::cerr
         << "      --path_diff     FLOAT   node difference ratio threshold for haplotype separation [" << BubbleOpts().path_diff << "]\n"
         << "      --min_len       INT     minimum total sequence length of a bubble for output (0 = no filter) [" << BubbleOpts().min_len << "]\n"
-        << "      --min_num       INT     minimum number of nodes inside a bubble required for output (0 = no filter) [" << BubbleOpts().min_num << "]\n\n"
+        << "      --min_num       INT     minimum number of nodes inside a bubble required for output (0 = no filter) [" << BubbleOpts().min_num << "]\n"
+        << "      --keep_nested           keep bubbles contained within larger bubbles\n"
+        << std::endl
         << "General Options:\n"
         << "  -t, --threads       INT     threads [" << GlobalOpts().threads << "]\n"
         << "  -d, --debug                 debug mode (forces threads=1)\n"
-        << "  -h, --help                  show this help\n\n";
+        << "  -h, --help                  show this help\n"
+        << "      --help_all              show all options\n\n";
 }
 
 AppConfig main_bubble(int argc, char** argv) {
@@ -374,9 +384,11 @@ AppConfig main_bubble(int argc, char** argv) {
         {"path_diff",    required_argument, nullptr, 1010},
         {"min_len",      required_argument, nullptr, 1011},
         {"min_num",      required_argument, nullptr, 1012},
+        {"keep_nested",  no_argument,       nullptr, 1013},
         {"threads",      required_argument, nullptr, 't'},
         {"debug",        no_argument,       nullptr, 'd'},
         {"help",         no_argument,       nullptr, 'h'},
+        {"help_all",     no_argument,       nullptr, 2001},
         {0,0,0,0}
     };
     const char* short_opts = "g:o:t:dh";
@@ -384,8 +396,8 @@ AppConfig main_bubble(int argc, char** argv) {
     int idx = 0, c;
     while ((c = getopt_long(argc, argv, short_opts, long_opts, &idx)) != -1) {
         switch (c) {
-            case 'g':  cfg.in.gfaFile          = optarg;            break;
-            case 'o':  cfg.out.gfaBubbles      = optarg;            break;
+            case  'g':  cfg.in.gfaFile         = optarg;            break;
+            case  'o':  cfg.out.gfaBubbles     = optarg;            break;
             case 1001: cfg.bubble.max_depth    = std::stoi(optarg); break;
             case 1002: cfg.bubble.max_paths    = std::stoi(optarg); break;
             case 1003: cfg.bubble.DFS_guard    = (uint64_t)std::stoull(optarg); break;
@@ -398,10 +410,12 @@ AppConfig main_bubble(int argc, char** argv) {
             case 1010: cfg.bubble.path_diff    = std::stod(optarg); break;
             case 1011: cfg.bubble.min_len      = std::stoi(optarg); break;
             case 1012: cfg.bubble.min_num      = std::stoi(optarg); break;
-            case 't':  cfg.global.threads      = std::stoi(optarg); break;
-            case 'd':  cfg.global.debug        = true;              break;
-            case 'h': help_bubble(argv); std::exit(0);
-            default:  help_bubble(argv); std::exit(1);
+            case 1013: cfg.bubble.keep_nested  = true;              break;
+            case  't': cfg.global.threads      = std::stoi(optarg); break;
+            case  'd': cfg.global.debug        = true;              break;
+            case  'h': help_bubble(argv);       std::exit(0);
+            case 2001: help_bubble(argv, true); std::exit(0);
+              default: help_bubble(argv);       std::exit(1);
         }
     }
 
@@ -455,15 +469,23 @@ AppConfig main_seq(int argc, char** argv) {
 
 void help_depth(char** argv) {
     std::cerr
-        << "Usage: " << argv[0] << " " << argv[1] << " -g FILE [--gaf FILE | -r FILE ...] [options]\n\n"
-        << "Compute node depth information from sequencing data for a GFA graph\n\n"
+        << "Usage: " << argv[0] << " " << argv[1] << " -g FILE [options]\n\n"
+        << "Compute node depth information from GFA (A-lines) / reads / GAF for a GFA graph\n\n"
+        << "Three ways to compute depth:\n"
+        << "  1. k-mer mode (provide -r):\n"
+        << "       " << argv[0] << " " << argv[1] << " -g graph.gfa -r reads.fq -o graph.depth\n"
+        << "  2. alignment mode (provide --gaf):\n"
+        << "       " << argv[0] << " " << argv[1] << " -g graph.gfa --gaf aln.gaf -o graph.depth\n"
+        << "  3. GFA-only mode (depth is calculated from 'A' lines in the GFA file):\n"
+        << "       " << argv[0] << " " << argv[1] << " -g graph.gfa -o graph.depth\n\n"
         << "Input/Output:\n"
         << "  -g, --gfa         FILE    input GFA file\n"
         << "  -r, --read        FILE    input sequencing data file(s) for **k-mer mode**\n"
         << "                             (depth calculated from k-mer coverage)\n"
         << "      --gaf         FILE    input GAF alignment file for **alignment mode**\n"
         << "                             (depth calculated directly from alignment)\n"
-        << "  -o, --output      FILE    output depth information to file [stdout]\n\n"
+        << "  -o, --output      FILE    output depth information to file [stdout]\n"
+        << "      --base_depth          output per-base depth\n\n"
         << "Index options:\n"
         << "  -k, --kmer        INT     k-mer length [" << GlobalOpts().kmerLen << "]\n\n"
         << "GFA loading options:\n"
@@ -482,16 +504,17 @@ AppConfig main_depth(int argc, char** argv) {
     cfg.mode = ToolMode::depth;
 
     const struct option long_opts[] = {
-        {"gfa",       required_argument, nullptr, 'g'},
-        {"read",      required_argument, nullptr, 'r'},
-        {"gaf",       required_argument, nullptr, 1000},
-        {"output",    required_argument, nullptr, 'o'},
-        {"kmer",      required_argument, nullptr, 'k'},
-        {"min_mapq",  required_argument, nullptr, 1001},
-        {"min_frac",  required_argument, nullptr, 1002},
-        {"threads",   required_argument, nullptr, 't'},
-        {"debug",     no_argument,       nullptr, 'd'},
-        {"help",      no_argument,       nullptr, 'h'},
+        {"gfa",        required_argument, nullptr, 'g'},
+        {"read",       required_argument, nullptr, 'r'},
+        {"gaf",        required_argument, nullptr, 0001},
+        {"output",     required_argument, nullptr, 'o'},
+        {"base_depth", no_argument,       nullptr, 0002},
+        {"kmer",       required_argument, nullptr, 'k'},
+        {"min_mapq",   required_argument, nullptr, 2001},
+        {"min_frac",   required_argument, nullptr, 2002},
+        {"threads",    required_argument, nullptr, 't'},
+        {"debug",      no_argument,       nullptr, 'd'},
+        {"help",       no_argument,       nullptr, 'h'},
         {0,0,0,0}
     };
     const char* short_opts = "g:r:o:k:t:dh";
@@ -507,11 +530,12 @@ AppConfig main_depth(int argc, char** argv) {
                 }
                 break;
             }
-            case 1000: cfg.in.gafFile        = optarg;                           break;
+            case 0001: cfg.in.gafFile        = optarg;                           break;
             case 'o':  cfg.out.gfaDepth      = optarg;                           break;
+            case 0002: cfg.depth.base_depth  = true;                             break;
             case 'k':  cfg.global.kmerLen    = std::stoi(optarg);                break;
-            case 1001: cfg.depth.min_mapq    = std::max(0, std::atoi(optarg));   break;
-            case 1002: cfg.depth.min_frac    = std::max(0.0, std::atof(optarg)); break;
+            case 2001: cfg.depth.min_mapq    = std::max(0, std::atoi(optarg));   break;
+            case 2002: cfg.depth.min_frac    = std::max(0.0, std::atof(optarg)); break;
             case 't':  cfg.global.threads    = std::max(1, std::stoi(optarg));   break;
             case 'd':  cfg.global.debug      = true;                             break;
             case 'h':  help_depth(argv); std::exit(0);
@@ -589,7 +613,7 @@ AppConfig main_deoverlap(int argc, char** argv) {
     return cfg;
 }
 
-void help_collapse(char** argv) {
+void help_collapse(char** argv, bool print_all) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE [options]\n\n"
         << "Collapse homologous sequences in bubbles into a single node\n\n"
@@ -608,20 +632,25 @@ void help_collapse(char** argv) {
         << "      --max_iters        INT       maximum iterations for cut point propagation [" << CollapseOpts().max_iters << "]\n"
         << "      --min_new_frac     FLOAT     submit align only if the unaligned fraction ≥ threshold [" << CollapseOpts().min_new_frac << "]\n\n"
         << "Bubble Detection Options:\n"
-        << "      --depth            INT       maximum depth for bubble detection [" << BubbleOpts().max_depth << "]\n"
-        << "      --paths            INT       maximum number of paths to enumerate per bubble [" << BubbleOpts().max_paths << "]\n"
-        << "      --DFS_guard        INT       max DFS states [" << BubbleOpts().DFS_guard << "]\n"
-        << "      --cx_depth         INT       local BFS depth [" << BubbleOpts().cx_depth << "]\n"
-        << "      --cx_nodes         INT       local visited node cap [" << BubbleOpts().cx_nodes << "]\n"
-        << "      --cx_branches      INT       branching node cap [" << BubbleOpts().cx_branches << "]\n"
-        << "      --cx_deg_branch    INT       degree>=this counts as branching [" << BubbleOpts().cx_deg_branch << "]\n"
-        << "      --cx_deg_hub       INT       degree>=this counts as hub (complex) [" << BubbleOpts().cx_deg_hub << "]\n"
-        << "      --cx_deg_cap       INT       stop counting degree after this [" << BubbleOpts().cx_deg_cap << "]\n"
+        << "      --depth            INT       maximum DFS depth for path exploration inside a bubble [" << BubbleOpts().max_depth << "]\n"
+        << "      --paths            INT       maximum number of DFS paths to explore per bubble [" << BubbleOpts().max_paths << "]\n";
+    if (print_all) {
+        std::cerr
+            << "      --DFS_guard        INT       max DFS states [" << BubbleOpts().DFS_guard << "]\n"
+            << "      --cx_depth         INT       local BFS depth [" << BubbleOpts().cx_depth << "]\n"
+            << "      --cx_nodes         INT       local visited node cap [" << BubbleOpts().cx_nodes << "]\n"
+            << "      --cx_branches      INT       branching node cap [" << BubbleOpts().cx_branches << "]\n"
+            << "      --cx_deg_branch    INT       degree>=this counts as branching [" << BubbleOpts().cx_deg_branch << "]\n"
+            << "      --cx_deg_hub       INT       degree>=this counts as hub (complex) [" << BubbleOpts().cx_deg_hub << "]\n"
+            << "      --cx_deg_cap       INT       stop counting degree after this [" << BubbleOpts().cx_deg_cap << "]\n";
+    }
+    std::cerr
         << "      --path_diff        FLOAT     node difference ratio threshold for haplotype separation [" << BubbleOpts().path_diff << "]\n\n"
         << "General Options:\n"
         << "  -t, --threads          INT       threads [" << GlobalOpts().threads << "]\n"
         << "  -d, --debug                      debug mode (forces threads=1)\n"
-        << "  -h, --help                       show this help\n\n";
+        << "  -h, --help                       show this help\n"
+        << "      --help_all                   show all options\n\n";
 }
 
 AppConfig main_collapse(int argc, char** argv) {
@@ -655,6 +684,7 @@ AppConfig main_collapse(int argc, char** argv) {
         {"threads",         required_argument, nullptr, 't'},
         {"debug",           no_argument,       nullptr, 'd'},
         {"help",            no_argument,       nullptr, 'h'},
+        {"help_all",        no_argument,       nullptr, 5001},
         {0,0,0,0}
     };
     const char* short_opts = "g:p:k:w:t:dh";
@@ -685,8 +715,9 @@ AppConfig main_collapse(int argc, char** argv) {
             case 4012:  cfg.bubble.min_num          = (uint32_t)std::stoul(optarg);   break;
             case 't':   cfg.global.threads          = std::max(1, std::stoi(optarg)); break;
             case 'd':   cfg.global.debug            = true;                           break;
-            case 'h':   help_collapse(argv); std::exit(0);
-            default:    help_collapse(argv); std::exit(1);
+            case 'h':   help_collapse(argv);       std::exit(0);
+            case 5001:  help_collapse(argv, true); std::exit(0);
+            default:    help_collapse(argv);       std::exit(1);
         }
     }
     
@@ -902,24 +933,27 @@ void help_liftover(char** argv, const AppConfig& cfg, bool print_all) {
         << "      --regex         STR      keep hits whose label matches regex\n"
         << "                                (\"h\\d+tg\" to match h1tg, h2tg, ...)\n"
         << "      --min_frac      FLOAT    minimum fraction of the BED interval that must be lifted over [" << cfg.liftover.min_frac << "]\n"
-        << "                                (0.9 means at least 90% of the BED region is mapped)\n"
-        << "      --flank_win     INT      extension window size around BED ends to identify insertions [" << cfg.liftover.flank_win << "]\n"
-        << "      --max_flank     INT      max extension around BED ends to identify insertions [" << cfg.liftover.max_flank << "]\n"
-        << "      --max_gap       INT      max allowed |ref_gap - query_gap| when calling INS [" << cfg.liftover.max_gap << "]\n"
-        << "      --max_hit       INT      max extended liftover results to keep [" << cfg.liftover.max_hit << "]\n\n"
+        << "                                (0.9 means at least 90% of the BED region is mapped)\n";
+    if (print_all) {
+        std::cerr
+            << "      --flank_win     INT      extension window size around BED ends to identify insertions [" << cfg.liftover.flank_win << "]\n"
+            << "      --max_flank     INT      max extension around BED ends to identify insertions [" << cfg.liftover.max_flank << "]\n"
+            << "      --max_gap       INT      max allowed |ref_gap - query_gap| when calling INS [" << cfg.liftover.max_gap << "]\n"
+            << "      --max_hit       INT      max extended liftover results to keep [" << cfg.liftover.max_hit << "]\n";
+    }
+    std::cerr
+        << std::endl
         << "PAF Options:\n"
         << "      --min_len       INT      minimum alignment length for liftover [" << cfg.liftover.min_len << "]\n"
         << "      --min_mapq      INT      minimum mapping quality for liftover [" << cfg.liftover.min_mapq << "]\n\n"
         << "Check Options:\n"
         << "      --check                  run sequence consistency check, requires -r\n";
-
     if (print_all) {
         std::cerr
             << "  -w, --win           INT      window size [" << LiftoverOpts().win << "]\n"
             << "  -s, --step          INT      step size [" << LiftoverOpts().step << "]\n"
             << "      --max_examples  INT      max reported examples [" << LiftoverOpts().max_examples << "]\n";
-    }
-        
+    }  
     std::cerr 
         << std::endl
         << "CoordMap Options:\n"
@@ -1016,10 +1050,10 @@ AppConfig main_liftover(int argc, char** argv) {
     return cfg;
 }
 
-void help_mapq_boost(char** argv) {
+void help_mapq_boost(char** argv, bool print_all) {
     static const char* kTail =
         "    | liftasm mapq_boost -m merge.map \\\n"
-        "    | samtools view -b -q 10 -o out.boost.bam\n\n";
+        "    | samtools view -b -q 10 -o out.boost.bam\n";
 
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -m FILE [options]\n\n"
@@ -1045,29 +1079,49 @@ void help_mapq_boost(char** argv) {
         << "  STAR --genomeDir ./ --readFilesIn read.1.fq.gz read.2.fq.gz --readFilesCommand zcat \\\n"
         << "       --outSAMtype BAM Unsorted --outStd BAM_Unsorted \\\n"
         << kTail
+        << "  # minimap2 (Pore-C; large -N required due to many secondary alignments)\n"
+        << "  minimap2 -ax map-ont -N 1000 HG002.hap1_hap2.fa pore-c.fq.gz \\\n"
+        << kTail
+        << std::endl
         << "Input/Output:\n"
         << "  -m, --map             FILE    coordinate mapping file (generated by deoverlap/collapse/file2map)\n"
         << "  -i, --in              FILE    input SAM/BAM/CRAM (default: stdin)\n"
         << "  -o, --out             FILE    output SAM/BAM (default: stdout)\n\n"
-        << "Boost Options:\n"
-        << "      --batch           INT     batch size [" << MapqBoostOpts().batch_size << "]\n"
+        << "Boost Options:\n";
+    if (print_all) {
+        std::cerr << "      --batch           INT     batch size [" << MapqBoostOpts().batch_size << "]\n";
+    }
+    std::cerr
         << "      --mapq_low        INT     only raise if MAPQ<=Q (no larger than 255) [" << (int)MapqBoostOpts().mapq_low << "]\n"
         << "      --mapq_new        INT     new MAPQ value (no larger than 255) [" << (int)MapqBoostOpts().mapq_new << "]\n"
-        << "      --min_frac        FLOAT   min coverage fraction (no larger than 1) [" << MapqBoostOpts().min_frac << "]\n"
-        << "      --min_equivalents INT     min #equivalent contigs [" << MapqBoostOpts().min_equiv << "]\n"
+        << "      --min_frac        FLOAT   min coverage fraction (no larger than 1) [" << MapqBoostOpts().min_frac << "]\n";
+    if (print_all) {
+        std::cerr << "      --min_equivalents INT     min #equivalent contigs [" << MapqBoostOpts().min_equiv << "]\n";
+    }
+    std::cerr
         << "      --name_check              check whether QNAMEs are name-sorted (off by default)\n\n"
         << "CoordMap Options:\n"
         << "      --cm_max_hops     INT     BFS depth limit [" << CoordMapOpts().max_hops << "]\n"
-        << "                                 (e.g. 1 allows: source -> A; 2 allows: source -> A -> B)\n"
-        << "      --cm_max_fanout   INT     max fanout per search [" << CoordMapOpts().max_fanout << "]\n"
-        << "      --cm_min_len      INT     min length (bp) to keep a hit for hops [" << CoordMapOpts().min_len << "]\n"
-        << "      --cm_min_frac     FLOAT   min fraction of current interval length to keep a hit [" << CoordMapOpts().min_frac << "]\n"
-        << "                                 (threshold = max(min_len, cur_len * min_frac))\n"
-        << "      --cm_max_hits     INT     global BFS node cap [" << CoordMapOpts().max_total_hits << "]\n\n"
+        << "                                 (e.g. 1 allows: source -> A; 2 allows: source -> A -> B)\n";
+    if (print_all) {
+        std::cerr
+            << "      --cm_max_fanout   INT     max fanout per search [" << CoordMapOpts().max_fanout << "]\n"
+            << "      --cm_min_len      INT     min length (bp) to keep a hit for hops [" << CoordMapOpts().min_len << "]\n"
+            << "      --cm_min_frac     FLOAT   min fraction of current interval length to keep a hit [" << CoordMapOpts().min_frac << "]\n"
+            << "                                 (threshold = max(min_len, cur_len * min_frac))\n"
+            << "      --cm_max_hits     INT     global BFS node cap [" << CoordMapOpts().max_total_hits << "]\n";
+    }
+    std::cerr
+        << std::endl
+        << "Subgrouping Options:\n"
+        << "      --sub_ovlp_frac   FLOAT   minimum overlap fraction on read to cluster alignments into the same subgroup [" << MapqBoostOpts().sub_ovlp_frac << "]\n"
+        << "                                 (alignments overlapping the same read region are evaluated together)\n\n"
         << "General Options:\n"
         << "  -t, --threads         INT     worker threads [" << GlobalOpts().threads << "]\n"
         << "      --io_threads      INT     HTS I/O threads [" << GlobalOpts().IOthreads << "]\n"
-        << "  -h, --help                    show this help\n\n";
+        << "  -d, --debug                   debug mode (forces threads=1)\n"
+        << "  -h, --help                    show this help\n"
+        << "      --help_all                show all options\n\n";
 }
 
 AppConfig main_mapq_boost(int argc, char** argv) {
@@ -1091,12 +1145,15 @@ AppConfig main_mapq_boost(int argc, char** argv) {
         {"cm_min_len",      required_argument, nullptr, 2003},
         {"cm_min_frac",     required_argument, nullptr, 2004},
         {"cm_max_hits",     required_argument, nullptr, 2005},
+        {"sub_ovlp_frac",   required_argument, nullptr, 3001},
         {"threads",         required_argument, nullptr, 't'},
-        {"io_threads",      required_argument, nullptr, 3001},
+        {"io_threads",      required_argument, nullptr, 4001},
+        {"debug",           no_argument,       nullptr, 'd'},
         {"help",            no_argument,       nullptr, 'h'},
+        {"help_all",        no_argument,       nullptr, 4002},
         {0,0,0,0}
     };
-    const char* short_opts = "m:i:o:t:h";
+    const char* short_opts = "m:i:o:t:dh";
 
     int idx = 0, c;
     while ((c = getopt_long(argc, argv, short_opts, long_opts, &idx)) != -1) {
@@ -1115,10 +1172,13 @@ AppConfig main_mapq_boost(int argc, char** argv) {
             case 2003: cfg.coordmap.min_len        = (uint32_t)std::max(1, std::atoi(optarg));       break;
             case 2004: cfg.coordmap.min_frac       = std::max(0.0, std::atof(optarg));               break;
             case 2005: cfg.coordmap.max_total_hits = (uint32_t)std::max(1, std::atoi(optarg));       break;
-            case 3001: cfg.global.IOthreads        = std::max(1, std::atoi(optarg));                 break;
+            case 3001: cfg.homq.sub_ovlp_frac      = std::max(0.0, std::atof(optarg));               break;
+            case 4001: cfg.global.IOthreads        = std::max(1, std::atoi(optarg));                 break;
             case 't':  cfg.global.threads          = std::max(1, std::atoi(optarg));                 break;
-            case 'h': help_mapq_boost(argv); std::exit(0);
-            default: help_mapq_boost(argv);  std::exit(1);
+            case 'd':  cfg.global.debug            = true;                                           break;
+            case 'h':  help_mapq_boost(argv);       std::exit(0);
+            case 4002: help_mapq_boost(argv, true); std::exit(0);
+            default:   help_mapq_boost(argv);       std::exit(1);
         }
     }
 

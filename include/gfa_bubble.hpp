@@ -30,10 +30,10 @@ public:
     GfaBubbleFinder(
         const GfaGraph& graph, std::size_t max_depth, std::size_t max_paths, uint64_t dfs_guard, 
         uint16_t cx_depth, uint32_t cx_nodes, uint32_t cx_branches, int cx_deg_branch, int cx_deg_hub, int cx_deg_cap, 
-        double path_diff, bool skip_comp, uint32_t thread
+        double path_diff, bool skip_comp, bool keep_nested, uint32_t thread
     );
     
-    void find_bubbles(const bool filter_nonlocal = true);  // Run bubble detection over the whole graph.
+    void find_bubbles();  // Run bubble detection over the whole graph.
     const std::vector<Bubble>& get_bubbles() const noexcept { return bubbles_; }  // getters
     void save_bubble_as_gfa(const std::string& filename, const uint32_t min_len, const uint32_t min_num) const;  // Save all detected bubbles as an independent GFA sub‑graph.
     void print_bubbles() const;  // Print bubbles
@@ -100,6 +100,8 @@ private:
     const double      path_diff_;          // --path-diff: diff ratio threshold (<= is same cluster)
 
     const bool        skip_comp_;
+
+    const bool        keep_nested_;        // whether to keep bubbles contained within larger bubbles (i.e. non-local bubbles)
 
     // 0 = unknown, 1 = complex, 2 = simple
     static constexpr uint8_t UNKNOWN_FLAG_  = 0;

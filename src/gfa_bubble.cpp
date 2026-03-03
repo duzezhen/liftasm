@@ -9,10 +9,10 @@ namespace GfaBubble {
 GfaBubbleFinder::GfaBubbleFinder(
     const GfaGraph& g, std::size_t md, std::size_t mp, uint64_t dfs_guard, 
         uint16_t cx_depth, uint32_t cx_nodes, uint32_t cx_branches, int cx_deg_branch, int cx_deg_hub, int cx_deg_cap, 
-        double path_diff, bool sc, uint32_t thread)
+        double path_diff, bool sc, bool keep_nested, uint32_t thread)
     : graph_(g), max_depth_(md), max_paths_(mp), dfs_guard_(dfs_guard), 
     cx_depth_(cx_depth), cx_nodes_(cx_nodes), cx_branches_(cx_branches), cx_deg_branch_(cx_deg_branch), cx_deg_hub_(cx_deg_hub), cx_deg_cap_(cx_deg_cap), 
-    path_diff_(path_diff), skip_comp_(sc), thread_(thread)
+    path_diff_(path_diff), skip_comp_(sc), keep_nested_(keep_nested), thread_(thread)
 {
     const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
     reach_buf_.assign(V, UNVIS_FLAG_);
@@ -242,7 +242,7 @@ bool GfaBubbleFinder::is_complex_source_(
     return false;
 }
 
-void GfaBubbleFinder::find_bubbles(const bool filter_nonlocal)
+void GfaBubbleFinder::find_bubbles()
 {
     log_stream() << "Detecting bubbles ...\n";
     bubbles_.clear();
@@ -339,7 +339,7 @@ void GfaBubbleFinder::find_bubbles(const bool filter_nonlocal)
     }
 
     // 4. Post-processing
-    if (filter_nonlocal) filter_nonlocal_bubbles_();
+    if (!keep_nested_) filter_nonlocal_bubbles_();
     log_stream() << "   - Total bubbles detected: " << bubbles_.size() << "\n";
 }
 

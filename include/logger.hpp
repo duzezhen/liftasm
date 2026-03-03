@@ -33,8 +33,10 @@ inline std::ostream& null_stream() {
     return ns;
 }
 
+// // Format: [L::<FILE>:<LINE> <func>::] <message>
+// #define debug_stream() (DEBUG_ENABLED ? (std::cerr << "[D::" << __FILE__ << ":" << __LINE__ << " " << pad_func_name(__func__) << "] ") : null_stream())
 // Format: [L::<FILE>:<LINE> <func>::] <message>
-#define debug_stream() (DEBUG_ENABLED ? (std::cerr << "[D::" << __FILE__ << ":" << __LINE__ << " " << pad_func_name(__func__) << "] ") : null_stream())
+#define debug_stream() (DEBUG_ENABLED ? (std::cerr << "[D::" << __FILE__ << "::" << pad_func_name(__func__) << "] ") : null_stream())
 
 inline void set_debug(bool on) {
     DEBUG_ENABLED = on;
