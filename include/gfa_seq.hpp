@@ -2,12 +2,13 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+
 #include "gfa_parser.hpp"
 
 // Simple extractor: read compact marker paths and emit concatenated sequences.
 // Path grammar (now supports two forms):
-//   A) Prefix markers: '<' = reverse, '>' = forward, e.g. "<s1>s2"
-//   B) s1+,s2-,s3,s4+
+//   A. Prefix markers: '<' = reverse, '>' = forward, e.g. "<s1>s2"
+//   B. Suffix markers: s1+,s2-,s3,s4+
 //
 class GfaSeq : public GfaGraph {
 public:
