@@ -104,7 +104,7 @@ struct File2mapOpts {
 };
 
 struct CoordMapOpts {
-    int      max_hops       = 15;
+    int      max_hops       = 8;
     uint32_t max_fanout     = 512;
     uint32_t min_len        = 15;
     double   min_frac       = 0.10;
@@ -216,7 +216,7 @@ void help_file2map(char** argv);
 
 // Liftover coordinates using a mapping file
 AppConfig main_liftover(int argc, char** argv);
-void help_liftover(char** argv, const AppConfig& cfg, bool print_all=false);
+void help_liftover(char** argv, bool print_all=false);
 
 // adjust mapping quality
 AppConfig main_mapq_boost(int argc, char** argv);

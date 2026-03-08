@@ -54,11 +54,6 @@ private:
     const int          io_threads_;
 
 private:
-    // query interval on read in forward coordinates (0-based, [qb,qe)), returns false if no aligned query span
-    bool get_query_interval_fwd(const bam1_t* r, uint32_t& qb, uint32_t& qe) const;
-    // overlap for [b1,e1) and [b2,e2)
-    bool query_overlap(uint32_t b1, uint32_t e1, uint32_t b2, uint32_t e2) const;
-    double query_overlap_frac(uint32_t b1, uint32_t e1, uint32_t b2, uint32_t e2) const;
     // Build subgroups for one read group:
     // 1. same read_end_id (0/1/2), 2. query intervals overlap (on forward read coordinates)
     void build_subgroups_by_query_overlap(

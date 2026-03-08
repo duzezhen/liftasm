@@ -1,7 +1,9 @@
 #pragma once
 #include <string>
+#include <string_view>
 #include <cstdint>
 #include <vector>
+#include <utility>
 
 namespace CIGAR {
 
@@ -14,51 +16,75 @@ struct COp {
 
 /**
  * @brief Parse a CIGAR string into a vector of COp.
- * @date 2025-08-08
- * 
- * @param cig CIGAR string (e.g., "10M1I5D3M")
- * @param out Output vector of COp, each COp contains length and operation type.
- * 
- * @return Parsed vector of COp.
  */
 std::vector<COp> parse(const std::string &cigar);
+std::vector<COp> parse(std::string_view cigar);
 
 /**
- * @brief Prepend a COp to the beginning of the ops vector.
- * @date 2025-08-08
- * 
- * If the first operation is the same as the new one, it will increase its length.
- * Otherwise, it will insert a new COp at the front.
- * 
- * @param ops Vector of COp to modify.
- * @param len Length of the operation to prepend.
- * @param op Operation type (e.g., 'M', 'I', 'D').
+ * @brief Prepend one operation.
  */
-void prepend(std::vector<COp> &ops, uint32_t len, char op);
+void prepend(std::vector<COp>& ops, uint32_t len, char op);
 
 /**
- * @brief Append a COp to the end of the ops vector.
- * @date 2025-08-08
- * 
- * If the last operation is the same as the new one, it will increase its length.
- * Otherwise, it will add a new COp at the end.
- * 
- * @param ops Vector of COp to modify.
- * @param len Length of the operation to append.
- * @param op Operation type (e.g., 'M', 'I', 'D').
+ * @brief Append one operation.
  */
-void append(std::vector<COp> &ops, uint32_t len, char op);
+void append(std::vector<COp>& ops, uint32_t len, char op);
 
 /**
- * @brief Pack a vector of COp into a CIGAR string.
- * @date 2025-08-08
- * 
- * The output string will be in the format of "10M1I5D3M".
- * If the ops vector is empty, it returns "*".
- * 
- * @param ops Vector of COp to pack.
- * @return Packed CIGAR string.
+ * @brief Pack COp vector into CIGAR string.
  */
-std::string pack(const std::vector<COp> &ops);
+std::string pack(const std::vector<COp>& ops);
+
+
+/**
+ * @brief Convert BAM packed CIGAR array to string
+ */
+std::string to_string(const uint32_t* cigar, uint32_t n);
+
+/**
+ * @brief Reference span consumed by CIGAR string.
+ * Count M/D/N/=/X
+ */
+uint32_t ref_span(std::string_view cigar);
+uint32_t ref_span(const uint32_t* cigar, uint32_t n);
+
+/**
+ * @brief Query aligned span consumed by CIGAR string.
+ * Count M/I/=/X, but not S/H.
+ */
+uint32_t query_span_aligned(std::string_view cigar);
+uint32_t query_span_aligned(const uint32_t* cigar, uint32_t n);
+
+/**
+ * @brief Total read/query span represented by CIGAR string.
+ * Count M/I/S/H/=/X
+ */
+uint32_t query_span(std::string_view cigar);
+uint32_t query_span(const uint32_t* cigar, uint32_t n);
+
+/**
+ * @brief Match length from CIGAR string.
+ * Count M/=/X
+ */
+uint32_t match_len(std::string_view cigar);
+uint32_t match_len(const uint32_t* cigar, uint32_t n);
+
+/**
+ * @brief Split reference-consuming blocks by N from CIGAR string.
+ * [beg1,end1), [beg2,end2), ...
+ */
+std::vector<std::pair<uint32_t,uint32_t>> ref_blocks(uint32_t ref_beg, std::string_view cigar);
+std::vector<std::pair<uint32_t,uint32_t>> ref_blocks(uint32_t ref_beg, const uint32_t* cigar, uint32_t n);
+
+/**
+ * @brief Sum total bases in blocks.
+ */
+uint32_t total_block_bases(const std::vector<std::pair<uint32_t,uint32_t>>& blocks);
+
+/**
+ * @brief Compute aligned query interval [qb,qe) in forward-read coordinates.
+ */
+bool query_interval_fwd(std::string_view cigar, bool is_rev, uint32_t& qb, uint32_t& qe);
+bool query_interval_fwd(const uint32_t* cigar, uint32_t n, bool is_rev, uint32_t& qb, uint32_t& qe);
 
 } // namespace CIGAR

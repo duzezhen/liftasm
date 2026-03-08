@@ -105,6 +105,24 @@ static inline void paf_emit_match_blocks(const paf::Record& p, std::ostream& out
     flush();
 }
 
+static inline void validate_paf_record_names(const paf::Record& r) {
+    auto check = [](const std::string& s, const char* kind) {
+        for (char c : s)
+            if (c == ':' || c == '-' || c == '+') {
+                error_stream() << "Invalid " << kind << " sequence name '" << s << "' (must not contain ':', '-', '+').\n";
+                std::exit(1);
+            }
+    };
+
+    check(r.qname, "query");
+    check(r.tname, "reference");
+
+    if (r.qname == r.tname) {
+        error_stream() << "Reference and query sequence names must be different ('" << r.qname << "').\n";
+        std::exit(1);
+    }
+}
+
 static inline bool keep_paf_record(const paf::Record& r, bool primary_only, uint32_t min_len, int min_mapq) {
     if (!primary_only) return true;
     const uint32_t tlen = r.tend - r.tstart;
@@ -123,6 +141,7 @@ static inline void paf_to_map(const std::string& paf_path, std::ostream& out, bo
     paf::Reader rd(paf_path);
     paf::Record r;
     while (rd.next(r)) {
+        validate_paf_record_names(r);  // Name check to prevent confusion with map coordinate formats (e.g., "chr1:100-200+")
         if (!keep_paf_record(r, primary_only, min_len, min_mapq)) continue;  // primary, alignment length and mapq filter
         paf_emit_match_blocks(r, out);
     }

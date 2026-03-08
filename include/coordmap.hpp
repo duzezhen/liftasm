@@ -4,6 +4,7 @@
 #include <string_view>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <fstream>
 #include <algorithm>
@@ -12,7 +13,7 @@
 #include <cassert>
 #include <cctype>
 #include <cmath>
-#include <unordered_set>
+#include <utility>
 
 #include "logger.hpp"
 
@@ -44,13 +45,13 @@ inline std::string to_string(const Hit& h, std::string_view ctg_name) {
 // ------------------------- Binner -------------------------
 struct Binner {
     // 16K,128K,1M,8M,64M,512M (covers up to 2^29)
-    static constexpr uint32_t BIN_FIRST_SHIFT = 14; // 16K
+    static constexpr uint32_t BIN_FIRST_SHIFT = 14;  // 16K
     static constexpr uint32_t BIN_NEXT_SHIFT  = 3;
 
     static inline void reg2bins(uint32_t beg, uint32_t end, std::vector<uint32_t>& vec) {
-        if (end == 0) return;
+        if (end == 0 || beg >= end) return;
         if (end > (1u<<29)) end = (1u<<29);
-        --end; // [beg,end) -> [beg,end] for binning
+        --end;  // [beg,end) -> [beg,end] for binning
 
         static constexpr uint32_t kLevelOffsets[] = {0, 1, 9, 73, 585, 4681};
 
@@ -81,29 +82,55 @@ struct Piece {               // Normalized piece on a single contig (e.g., utg00
 struct Slice { uint32_t beg = 0, end = 0; bool has = false; };
 
 struct SidePlan {              // e.g., utg000032l:1745955-1744739:0-3+
-    std::vector<Piece> pieces; // Concatenated pieces in written order (beg, end, len, dir=+1/-1) (e.g., utg000032l, 1744739, 1745955, -1)
-    Slice clip;                // Sub-interval on virtual sequence (e.g., 0, 3)
-    bool  sign_plus = true;    // Trailing +/- (walk direction) (e.g., +)
+    std::vector<Piece> pieces; // concatenated pieces in written order
+    Slice clip;                // Sub-interval on virtual sequence
+    bool  sign_plus = true;    // Trailing +/- (walk direction)
     uint64_t total_len = 0;    // Total concatenated length
+};
+
+// Transform string/string_view/char to hash value
+struct TransparentStringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+    size_t operator()(const std::string& s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+    size_t operator()(const char* s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+};
+
+struct TransparentStringEq {
+    using is_transparent = void;
+    bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
+    bool operator()(const std::string& a, const std::string& b) const noexcept { return a == b; }
+    bool operator()(const std::string& a, std::string_view b) const noexcept { return a == b; }
+    bool operator()(std::string_view a, const std::string& b) const noexcept { return a == b; }
 };
 
 class CoordMap {
 public:
     bool load(const std::string& path) {
         clear();
+
         std::ifstream in(path);
         if (!in) {
             error_stream() << path << ": No such file or directory" << std::endl;
             std::exit(1);
         }
-        std::string line; line.reserve(512);
-        uint32_t n_line = 0;
 
-        std::vector<Record> tmp; tmp.reserve(1<<20);
+        std::string line;
+        line.reserve(512);
+        uint32_t n_line = 0;
+        std::vector<Record> tmp;
+        tmp.reserve(1u << 20);
 
         while (std::getline(in, line)) {
-            ++n_line; trim(line);
-            if (line.empty() || line[0]=='#') continue;
+            ++n_line;
+            trim(line);
+            if (line.empty() || line[0] == '#') continue;
 
             std::string_view L, R;
             if (!split_two_tokens(line, L, R)) {
@@ -111,7 +138,6 @@ public:
                 std::exit(1);
             }
 
-            // parse sides
             SidePlan A, B;
             if (!parse_side(L, A, n_line)) return false;
             if (!parse_side(R, B, n_line)) return false;
@@ -122,7 +148,7 @@ public:
             apply_sign_to_consumption(As, A.sign_plus);
             apply_sign_to_consumption(Bs, B.sign_plus);
 
-            // Length check
+            // length check
             uint64_t lenA = total_len(As), lenB = total_len(Bs);
             if (lenA != lenB) {
                 error_stream() << path << ": Length mismatch at line " << n_line << std::endl;
@@ -155,19 +181,25 @@ public:
      * @return                Vector of Hit structs with target positions and orientations
      */
     std::vector<Hit> map_range(
-        std::string_view ctg, uint32_t qbeg, uint32_t qend, 
+        std::string_view ctg, uint32_t qbeg, uint32_t qend,
         int max_hops = 15, size_t max_fanout = 512, uint32_t min_len = 15,
         double min_frac = 0.1, size_t max_total_hits = 2000, bool merge_indels = false
     ) const {
         std::vector<Hit> out;
         if (qbeg >= qend) return out;
 
-        auto it = name2id_.find(std::string(ctg));
+        auto it = name2id_.find(ctg);
         if (it == name2id_.end()) return out;
         const uint32_t src_ctg = it->second;
 
+        QueryWorkspace& ws = tls_workspace_();
+        ws.prepare_for_map(*this);
+
         // visited: (ctg,beg,end,rev) to avoid loops
-        struct Key { uint32_t ctg, beg, end; bool rev; };
+        struct Key {
+            uint32_t ctg, beg, end;
+            bool rev;
+        };
         struct KeyHash {
             size_t operator()(const Key& k) const noexcept {
                 uint64_t x = (uint64_t(k.ctg) << 32) ^ uint64_t(k.beg);
@@ -181,9 +213,10 @@ public:
                 return a.ctg==b.ctg && a.beg==b.beg && a.end==b.end && a.rev==b.rev;
             }
         };
-        std::unordered_map<Key, uint8_t, KeyHash, KeyEq> visited;
-        visited.reserve(128);
-        visited.emplace(Key{src_ctg, qbeg, qend, false}, 1);  // mark source
+
+        std::unordered_set<Key, KeyHash, KeyEq> visited;
+        visited.reserve(256);
+        visited.insert(Key{src_ctg, qbeg, qend, false});  // mark source
 
         // BFS queue
         struct Node {
@@ -192,7 +225,9 @@ public:
             bool     rev_to_src;        // relative to source, whether reversed
             int      depth;             // number of hops
         };
-        std::vector<Node> q; q.reserve(128);
+
+        std::vector<Node> q;
+        q.reserve(256);
         q.push_back(Node{src_ctg, qbeg, qend, qbeg, qend, false, 0});
 
         auto to_src_interval = [](const Node& cur, uint32_t sub_qbeg, uint32_t sub_qend) -> std::pair<uint32_t,uint32_t> {
@@ -220,6 +255,7 @@ public:
         };
 
         size_t total_nodes = 0;
+
         for (size_t qi = 0; qi < q.size(); ++qi) {
             if (++total_nodes > max_total_hits) break;
 
@@ -227,47 +263,54 @@ public:
             const uint32_t cur_len = cur.end - cur.beg;
 
             // Hop: map current interval to other contigs
-            auto step_hits = map_range_internal(cur.ctg, cur.beg, cur.end);
+            std::vector<Hit> step_hits = map_range_internal_(cur.ctg, cur.beg, cur.end, ws);
             if (step_hits.empty()) continue;
 
             // 1. First hop (depth==0): don't filter
             // 2. Next hops (depth>0): filter using min_keep_len(cur_len)
             if (cur.depth > 0) {
                 const uint32_t min_keep = min_keep_len(cur_len);
-                size_t out_i = 0;
-                for (auto& h : step_hits) {
+                size_t w = 0;
+                for (size_t i = 0; i < step_hits.size(); ++i) {
+                    const auto& h = step_hits[i];
                     uint32_t tlen = h.end  - h.beg;
                     uint32_t qlen = h.qend - h.qbeg;
-                    if (tlen >= min_keep && qlen >= min_keep)
-                        step_hits[out_i++] = h;
+                    if (tlen >= min_keep && qlen >= min_keep) {
+                        step_hits[w++] = h;
+                    }
                 }
-                step_hits.resize(out_i);
+                step_hits.resize(w);
                 if (step_hits.empty()) continue;
             }
 
             // Merge overlapping/adjacent hits to reduce fan-out
-            step_hits = merge_adjacent_hits(step_hits);
+            merge_adjacent_hits(step_hits);
+            if (step_hits.empty()) continue;
 
             // Keep top K longest hits for expansion
-            std::vector<size_t> order; order.reserve(step_hits.size());
-            for (size_t i = 0; i < step_hits.size(); ++i) order.push_back(i);
-            std::sort(order.begin(), order.end(), [&](size_t a, size_t b){
-                return (step_hits[a].end-step_hits[a].beg) > (step_hits[b].end-step_hits[b].beg);
-            });
+            size_t expand_limit = std::min(step_hits.size(), max_fanout);
+            if (expand_limit < step_hits.size()) {
+                std::nth_element(
+                    step_hits.begin(),
+                    step_hits.begin() + expand_limit,
+                    step_hits.end(),
+                    [](const Hit& a, const Hit& b) {
+                        return (a.end - a.beg) > (b.end - b.beg);
+                    }
+                );
+            }
 
-            size_t expand_limit = std::min(order.size(), max_fanout);
-
-            for (size_t oi = 0; oi < order.size(); ++oi) {
-                const Hit& h1 = step_hits[order[oi]];
+            for (size_t i = 0; i < step_hits.size(); ++i) {
+                const Hit& h1 = step_hits[i];
 
                 if (h1.ctg == src_ctg) continue;
                 if (h1.ctg == cur.ctg) continue;
 
                 const bool cum_rev = (cur.rev_to_src ^ h1.rev);
-
                 Key k{h1.ctg, h1.beg, h1.end, cum_rev};
+
                 if (visited.find(k) != visited.end()) continue;
-                visited.emplace(k, 1);
+                visited.insert(k);
 
                 // Remap sub-interval back to source coordinates
                 auto [src_sub_b, src_sub_e] = to_src_interval(cur, h1.qbeg, h1.qend);
@@ -286,29 +329,29 @@ public:
                 if (cur.depth >= max_hops) continue;
 
                 // Only allow the top K longest hits to enter the next level, limiting fan-out
-                if (oi < expand_limit) {
-                    q.push_back(Node{h1.ctg, h1.beg, h1.end, src_sub_b, src_sub_e, cum_rev, cur.depth+1});
+                if (i < expand_limit) {
+                    q.push_back(Node{h1.ctg, h1.beg, h1.end, src_sub_b, src_sub_e, cum_rev, cur.depth + 1});
                 }
             }
         }
 
         // Compress the output again to reduce fragmentation
-        out = merge_adjacent_hits(out);
+        merge_adjacent_hits(out);
+
         if (merge_indels) {
             std::vector<Hit> merged_hits = hits_chaining(out);
             if (merged_hits.empty()) return out;
             double fracTmp = double(merged_hits[0].qend - merged_hits[0].qbeg) / double(qend - qbeg);
-            if (fracTmp >= min_frac) { return merged_hits; }
+            if (fracTmp >= min_frac) return merged_hits;
         }
 
         return out;
     }
 
     // Merge adjacent/overlapping hits on the same contig and strand
-    std::vector<Hit> merge_adjacent_hits(std::vector<Hit> hits) const {
-        if (hits.size() <= 1) return hits;
+    static void merge_adjacent_hits(std::vector<Hit>& hits) {
+        if (hits.size() <= 1) return;
 
-        // Sort by (rev, ctg, qbeg)
         std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
             if (a.rev  != b.rev)  return a.rev  < b.rev;
             if (a.ctg  != b.ctg)  return a.ctg  < b.ctg;
@@ -318,31 +361,33 @@ public:
             return a.end < b.end;
         });
 
-        std::vector<Hit> out;
-        out.reserve(hits.size());
-
-        Hit cur = hits[0];
+        size_t w = 0;
         for (size_t i = 1; i < hits.size(); ++i) {
+            Hit& cur = hits[w];
             const Hit& nx = hits[i];
 
-            if (cur.ctg != nx.ctg || cur.rev != nx.rev) {  // Different contig or strand
-                out.push_back(cur); cur = nx; continue;
+            if (cur.ctg != nx.ctg || cur.rev != nx.rev) {
+                hits[++w] = nx;
+                continue;
             }
 
-            uint32_t q_gap, t_gap;
-            q_gap = cur.qend >= nx.qbeg ? cur.qend - nx.qbeg : UINT32_MAX;
-            if (!cur.rev) { t_gap = cur.end >= nx.beg ? cur.end - nx.beg : UINT32_MAX; }  // forward
-            else          { t_gap = nx.end >= cur.beg ? nx.end - cur.beg : UINT32_MAX; }  // reverse
+            uint32_t q_gap = (cur.qend >= nx.qbeg) ? (cur.qend - nx.qbeg) : UINT32_MAX;
+            uint32_t t_gap;
+            if (!cur.rev) t_gap = (cur.end >= nx.beg) ? (cur.end - nx.beg) : UINT32_MAX;  // forward
+            else          t_gap = (nx.end >= cur.beg) ? (nx.end - cur.beg) : UINT32_MAX;  // reverse
 
-            if (q_gap == UINT32_MAX || t_gap == UINT32_MAX || q_gap != t_gap) { out.push_back(cur); cur = nx; continue; }
+            if (q_gap == UINT32_MAX || t_gap == UINT32_MAX || q_gap != t_gap) {
+                hits[++w] = nx;
+                continue;
+            }
 
             cur.qbeg = std::min(cur.qbeg, nx.qbeg);
             cur.qend = std::max(cur.qend, nx.qend);
             cur.beg  = std::min(cur.beg , nx.beg );
             cur.end  = std::max(cur.end , nx.end );
         }
-        out.push_back(cur);
-        return out;
+
+        hits.resize(w + 1);
     }
 
     // DP and chaining
@@ -351,7 +396,7 @@ public:
         uint32_t max_lookback = 10,
         uint32_t max_gap = 20000,
         uint32_t max_off_diff = 500,
-        double gap_pen =0.1
+        double gap_pen = 0.1
     ) {
         auto len = [](const Hit& h)->uint32_t {
             uint32_t qlen = (h.qend > h.qbeg) ? (h.qend - h.qbeg) : 0u;
@@ -363,9 +408,9 @@ public:
         };
         auto iabs64 = [](int64_t x)->uint64_t { return (uint64_t)(x < 0 ? -x : x); };
 
-        // copy and sort
         std::vector<Hit> v = hits;
         v.erase(std::remove_if(v.begin(), v.end(), [&](const Hit& h){ return len(h) == 0; }), v.end());
+
         std::sort(v.begin(), v.end(), [&](const Hit& a, const Hit& b){
             if (a.ctg  != b.ctg)  return a.ctg  < b.ctg;
             if (a.rev  != b.rev)  return a.rev  < b.rev;
@@ -464,7 +509,6 @@ public:
             out.push_back(merged);
         }
 
-        // Sort by length descending
         std::sort(out.begin(), out.end(), [](const Hit& a, const Hit& b){
             uint32_t alen = a.qend - a.qbeg;
             uint32_t blen = b.qend - b.qbeg;
@@ -478,17 +522,52 @@ public:
     }
 
     // Internal data
-    const std::string& contig_name(uint32_t id) const { return id < id2name_.size()? id2name_[id] : kEmpty_; }
-    const std::uint32_t contig_id(std::string_view name) const {
-        auto it = name2id_.find(std::string(name));
+    const std::string& contig_name(uint32_t id) const {
+        return id < id2name_.size() ? id2name_[id] : kEmpty_;
+    }
+
+    uint32_t contig_id(std::string_view name) const {
+        auto it = name2id_.find(name);
         return it != name2id_.end() ? it->second : std::numeric_limits<uint32_t>::max();
     }
+
     size_t num_records() const { return recs_.size(); }
 
     void clear() {
         recs_.clear();
-        name2id_.clear(); id2name_.clear();
+        name2id_.clear();
+        id2name_.clear();
         idx_.clear();
+    }
+
+private:
+    struct QueryWorkspace {
+        std::vector<uint32_t> seen_refs;
+        uint32_t seen_stamp = 1;
+        std::vector<uint32_t> qb;
+
+        void prepare_for_map(const CoordMap& cm) {
+            const size_t need = cm.recs_.size() * 2u;
+            if (seen_refs.size() < need) {
+                seen_refs.assign(need, 0u);
+                seen_stamp = 1;
+            }
+            qb.clear();
+            qb.reserve(16);
+        }
+
+        void next_stamp() {
+            ++seen_stamp;
+            if (seen_stamp == 0) {
+                std::fill(seen_refs.begin(), seen_refs.end(), 0u);
+                seen_stamp = 1;
+            }
+        }
+    };
+
+    static QueryWorkspace& tls_workspace_() {
+        static thread_local QueryWorkspace ws;
+        return ws;
     }
 
 private:
@@ -505,10 +584,13 @@ private:
         size_t i = 0, n = line.size();
         while (i < n && std::isspace((unsigned char)line[i])) ++i;
         size_t j = i; while (j < n && !std::isspace((unsigned char)line[j])) ++j;
-        if (i == j) return false; A = std::string_view(line).substr(i, j - i);
+        if (i == j) return false;
+        A = std::string_view(line).substr(i, j - i);
+
         while (j < n && std::isspace((unsigned char)line[j])) ++j;
         size_t k = j; while (k < n && !std::isspace((unsigned char)line[k])) ++k;
-        if (j == k) return false; B = std::string_view(line).substr(j, k - j);
+        if (j == k) return false;
+        B = std::string_view(line).substr(j, k - j);
         return true;
     }
     // Trim leading and trailing whitespace from a std::string_view in place
@@ -526,14 +608,17 @@ private:
             x = x*10 + (c - '0');
             if (x > std::numeric_limits<uint32_t>::max()) return false;
         }
-        out = (uint32_t)x; return true;
+        out = (uint32_t)x;
+        return true;
     }
     // Parse "num-num" format (e.g., "12-34") into two uint32_t values.
     static bool parse_numdash_num(std::string_view sv, uint32_t& a, uint32_t& b) {
         trim_view(sv);
-        size_t m = sv.find('-'); if (m == std::string_view::npos) return false;
+        size_t m = sv.find('-');
+        if (m == std::string_view::npos) return false;
         std::string_view s1 = sv.substr(0, m), s2 = sv.substr(m + 1);
-        trim_view(s1); trim_view(s2);
+        trim_view(s1);
+        trim_view(s2);
         return sv_to_u32(s1, a) && sv_to_u32(s2, b);
     }
 
@@ -544,7 +629,7 @@ private:
         uint32_t id = (uint32_t)id2name_.size();
         id2name_.push_back(name);
         name2id_.emplace(name, id);
-        if (id >= idx_.size()) idx_.resize(id+1);
+        if (id >= idx_.size()) idx_.resize(id + 1);
         return id;
     }
 
@@ -559,33 +644,45 @@ private:
             std::exit(1);
         }
 
-        // directional
+        // +/-
         char tail = sv.back();
-        if (tail == '+' || tail == '-') { out.sign_plus = (tail == '+'); sv.remove_suffix(1); trim_view(sv); }
+        if (tail == '+' || tail == '-') {
+            out.sign_plus = (tail == '+');
+            sv.remove_suffix(1);
+            trim_view(sv);
+        }
 
         // Split concatenation pieces by ';'.
         std::vector<std::string_view> parts;
         size_t start = 0;
         while (start < sv.size()) {
             size_t pos = sv.find(';', start);
-            if (pos == std::string_view::npos) { parts.push_back(sv.substr(start)); break; }
+            if (pos == std::string_view::npos) {
+                parts.push_back(sv.substr(start));
+                break;
+            }
             parts.push_back(sv.substr(start, pos - start));
             start = pos + 1;
         }
+
         if (parts.empty()) {
             error_stream() << "Bad side at line " << line_no << std::endl;
             std::exit(1);
         }
 
         // Detect optional global slice in the last piece (e.g., h1tg000002l:12400-12345:0-50+)
-        std::string_view last = parts.back(); trim_view(last);
+        std::string_view last = parts.back();
+        trim_view(last);
+
         size_t first_colon = last.find(':');
         if (first_colon == std::string_view::npos) {
             error_stream() << "Missing ':' in side at line " << line_no << std::endl;
             std::exit(1);
         }
+
         size_t last_colon = last.rfind(':');
         std::optional<Slice> gslice;
+
         if (last_colon != first_colon) {
             std::string_view sub = last.substr(last_colon + 1);
             uint32_t sb = 0, se = 0;
@@ -605,25 +702,35 @@ private:
                 error_stream() << "Bad piece (no ':') at line " << line_no << std::endl;
                 std::exit(1);
             }
-            std::string name(p.substr(0,c));
+
+            std::string name(p.substr(0, c));
             trim(name);
-            std::string_view rg = p.substr(c + 1); trim_view(rg);
+
+            std::string_view rg = p.substr(c + 1);
+            trim_view(rg);
 
             uint32_t x = 0, y = 0;
             if (!parse_numdash_num(rg, x, y) || x == y) {
                 error_stream() << "Bad or zero-length range at line " << line_no << std::endl;
                 std::exit(1);
             }
+
             uint32_t lo = std::min(x, y), hi = std::max(x, y);
-            int8_t dir  = (y > x ? +1 : -1);
+            int8_t dir = (y > x ? +1 : -1);
+
             Piece pc;
             pc.ctg = intern_ctg(name);
-            pc.beg = lo; pc.end = hi; pc.dir = dir;
+            pc.beg = lo;
+            pc.end = hi;
+            pc.dir = dir;
+
             out.pieces.push_back(pc);
-            out.total_len += (hi-lo);
+            out.total_len += (hi - lo);
         }
+
         if (gslice.has_value()) out.clip = *gslice;
         else out.clip = Slice{0, (uint32_t)out.total_len, false};
+
         return true;
     }
 
@@ -642,6 +749,7 @@ private:
         uint64_t total = sp.total_len;
         uint32_t qs = sp.clip.has ? sp.clip.beg : 0;
         uint32_t qe = sp.clip.has ? sp.clip.end : (uint32_t)total;
+
         if (qs > qe) std::swap(qs, qe);
         if (qe > total) qe = (uint32_t)total;
 
@@ -659,7 +767,10 @@ private:
             uint32_t off0 = (uint32_t)(std::max<uint64_t>(qs, seg_s) - seg_s);
             uint32_t off1 = (uint32_t)(std::min<uint64_t>(qe, seg_e) - seg_s);
             // Map [off0,off1) (virtual offset) to "real coordinates"
-            Piece sub; sub.ctg = pc.ctg; sub.dir = pc.dir;
+            Piece sub;
+            sub.ctg = pc.ctg;
+            sub.dir = pc.dir;
+
             if (pc.dir > 0) {
                 sub.beg = pc.beg + off0;
                 sub.end = pc.beg + off1;
@@ -680,10 +791,14 @@ private:
         std::reverse(v.begin(), v.end());
         for (auto& p : v) p.dir = -p.dir;
     }
+
     // Sum of lengths of pieces
     static uint64_t total_len(const std::vector<Piece>& v) {
-        uint64_t s = 0; for (auto& p : v) s += (p.end - p.beg); return s;
+        uint64_t s = 0;
+        for (const auto& p : v) s += (p.end - p.beg);
+        return s;
     }
+
     // Example:
     //   A: [ [A1,100,110,+1], [A2,200,206,-1] ]   (total 10+6=16)
     //   B: [ [B1,500,508,+1], [B2,900,908,-1] ]   (total  8+8=16)
@@ -699,10 +814,12 @@ private:
         while (ia < A.size() && ib < B.size()) {
             const Piece& pa = A[ia];
             const Piece& pb = B[ib];
+
             assert(pa.dir == +1 || pa.dir == -1);
             assert(pb.dir == +1 || pb.dir == -1);
+
             if (pa.ctg == pb.ctg) {
-                if (warned_same_ctg_.insert(pa.ctg).second){
+                if (warned_same_ctg_.insert(pa.ctg).second) {
                     warning_stream() << "Reference and query contig names must be different: " << contig_name(pa.ctg) << "\n";
                 }
             }
@@ -712,17 +829,34 @@ private:
             uint32_t delta = std::min(a_rem, b_rem);
             assert(delta > 0);
 
-            Record r; r.a_ctg = pa.ctg; r.b_ctg = pb.ctg;
-            r.a_dir = pa.dir; r.b_dir = pb.dir;
+            Record r;
+            r.a_ctg = pa.ctg;
+            r.b_ctg = pb.ctg;
+            r.a_dir = pa.dir;
+            r.b_dir = pb.dir;
             r.rev   = (r.a_dir != r.b_dir);
 
             // Take delta from A
-            if (pa.dir > 0) { r.a.beg = a_pos;         r.a.end = a_pos + delta; a_pos += delta; }
-            else            { r.a.beg = a_pos - delta; r.a.end = a_pos;         a_pos -= delta; }
+            if (pa.dir > 0) {
+                r.a.beg = a_pos;
+                r.a.end = a_pos + delta;
+                a_pos += delta;
+            } else {
+                r.a.beg = a_pos - delta;
+                r.a.end = a_pos;
+                a_pos -= delta;
+            }
 
             // Take delta from B
-            if (pb.dir > 0) { r.b.beg = b_pos;         r.b.end = b_pos + delta; b_pos += delta; }
-            else            { r.b.beg = b_pos - delta; r.b.end = b_pos;         b_pos -= delta; }
+            if (pb.dir > 0) {
+                r.b.beg = b_pos;
+                r.b.end = b_pos + delta;
+                b_pos += delta;
+            } else {
+                r.b.beg = b_pos - delta;
+                r.b.end = b_pos;
+                b_pos -= delta;
+            }
 
             outRecs.push_back(r);
 
@@ -739,13 +873,16 @@ private:
     }
 
     // ==================== Index ====================
-    struct ContigIndex { std::unordered_map<uint32_t, std::vector<uint32_t>> bin2refs; };  // key=bin, value=packed ref ids
+    struct ContigIndex {
+        std::unordered_map<uint32_t, std::vector<uint32_t>> bin2refs;  // key=bin, value=packed ref ids
+    };
 
     static void normalize_records(std::vector<Record>& v) {
         if (v.empty()) return;
 
         struct Item { Record r; long long inv; };
-        std::vector<Item> w; w.reserve(v.size());
+        std::vector<Item> w;
+        w.reserve(v.size());
 
         auto inv_of = [](const Record& r) -> long long {
             if (r.a_dir == r.b_dir) {
@@ -774,34 +911,41 @@ private:
         });
 
         auto same_group = [](const Item& x, const Item& y){
-            return x.r.a_ctg == y.r.a_ctg && x.r.b_ctg == y.r.b_ctg && x.r.a_dir == y.r.a_dir && x.r.b_dir == y.r.b_dir && x.inv == y.inv;
+            return x.r.a_ctg == y.r.a_ctg &&
+                   x.r.b_ctg == y.r.b_ctg &&
+                   x.r.a_dir == y.r.a_dir &&
+                   x.r.b_dir == y.r.b_dir &&
+                   x.inv == y.inv;
         };
 
         auto map_A_to_B = [](const Record& proto, long long inv, uint32_t Abeg, uint32_t Aend) -> std::pair<uint32_t,uint32_t> {
             if (proto.a_dir == proto.b_dir) {
                 long long Bb = (long long)Abeg - inv;
                 long long Be = (long long)Aend - inv;
-                return { (uint32_t)Bb, (uint32_t)Be };
+                return {(uint32_t)Bb, (uint32_t)Be};
             } else {
                 // reverse: B = [-Aend + s, -Abeg + s]
                 long long Bb = -(long long)Aend + inv;
                 long long Be = -(long long)Abeg + inv;
-                if (Bb < Be) return { (uint32_t)Bb, (uint32_t)Be };
-                else         return { (uint32_t)Be, (uint32_t)Bb };
+                if (Bb < Be) return {(uint32_t)Bb, (uint32_t)Be};
+                else         return {(uint32_t)Be, (uint32_t)Bb};
             }
         };
 
-        std::vector<Record> out; out.reserve(w.size());
-        Item cur = w[0];
+        std::vector<Record> out;
+        out.reserve(w.size());
 
+        Item cur = w[0];
         for (size_t i = 1; i < w.size(); ++i) {
             const Item& nx = w[i];
             if (same_group(cur, nx) && nx.r.a.beg <= cur.r.a.end) {
                 uint32_t Ab = std::min(cur.r.a.beg, nx.r.a.beg);
                 uint32_t Ae = std::max(cur.r.a.end, nx.r.a.end);
-                cur.r.a.beg = Ab; cur.r.a.end = Ae;
+                cur.r.a.beg = Ab;
+                cur.r.a.end = Ae;
                 auto [Bb, Be] = map_A_to_B(cur.r, cur.inv, Ab, Ae);
-                cur.r.b.beg = Bb; cur.r.b.end = Be;
+                cur.r.b.beg = Bb;
+                cur.r.b.end = Be;
             } else {
                 out.push_back(cur.r);
                 cur = nx;
@@ -813,19 +957,35 @@ private:
 
     void build_bin_index() {
         size_t approx_bins = recs_.size() * 10u;
-        for (auto& ci : idx_) ci.bin2refs.reserve(approx_bins / std::max<size_t>(1, idx_.size()));
+        for (auto& ci : idx_) {
+            ci.bin2refs.reserve(approx_bins / std::max<size_t>(1, idx_.size()));
+        }
 
-        std::vector<uint32_t> bins; bins.reserve(64);
+        std::vector<uint32_t> bins;
+        bins.reserve(64);
+
         for (uint32_t i = 0; i < recs_.size(); ++i) {
             const Record& r = recs_[i];
+
             // A -> B
-            bins.clear(); Binner::reg2bins(r.a.beg, r.a.end, bins);
+            bins.clear();
+            Binner::reg2bins(r.a.beg, r.a.end, bins);
             auto& Amap = idx_[r.a_ctg].bin2refs;
             for (uint32_t b : bins) Amap[b].push_back(pack_ref(i, false));
+
             // B -> A
-            bins.clear(); Binner::reg2bins(r.b.beg, r.b.end, bins);
+            bins.clear();
+            Binner::reg2bins(r.b.beg, r.b.end, bins);
             auto& Bmap = idx_[r.b_ctg].bin2refs;
             for (uint32_t b : bins) Bmap[b].push_back(pack_ref(i, true));
+        }
+
+        for (auto& ci : idx_) {
+            for (auto& kv : ci.bin2refs) {
+                auto& v = kv.second;
+                std::sort(v.begin(), v.end());
+                v.erase(std::unique(v.begin(), v.end()), v.end());
+            }
         }
     }
 
@@ -834,80 +994,85 @@ private:
     }
 
     // query
-    std::vector<Hit> map_range_internal(uint32_t q_ctg, uint32_t qbeg, uint32_t qend) const {
+    std::vector<Hit> map_range_internal_(uint32_t q_ctg, uint32_t qbeg, uint32_t qend, QueryWorkspace& ws) const {
         std::vector<Hit> out;
         if (qbeg >= qend) return out;
+        if (q_ctg >= idx_.size()) return out;
 
-        std::vector<uint32_t> qb; qb.reserve(16);
-        Binner::reg2bins(qbeg, qend, qb);
+        ws.next_stamp();
 
-        std::vector<uint32_t> cands; cands.reserve(qb.size()*4);
+        ws.qb.clear();
+        ws.qb.reserve(16);
+        Binner::reg2bins(qbeg, qend, ws.qb);
+
         const auto& cmap = idx_[q_ctg].bin2refs;
-        for (uint32_t b : qb) {
+        out.reserve(64);
+
+        for (uint32_t b : ws.qb) {
             auto it = cmap.find(b);
             if (it == cmap.end()) continue;
-            const auto& v = it->second;
-            cands.insert(cands.end(), v.begin(), v.end());
-        }
-        if (cands.empty()) return out;
-        std::sort(cands.begin(), cands.end());
-        cands.erase(std::unique(cands.begin(), cands.end()), cands.end());
 
-        out.reserve(cands.size());
-        for (uint32_t ref : cands) {
-            uint32_t rid = unpack_rec(ref);
-            bool side_is_B = unpack_side_is_B(ref);
-            const Record& r = recs_[rid];
+            const auto& refs = it->second;
+            for (uint32_t ref : refs) {
+                if (ref >= ws.seen_refs.size()) continue;
+                if (ws.seen_refs[ref] == ws.seen_stamp) continue;
+                ws.seen_refs[ref] = ws.seen_stamp;
 
-            bool query_on_A = (!side_is_B && r.a_ctg == q_ctg);
-            bool query_on_B = ( side_is_B && r.b_ctg == q_ctg);
-            if (!query_on_A && !query_on_B) continue;
+                uint32_t rid = unpack_rec(ref);
+                bool side_is_B = unpack_side_is_B(ref);
+                const Record& r = recs_[rid];
 
-            const Interval& Iq = query_on_A ? r.a : r.b;
-            if (!overlaps(qbeg, qend, Iq.beg, Iq.end)) continue;
+                bool query_on_A = (!side_is_B && r.a_ctg == q_ctg);
+                bool query_on_B = ( side_is_B && r.b_ctg == q_ctg);
+                if (!query_on_A && !query_on_B) continue;
 
-            uint32_t ibeg = std::max(qbeg, Iq.beg);
-            uint32_t iend = std::min(qend, Iq.end);
+                const Interval& Iq = query_on_A ? r.a : r.b;
+                if (!overlaps(qbeg, qend, Iq.beg, Iq.end)) continue;
 
-            int8_t qdir = query_on_A ? r.a_dir : r.b_dir;
-            int8_t odir = query_on_A ? r.b_dir : r.a_dir;
-            const Interval& Io = query_on_A ? r.b : r.a;
+                uint32_t ibeg = std::max(qbeg, Iq.beg);
+                uint32_t iend = std::min(qend, Iq.end);
 
-            uint32_t off0, off1;
-            if (qdir > 0) {
-                off0 = ibeg - Iq.beg;
-                off1 = iend - Iq.beg;
-            } else {
-                off0 = Iq.end - iend;
-                off1 = Iq.end - ibeg;
+                int8_t qdir = query_on_A ? r.a_dir : r.b_dir;
+                int8_t odir = query_on_A ? r.b_dir : r.a_dir;
+                const Interval& Io = query_on_A ? r.b : r.a;
+
+                uint32_t off0, off1;
+                if (qdir > 0) {
+                    off0 = ibeg - Iq.beg;
+                    off1 = iend - Iq.beg;
+                } else {
+                    off0 = Iq.end - iend;
+                    off1 = Iq.end - ibeg;
+                }
+
+                Hit h;
+                h.ctg = query_on_A ? r.b_ctg : r.a_ctg;
+                h.rev = (qdir != odir);
+                h.qbeg = ibeg;
+                h.qend = iend;
+
+                if (odir > 0) {
+                    h.beg = Io.beg + off0;
+                    h.end = Io.beg + off1;
+                } else {
+                    h.beg = Io.end - off1;
+                    h.end = Io.end - off0;
+                }
+                out.push_back(h);
             }
-
-            Hit h;
-            h.ctg = query_on_A ? r.b_ctg : r.a_ctg;
-            h.rev = (qdir != odir);
-
-            h.qbeg = ibeg;
-            h.qend = iend;
-
-            if (odir > 0) {
-                h.beg = Io.beg + off0;
-                h.end = Io.beg + off1;
-            } else {
-                h.beg = Io.end - off1;
-                h.end = Io.end - off0;
-            }
-            out.push_back(h);
         }
+
         return out;
     }
 
 private:
     std::vector<Record> recs_;
-    std::unordered_map<std::string, uint32_t> name2id_;
+    std::unordered_map<std::string, uint32_t, TransparentStringHash, TransparentStringEq> name2id_;
     std::vector<std::string> id2name_;
     std::vector<ContigIndex> idx_;
+
     static inline const std::string kEmpty_{};
     inline static std::unordered_set<uint32_t> warned_same_ctg_;
 };
 
-} // namespace coordmap
+}  // namespace coordmap

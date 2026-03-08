@@ -864,7 +864,12 @@ void help_file2map(char** argv) {
         << "convert GFA/PAF to map format for liftover\n\n"
         << "PAF input notes:\n"
         << "  * For PAF input, generate PAF with minimap2 in 1-to-1 mode:\n"
-        << "     minimap2 -t8 -cx asm5 --secondary=no reference.fa query.fa > aln.paf\n\n"
+        << "     - minimap2 -t8 -cx asm5 --secondary=no reference.fa query.fa > aln.paf\n"
+        << "  * IMPORTANT: reference and query sequence names must be different.\n"
+        << "     - For example, avoid using the same name like 'chr1' in both files.\n"
+        << "       Rename them to something like 'chr1_ref' and 'chr1_qry'.\n"
+        << "     - Sequence names must NOT contain ':', '-' or '+' characters,\n"
+        << "       to avoid confusion with map coordinate formats such as 'chr:beg-end+'.\n\n"
         << "Input/Output:\n"
         << "  -i, --input        FILE     input PAF/GFA file\n"
         << "  -o, --output       FILE     output file name (default: stdout)\n\n"
@@ -912,14 +917,7 @@ AppConfig main_file2map(int argc, char** argv) {
     return cfg;
 }
 
-static AppConfig make_liftover_defaults() {
-    AppConfig cfg;
-    cfg.mode = ToolMode::liftover;
-    cfg.coordmap.max_hops = 0;
-    return cfg;
-}
-
-void help_liftover(char** argv, const AppConfig& cfg, bool print_all) {
+void help_liftover(char** argv, bool print_all) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -m FILE [options]\n\n"
         << "LiftOver BED coordinates using a .map file, which produced by deoverlap/collapse/file2map\n\n"
@@ -932,20 +930,20 @@ void help_liftover(char** argv, const AppConfig& cfg, bool print_all) {
         << "Map Options:\n"
         << "      --regex         STR      keep hits whose label matches regex\n"
         << "                                (\"h\\d+tg\" to match h1tg, h2tg, ...)\n"
-        << "      --min_frac      FLOAT    minimum fraction of the BED interval that must be lifted over [" << cfg.liftover.min_frac << "]\n"
+        << "      --min_frac      FLOAT    minimum fraction of the BED interval that must be lifted over [" << LiftoverOpts().min_frac << "]\n"
         << "                                (0.9 means at least 90% of the BED region is mapped)\n";
     if (print_all) {
         std::cerr
-            << "      --flank_win     INT      extension window size around BED ends to identify insertions [" << cfg.liftover.flank_win << "]\n"
-            << "      --max_flank     INT      max extension around BED ends to identify insertions [" << cfg.liftover.max_flank << "]\n"
-            << "      --max_gap       INT      max allowed |ref_gap - query_gap| when calling INS [" << cfg.liftover.max_gap << "]\n"
-            << "      --max_hit       INT      max extended liftover results to keep [" << cfg.liftover.max_hit << "]\n";
+            << "      --flank_win     INT      extension window size around BED ends to identify insertions [" << LiftoverOpts().flank_win << "]\n"
+            << "      --max_flank     INT      max extension around BED ends to identify insertions [" << LiftoverOpts().max_flank << "]\n"
+            << "      --max_gap       INT      max allowed |ref_gap - query_gap| when calling INS [" << LiftoverOpts().max_gap << "]\n"
+            << "      --max_hit       INT      max extended liftover results to keep [" << LiftoverOpts().max_hit << "]\n";
     }
     std::cerr
         << std::endl
         << "PAF Options:\n"
-        << "      --min_len       INT      minimum alignment length for liftover [" << cfg.liftover.min_len << "]\n"
-        << "      --min_mapq      INT      minimum mapping quality for liftover [" << cfg.liftover.min_mapq << "]\n\n"
+        << "      --min_len       INT      minimum alignment length for liftover [" << LiftoverOpts().min_len << "]\n"
+        << "      --min_mapq      INT      minimum mapping quality for liftover [" << LiftoverOpts().min_mapq << "]\n\n"
         << "Check Options:\n"
         << "      --check                  run sequence consistency check, requires -r\n";
     if (print_all) {
@@ -957,16 +955,16 @@ void help_liftover(char** argv, const AppConfig& cfg, bool print_all) {
     std::cerr 
         << std::endl
         << "CoordMap Options:\n"
-        << "      --cm_max_hops   INT      max hop depth when chaining names [" << cfg.coordmap.max_hops << "]\n"
+        << "      --cm_max_hops   INT      max hop depth when chaining names [" << CoordMapOpts().max_hops << "]\n"
         << "                                (0 allows source -> A; 1 allows source -> A -> B)\n";
 
     if (print_all) {
         std::cerr
-            << "      --cm_max_fanout INT      max fanout per search [" << cfg.coordmap.max_fanout << "]\n"
-            << "      --cm_min_len    INT      min length (bp) to keep a hit for hops [" << cfg.coordmap.min_len << "]\n"
-            << "      --cm_min_frac   FLOAT    min fraction of current interval length to keep a hit [" << cfg.coordmap.min_frac << "]\n"
+            << "      --cm_max_fanout INT      max fanout per search [" << CoordMapOpts().max_fanout << "]\n"
+            << "      --cm_min_len    INT      min length (bp) to keep a hit for hops [" << CoordMapOpts().min_len << "]\n"
+            << "      --cm_min_frac   FLOAT    min fraction of current interval length to keep a hit [" << CoordMapOpts().min_frac << "]\n"
             << "                                (threshold = max(min_len, cur_len * min_frac))\n"
-            << "      --cm_max_hits   INT      global BFS node cap [" << cfg.coordmap.max_total_hits << "]\n";
+            << "      --cm_max_hits   INT      global BFS node cap [" << CoordMapOpts().max_total_hits << "]\n";
     }
 
     std::cerr
@@ -978,9 +976,10 @@ void help_liftover(char** argv, const AppConfig& cfg, bool print_all) {
 }
 
 AppConfig main_liftover(int argc, char** argv) {
-    AppConfig cfg = make_liftover_defaults();
+    if (argc < 3) { help_liftover(argv); std::exit(1); }
 
-    if (argc < 3) { help_liftover(argv, cfg); std::exit(1); }
+    AppConfig cfg;
+    cfg.mode = ToolMode::liftover;
 
     const struct option long_opts[] = {
         {"map",           required_argument, nullptr, 'm'},
@@ -1038,9 +1037,9 @@ AppConfig main_liftover(int argc, char** argv) {
             case 4004: cfg.coordmap.min_frac       = std::max(0.0, std::atof(optarg));                break;
             case 4005: cfg.coordmap.max_total_hits = (uint32_t)std::max(1, std::atoi(optarg));        break;
             case 't':  cfg.global.threads          = std::max(1, std::stoi(optarg));                  break;
-            case 'h':  help_liftover(argv, cfg);       std::exit(0);
-            case 5001: help_liftover(argv, cfg, true); std::exit(0);
-            default:   help_liftover(argv, cfg);       std::exit(1);
+            case 'h':  help_liftover(argv);       std::exit(0);
+            case 5001: help_liftover(argv, true); std::exit(0);
+            default:   help_liftover(argv);       std::exit(1);
         }
     }
 
