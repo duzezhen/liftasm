@@ -1069,7 +1069,7 @@ void help_mapq_boost(char** argv, bool print_all) {
         << "     If unsure, run `samtools sort -n` (slower, more I/O). Alternatively, add --name_check to make the program verify the order.\n\n"
         << "Example pipeline:\n"
         << "  # BWA\n"
-        << "  bwa mem -a HG002.hap1_hap2.fa read.1.fq.gz read.2.fq.gz \\\n"
+        << "  bwa mem HG002.hap1_hap2.fa read.1.fq.gz read.2.fq.gz \\\n"
         << kTail
         << "  # HISAT2\n"
         << "  hisat2 -x INDEX -1 read.1.fq.gz -2 read.2.fq.gz \\\n"
