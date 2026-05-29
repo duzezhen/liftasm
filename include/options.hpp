@@ -67,7 +67,7 @@ struct ExtendOpts {
 
     bool     dyn_rescue_enable;       // enable dynamic rescue
     uint32_t dyn_step_bp;             // extend step size in base pairs
-    int      dyn_zdrop;               // z-drop: stop if current score falls behind best historical score by this threshold
+    int      dyn_zdrop = 5e3;               // z-drop: stop if current score falls behind best historical score by this threshold
     uint32_t dyn_max_query_bp;        // maximum query extension length
     uint32_t dyn_max_ref_bp;          // maximum reference extension length
     int      dyn_min_gain;            // minimum score gain per step

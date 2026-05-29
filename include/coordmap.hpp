@@ -112,57 +112,70 @@ struct TransparentStringEq {
 
 class CoordMap {
 public:
-    bool load(const std::string& path) {
+    bool load(const std::vector<std::string>& paths) {
         clear();
 
-        std::ifstream in(path);
-        if (!in) {
-            error_stream() << path << ": No such file or directory" << std::endl;
+        if (paths.empty()) {
+            error_stream() << "No homology mapping file provided." << std::endl;
             std::exit(1);
         }
 
-        std::string line;
-        line.reserve(512);
-        uint32_t n_line = 0;
         std::vector<Record> tmp;
         tmp.reserve(1u << 20);
 
-        while (std::getline(in, line)) {
-            ++n_line;
-            trim(line);
-            if (line.empty() || line[0] == '#') continue;
+        for (const auto& path : paths) {
+            log_stream() << "Loading homology mappings from " << path << "...\n";
 
-            std::string_view L, R;
-            if (!split_two_tokens(line, L, R)) {
-                error_stream() << path << ": Bad line (need two columns) at line " << n_line << std::endl;
+            std::ifstream in(path);
+            if (!in) {
+                error_stream() << path << ": No such file or directory" << std::endl;
                 std::exit(1);
             }
 
-            SidePlan A, B;
-            if (!parse_side(L, A, n_line)) return false;
-            if (!parse_side(R, B, n_line)) return false;
+            std::string line;
+            line.reserve(512);
+            uint32_t n_line = 0;
 
-            std::vector<Piece> As = slice_on_virtual(A);
-            std::vector<Piece> Bs = slice_on_virtual(B);
+            while (std::getline(in, line)) {
+                ++n_line;
+                trim(line);
+                if (line.empty() || line[0] == '#') continue;
 
-            apply_sign_to_consumption(As, A.sign_plus);
-            apply_sign_to_consumption(Bs, B.sign_plus);
+                std::string_view L, R;
+                if (!split_two_tokens(line, L, R)) {
+                    error_stream() << path << ": Bad line (need two columns) at line " << n_line << std::endl;
+                    std::exit(1);
+                }
 
-            // length check
-            uint64_t lenA = total_len(As), lenB = total_len(Bs);
-            if (lenA != lenB) {
-                error_stream() << path << ": Length mismatch at line " << n_line << std::endl;
-                std::exit(1);
+                SidePlan A, B;
+                if (!parse_side(L, A, n_line)) return false;
+                if (!parse_side(R, B, n_line)) return false;
+
+                std::vector<Piece> As = slice_on_virtual(A);
+                std::vector<Piece> Bs = slice_on_virtual(B);
+
+                apply_sign_to_consumption(As, A.sign_plus);
+                apply_sign_to_consumption(Bs, B.sign_plus);
+
+                // length check
+                uint64_t lenA = total_len(As), lenB = total_len(Bs);
+                if (lenA != lenB) {
+                    error_stream() << path << ": Length mismatch at line " << n_line << std::endl;
+                    std::exit(1);
+                }
+                if (lenA == 0) continue;
+
+                fuse_to_records(As, Bs, tmp);
             }
-            if (lenA == 0) continue;
-
-            fuse_to_records(As, Bs, tmp);
+            in.close();
         }
-        in.close();
 
         recs_ = std::move(tmp);
         normalize_records(recs_);
         build_bin_index();
+
+        log_stream() << "  - Loaded records: " << num_records() << "\n" << "\n";
+
         return true;
     }
 
@@ -228,7 +241,7 @@ public:
 
         std::vector<Node> q;
         q.reserve(256);
-        q.push_back(Node{src_ctg, qbeg, qend, qbeg, qend, false, 0});
+        q.push_back(Node{src_ctg, qbeg, qend, qbeg, qend, false, 1});
 
         auto to_src_interval = [](const Node& cur, uint32_t sub_qbeg, uint32_t sub_qend) -> std::pair<uint32_t,uint32_t> {
             if (!cur.rev_to_src) {
@@ -266,9 +279,9 @@ public:
             std::vector<Hit> step_hits = map_range_internal_(cur.ctg, cur.beg, cur.end, ws);
             if (step_hits.empty()) continue;
 
-            // 1. First hop (depth==0): don't filter
-            // 2. Next hops (depth>0): filter using min_keep_len(cur_len)
-            if (cur.depth > 0) {
+            // 1. First hop (depth==1): don't filter
+            // 2. Next hops (depth>1): filter using min_keep_len(cur_len)
+            if (cur.depth > 1) {
                 const uint32_t min_keep = min_keep_len(cur_len);
                 size_t w = 0;
                 for (size_t i = 0; i < step_hits.size(); ++i) {
@@ -820,7 +833,12 @@ private:
 
             if (pa.ctg == pb.ctg) {
                 if (warned_same_ctg_.insert(pa.ctg).second) {
-                    warning_stream() << "Reference and query contig names must be different: " << contig_name(pa.ctg) << "\n";
+                    constexpr size_t kMaxDetailedWarnings = 10;
+                    if (warned_same_ctg_.size() <= kMaxDetailedWarnings) {
+                        warning_stream() << "  ! Reference and query contig names must be different: " << contig_name(pa.ctg) << "\n";
+                    } else if (warned_same_ctg_.size() == kMaxDetailedWarnings + 1) {
+                        warning_stream() << "  ! Reference and query contig names must be different: " << "too many cases; further warnings are suppressed.\n";
+                    }
                 }
             }
 

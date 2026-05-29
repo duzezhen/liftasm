@@ -220,6 +220,11 @@ bool Expander::save_map(const std::string& path) {
     };
     std::sort(items.begin(), items.end(), seg_less);
 
+    // Deduplicated output
+    bool has_prev = false;
+    Seg prev_s = 0;
+    Seg prev_t = 0;
+
     for (const auto& kv : items) {
         const Seg        s   = kv.first;
         const Expansion& exp = kv.second;
@@ -229,9 +234,11 @@ bool Expander::save_map(const std::string& path) {
         const uint32_t se  = Interval::end(s);
         const bool     sr  = Interval::is_reverse(s);
         const uint32_t sl  = se - sb;
+    
         if (sl == 0 || exp.empty()) continue;
 
         uint32_t used = 0;
+
         for (Seg t : exp) {
             if (used >= sl) break;
 
@@ -258,8 +265,19 @@ bool Expander::save_map(const std::string& path) {
                     t_sub = Interval::pack(tid, te - take, te, true);
             }
 
-            ofs << Interval::format(s_sub, names_) << '\t'
-                << Interval::format(t_sub, names_) << '\n';
+            if (s_sub != t_sub) {
+                // dedup consecutive identical pairs
+                if (has_prev && prev_s == s_sub && prev_t == t_sub) {
+                    used += take;
+                    continue;
+                }
+
+                ofs << Interval::format(s_sub, names_) << '\t' << Interval::format(t_sub, names_) << '\n';
+
+                has_prev = true;
+                prev_s = s_sub;
+                prev_t = t_sub;
+            }
 
             used += take;
         }

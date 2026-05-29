@@ -17,9 +17,9 @@ Usage:
    tracker.finish(); // ensure the final 100% is printed
 
    Example output:
-   [I::...::check_progress....] [Progress]  10% ( 50/492) done
+   [M::check_prog::8.0014*1.72]   #  10% ( 50/492) done
    ...
-   [I::...::check_progress....] [Progress] 100% (492/492) done
+   [M::check_prog::8.0014*1.72]   # 100% (492/492) done
 
 2. Step mode (unknown total number of tasks)
    -----------------------------------------
@@ -32,10 +32,10 @@ Usage:
    tracker.finish(); // print final processed count
 
    Example output:
-   [I::...::check_progress....] [Progress] processed 1000 items
-   [I::...::check_progress....] [Progress] processed 2000 items
+   [M::check_prog::8.0014*1.72]   # 1000 items
+   [M::check_prog::8.0014*1.72]   # 2000 items
    ...
-   [I::...::check_progress....] [Progress] processed 5234 items (done)
+   [M::check_prog::8.0014*1.72]   # processed 5234 items (done)
 */
 
 class ProgressTracker {
@@ -81,13 +81,13 @@ public:
         if (mode_ == Mode::Percent) {  // Mode::Percent
             if (!finished_printed_ && total_ > 0) {
                 log_stream()
-                    << " [Progress] " << std::setw(3) << 100 << "% ("
+                    << "  # " << std::setw(3) << 100 << "% ("
                     << std::setw(width_count_) << processed_ << "/" << total_
                     << ") done\n";
                 finished_printed_ = true;
             }
         } else {  // Mode::Step
-            log_stream() << " [Progress] processed " << processed_ << " items (done)\n";
+            log_stream() << "  # processed " << processed_ << " items (done)\n";
             finished_printed_ = true;
         }
     }
@@ -105,7 +105,7 @@ private:
 
             if (percent >= 100.0 && !finished_printed_) {
                 log_stream()
-                    << " [Progress] " << std::setw(3) << 100 << "% ("
+                    << "  # " << std::setw(3) << 100 << "% ("
                     << std::setw(width_count_) << processed_ << "/" << total_
                     << ") done\n";
                 finished_printed_ = true;
@@ -114,7 +114,7 @@ private:
 
             if (!finished_printed_ && percent >= next_step_) {
                 log_stream()
-                    << " [Progress] " << std::setw(3) << static_cast<int>(percent) << "% ("
+                    << "  # " << std::setw(3) << static_cast<int>(percent) << "% ("
                     << std::setw(width_count_) << processed_ << "/" << total_
                     << ") done\n";
                 next_step_ += step_percent_;
@@ -122,7 +122,7 @@ private:
         } else {  // Mode::Step
             if (step_count_ == 0) return;
             if (processed_ >= next_count_ && !finished_printed_) {
-                log_stream() << " [Progress] processed " << processed_ << " items\n";
+                log_stream() << "  # processed " << processed_ << " items\n";
                 next_count_ += step_count_;
             }
         }

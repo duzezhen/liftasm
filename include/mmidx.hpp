@@ -28,10 +28,8 @@ class GfaGraph;
 
 namespace mmidx {
 
-/* ----------------------------- class ----------------------------- */
 class MinimizerIndex {
 public:
-    /* build the minimizer index */
     MinimizerIndex(
         const std::vector<std::string>& names, 
         const std::vector<std::string_view>& seqs, 
@@ -40,14 +38,11 @@ public:
         const opt::AnchorOpts& anchorOpts
     );
 
-    /* build minimizer table */
-    // void build_mm();
     void build_mm(bool expand_right = false);
 
-    /*  High-frequency minimizer filtering */
+    //  High-frequency minimizer filtering
     uint32_t calc_max_occ(float f) const;
 
-    // ----------------------- seeding -----------------------
     // false = all seeds; true = only seeds on the same strand as the read
     std::vector<MM128> collect_seeds(std::string_view read, bool keep_same_strand_only = false) const;
 
@@ -55,7 +50,7 @@ public:
     void sort_seeds_by_ref(std::vector<MM128>& seeds) const;
     void sort_seeds_by_qry(std::vector<MM128>& seeds) const;
 
-    /* k-mer exact query */
+    // K-mer query
     span_pos query(std::string_view kmer) const;
     span_pos lookup_hash(__uint128_t key) const;
     __uint128_t canonical_key(std::string_view s) const;
@@ -212,7 +207,6 @@ private:
 
 
     int32_t score_transition_seg_(const SegNode& A, const SegNode& B) const;
-    inline bool is_connected_vertex_(uint32_t v_from, uint32_t v_to) const;
     // Graph-aware seed scoring: same segment uses mm_comput_sc_, cross-segment uses graph API
     int32_t mm_comput_sc_graph_(const MM128* ai, const MM128* aj) const;
 };

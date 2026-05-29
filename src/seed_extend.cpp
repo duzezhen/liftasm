@@ -71,7 +71,7 @@ build_frag_tasks_from_blocks(
 /* ================================================================== */
 /* Run WFA fragment                                                     */
 /* ================================================================== */
-static void run_wfa_fragment(
+void run_wfa_fragment(
     std::string_view rseq,
     std::string_view qseq,
     std::string& cigar_out,
@@ -275,7 +275,7 @@ static DynResResult dynamic_extend_end(
             std::string cig; int sc = 0;
             run_wfa_fragment(rseg, qseg, cig, sc, extendOpts);
 
-            if (sc - prev_sc < extendOpts.dyn_zdrop) break;
+            if (sc - prev_sc < -extendOpts.dyn_zdrop) break;
 
             q_beg = try_qb; r_beg = try_rb;
             out.used = true;
@@ -301,7 +301,7 @@ static DynResResult dynamic_extend_end(
             std::string cig; int sc = 0;
             run_wfa_fragment(rseg, qseg, cig, sc, extendOpts);
 
-            if (sc - prev_sc < extendOpts.dyn_zdrop) break;
+            if (sc - prev_sc < -extendOpts.dyn_zdrop) break;
 
             q_end = try_qe; r_end = try_re;
             out.used = true;

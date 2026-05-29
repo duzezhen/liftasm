@@ -1,26 +1,16 @@
 #pragma once
-/*-----------------------------------------------------------------------
- * Simple ThreadPool
- *
- * - Fixed number of worker threads (created in ctor).
- * - submit() enqueues a callable and returns std::future<R>.
- * - Graceful shutdown in destructor or explicit stop().
- * - Bounded internal task queue with back-pressure:
- *     * Default queue capacity = 2 * n_threads (if user doesn't specify).
- *     * If user provides queue_capacity > 0, use that instead.
- *
- * 2025-10-24: Added queue capacity (bounded task queue) and default
- *             capacity = 2 * n_threads.
- *---------------------------------------------------------------------*/
 #include <vector>
 #include <thread>
 #include <future>
 #include <functional>
 #include <atomic>
-#include <iostream>     // for default error printing
-#include <type_traits>  // for std::invoke_result_t
-#include <utility>      // for std::forward
-#include <stdexcept>    // for std::runtime_error
+#include <iostream>
+#include <type_traits>
+#include <utility>
+#include <stdexcept>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include "BlockingQueue.hpp"
 
 class ThreadPool {

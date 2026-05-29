@@ -38,10 +38,13 @@ static inline void write_one_map(std::ostream& out, const std::string& unitig, u
 }
 
 // ---------- GFA2map ----------
-static inline void gfa_to_map(const std::string& gfa_path, std::ostream& out) {
-    log_stream() << "Converting GFA alignments to map format: " << gfa_path << "\n";
+static inline void gfa_to_map(std::vector<std::string> gfaFiles, std::ostream& out) {
+    log_stream() << "Converting GFA alignments to map format ..." << "\n";
+    for (const auto& gfaFile : gfaFiles) {
+        log_stream() << "  - " << gfaFile << "\n";
+    }
 
-    GfaGraph g; g.load_from_GFA(gfa_path);
+    GfaGraph g; g.load_from_GFA(gfaFiles);
     const auto& aligns = g.getAlignments();
 
     std::vector<MapRec> rows;
@@ -135,19 +138,26 @@ static inline bool keep_paf_record(const paf::Record& r, bool primary_only, uint
     return v[0]=='P';
 }
 
-static inline void paf_to_map(const std::string& paf_path, std::ostream& out, bool primary_only, uint32_t min_len, int min_mapq) {
-    log_stream() << "Converting PAF to map format: " << paf_path << "\n";
-
-    paf::Reader rd(paf_path);
-    paf::Record r;
-    while (rd.next(r)) {
-        validate_paf_record_names(r);  // Name check to prevent confusion with map coordinate formats (e.g., "chr1:100-200+")
-        if (!keep_paf_record(r, primary_only, min_len, min_mapq)) continue;  // primary, alignment length and mapq filter
-        paf_emit_match_blocks(r, out);
+static inline void paf_to_map(const std::vector<std::string>& pafFiles, std::ostream& out, bool primary_only, uint32_t min_len, int min_mapq) {
+    log_stream() << "Converting PAF to map format ..." << "\n";
+    for (const auto& pafFile : pafFiles) {
+        log_stream() << "  - " << pafFile << "\n";
+        paf::Reader rd(pafFile);
+        paf::Record r;
+        while (rd.next(r)) {
+            validate_paf_record_names(r);  // Name check to prevent confusion with map coordinate formats (e.g., "chr1:100-200+")
+            if (!keep_paf_record(r, primary_only, min_len, min_mapq)) continue;  // primary, alignment length and mapq filter
+            paf_emit_match_blocks(r, out);
+        }
     }
 }
 
-static inline void file_to_map_auto(const std::string& in_path, const std::string& out_path, bool paf_primary_only, uint32_t min_len, int min_mapq) {
+static inline void file_to_map_auto(const std::vector<std::string>& in_paths, const std::string& out_path, bool paf_primary_only, uint32_t min_len, int min_mapq) {
+    if (in_paths.empty()) {
+        error_stream() << "No input file provided.\n";
+        std::exit(1);
+    }
+    
     std::ostream* out = &std::cout;
     std::ofstream fout;
 
@@ -160,11 +170,23 @@ static inline void file_to_map_auto(const std::string& in_path, const std::strin
         out = &fout;
     }
 
-    if (has_suffix(in_path, ".gfa") || has_suffix(in_path, ".gfa.gz")) {
-        gfa_to_map(in_path, *out);
+    std::vector<std::string> gfa_files;
+    std::vector<std::string> paf_files;
+
+    for (const auto& path : in_paths) {
+        if (has_suffix(path, ".gfa") || has_suffix(path, ".gfa.gz")) {
+            gfa_files.emplace_back(path);
+        } else {
+            paf_files.emplace_back(path);
+        }
     }
-    else {
-        paf_to_map(in_path, *out, paf_primary_only, min_len, min_mapq);
+
+    if (!gfa_files.empty()) {
+        gfa_to_map(gfa_files, *out);
+    }
+
+    if (!paf_files.empty()) {
+        paf_to_map(paf_files, *out, paf_primary_only, min_len, min_mapq);
     }
 }
 

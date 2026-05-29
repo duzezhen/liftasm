@@ -40,19 +40,16 @@ public:
     GfaGraph();
     ~GfaGraph();
 
-    void load_from_GFA(const std::string& filename);  // Load GFA file into the graph structure
+    void load_from_GFA(const std::vector<std::string>& filenames);
 
     /* ---------- accessors ---------- */
     const GfaNode*                       getNode(uint64_t internal_id)              const { return internal_id < nodes_.size() ? &nodes_[internal_id] : nullptr; }
     uint64_t                             getNodeInternalId(const std::string& name) const;
-    const std::string                    getNodeName(uint64_t internal_id)          const { return internal_id < nodes_.size() ? nodes_[internal_id].name : std::to_string(internal_id); }
+    const std::string                    getNodeName(uint64_t internal_id)          const { return internal_id < nodes_.size() ? nodes_[internal_id].name : "*"; }
     const uint32_t                       getNodeLength(uint64_t internal_id)        const { return internal_id < nodes_.size() ? nodes_[internal_id].length : 0; }
     const bool                           getNodeDeleted(uint64_t internal_id)       const { return internal_id < nodes_.size() ? nodes_[internal_id].deleted : true; }
+    const GfaArc&                        getArc(size_t arc_idx)                     const { if (arc_idx < arcs_.size()) return arcs_[arc_idx]; throw std::out_of_range("Arc index out of bounds"); }
     const std::vector<GfaArc>&           getAllArcs()                               const { return arcs_; }
-    std::vector<size_t>                  getArcsIdxFromVertex(uint32_t v, bool skip_self = false)           const;  // indices of outgoing arcs per vertex, excluding deleted arcs
-    std::vector<const GfaArc*>           getArcsFromVertex(uint32_t v, bool skip_self = false)              const;  // outgoing arcs per vertex, excluding deleted arcs
-    std::vector<size_t>                  getArcsIdxToVertex(uint32_t v, bool skip_self = false)             const;  // indices of incoming arcs per vertex, excluding deleted arcs
-    std::vector<const GfaArc*>           getArcsToVertex(uint32_t v, bool skip_self = false)                const;  // incoming arcs per vertex, excluding deleted arcs
     const std::vector<GfaPath>&          getPaths()                                 const { return paths_; }
     const std::vector<GfaAlignment>&     getAlignments()                            const { return alignments_; }
     size_t                               getNumNodes()                              const { return total_segments_; }
@@ -72,11 +69,26 @@ public:
     /* ---------- setters ---------- */
     void set_forbid_overlap(bool v) { forbid_overlap_ = v; }
 
-    // Format overlap field ov/ow as in GFA
-    std::string format_overlap_field(int32_t ov, int32_t ow) const;
+    std::string format_overlap_field(int32_t ov, int32_t ow) const;  // Format overlap field ov/ow as in GFA
+
+    // Get outgoing/incoming arcs of a vertex, excluding deleted arcs. If skip_self is true, also exclude self-loop arcs.
+    std::vector<size_t> getArcsIdxFromVertex(uint32_t v, bool skip_self = false) const;
+    std::vector<const GfaArc*> getArcsFromVertex(uint32_t v, bool skip_self = false) const;
+    std::vector<size_t> getArcsIdxToVertex(uint32_t v, bool skip_self = false) const;
+    std::vector<const GfaArc*> getArcsToVertex(uint32_t v, bool skip_self = false) const;
+    
     // Fetch oriented string (forward if ori=0; reverse-complement if ori=1)
-    std::string get_oriented_sequence(uint32_t vertex) const;
-    std::string get_path_sequence(const std::vector<uint32_t>& path) const;
+    std::string get_oriented_sequence(Vertex vertex, uint32_t ow=0) const;
+
+    // Get the assembled sequence of a path defined by a chain of vertex IDs, using the ow rule for overlaps. Return "*" if any segment is missing or has "*".
+    std::string get_path_sequence(const std::vector<uint32_t>& path_vtx_ids) const;
+    std::string get_path_sequence(const std::vector<Vertex>& path_vtxs) const;
+    std::vector<std::uint32_t> get_path_overlaps(const std::vector<uint32_t>& path_vtx_ids) const;
+    std::vector<std::uint32_t> get_path_overlaps(const std::vector<Vertex>& path_vtxs) const;
+
+    // Get the overlap length (ow) of the edge from from_vtx to to_vtx, or 0 if no such edge exists or if it's deleted.
+    uint32_t get_edge_ow(uint32_t from_vtx_id, uint32_t to_vtx_id) const;
+    uint32_t get_edge_ow(Vertex from_vtx, Vertex to_vtx) const;
 
     // traversal helpers
     // start_v -> vertex-id (segment<<1 | ori)
@@ -100,13 +112,36 @@ public:
     
     // Enumerate paths from `src` to `sink` using DFS up to `max_depth` and `max_paths`.
     std::vector<std::vector<uint32_t>> enumerate_paths_DFS(
-        const uint32_t src, const uint32_t sink, const std::unordered_set<uint32_t>& region_set, 
+        const uint32_t src, const uint32_t sink, const std::unordered_set<uint32_t>& region_set,
         const uint32_t max_depth, const uint32_t max_paths,
         const bool skip_comp, bool& hit_limits,
-        const uint64_t DFS_guard
+        const uint64_t DFS_guard, const uint32_t stall_round_limit
+    ) const;
+    std::vector<std::vector<uint32_t>> enumerate_paths_greedy_DFS(
+        const uint32_t src, const uint32_t sink, const std::unordered_set<uint32_t>& region_set,
+        const uint32_t max_depth, const uint32_t max_paths,
+        const bool skip_comp, bool& hit_limits, const uint64_t DFS_guard, const uint32_t stall_round_limit
     ) const;
 
-    bool is_connected_vertex(uint32_t v_from, uint32_t v_to, uint32_t step_cap = 200000) const;
+    /**
+     * @brief Build a connectivity index for all nodes in the graph, where each node is assigned a component ID based on its connectivity.
+     * 
+     *   - Nodes that are reachable from each other (ignoring edge directions) will share the same component ID.
+     * 
+     */
+    bool build_nodes_connectivity_index(bool skip_comp = false);
+    const std::vector<uint32_t>& get_nodes_connectivity_index() const { return connectivity_index_; }
+    uint32_t node_connectivity_id(Vertex v) const;
+    bool nodes_connected(Vertex a, Vertex b) const;
+
+    /**
+     * @brief Build a topological index for all vertices in the graph, where each vertex is annotated with its strongly connected component (SCC) ID, topological rank, and cycle membership.
+     * 
+     */
+    bool build_vertex_topological_index(bool skip_comp = false);
+    const std::vector<GfaTopoIndex>& get_vertex_topological_index() const { return topo_index_; }
+    uint32_t vertex_topo_rank(Vertex v) const;
+    const GfaTopoIndex& vertex_topo_info(Vertex v) const;
 
     bool shortest_distance_between_offsets(
         uint32_t v_from, uint32_t off_from,
@@ -152,12 +187,37 @@ protected:
     /* ---------- paths ---------- */
     std::vector<GfaPath>                       paths_;
 
+    /* ---------- connectivity & topological index ---------- */
+    std::vector<uint32_t> connectivity_index_;  // node_id -> component_id
+    std::vector<GfaTopoIndex> topo_index_;      // vertex_id -> { scc_id, topo_rank, scc_size, in_cycle }
+
 
 protected:
-    /* ---------- helpers ---------- */
-    // Get or add a segment by name, and return its ID
-    uint32_t get_or_add_segment(const std::string& name);
-    // Slice the sequence of a segment or return "*" if invalid
+    /**
+     * @brief Get the segment ID for a given name, or create a new segment entry if it does not exist.
+     *
+     * @param name    Segment name.
+     * @param is_new  Optional output flag; set to true if a new segment was created, false otherwise.
+     *
+     * @return Segment ID corresponding to @p name.
+     */
+    uint32_t get_or_add_segment(const std::string& name, bool* is_new = nullptr);
+    
+    
+    /**
+     * @brief Extract a sequence slice from a segment, or return "*" if unavailable/invalid.
+     *
+     * The slice is taken from [beg, end) on the forward strand. If @p is_rev is true,
+     * the extracted subsequence is reverse-complemented before returning.
+     *
+     * @param nodes    Node table.
+     * @param seg_id   Segment ID.
+     * @param beg      Begin position (inclusive).
+     * @param end      End position (exclusive).
+     * @param is_rev   Whether to return the reverse-complemented slice.
+     *
+     * @return Extracted subsequence, or "*" if the source sequence is missing or the range is invalid.
+     */
     static std::string slice_seq_or_star_(const std::vector<GfaNode>& nodes, uint32_t seg_id, uint32_t beg, uint32_t end, bool is_rev);
 
     // Add an arc to the graph, ensuring synchronization between arcs_ and link_aux_ vectors.

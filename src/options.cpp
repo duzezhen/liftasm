@@ -55,7 +55,7 @@ void init_opts(uint16_t k, uint16_t w, double sec_pri_ratio, int sec_pri_num, bo
     e.hard_clip = false;
     e.dyn_rescue_enable = true;
     e.dyn_step_bp = 1e3;
-    e.dyn_zdrop = -1e3;
+    e.dyn_zdrop = 1e3;
     e.dyn_max_query_bp = 2e4;
     e.dyn_max_ref_bp = 2e4;
     e.dyn_min_gain = 15;
@@ -68,7 +68,7 @@ void Preset::map_ont(ChainOpts& c, AnchorOpts& a, ExtendOpts& e, AlignOpts& al) 
     e.min_qry_local_identity = 0.85f;
     e.min_ref_local_identity = 0.85f;
     e.min_qry_global_identity = 0.85f;
-    e.dyn_zdrop = -1000; e.gap_open = 16; e.gap_extend = 1;
+    e.dyn_zdrop = 1e3; e.gap_open = 16; e.gap_extend = 1;
     return;
 }
 
@@ -80,13 +80,13 @@ void Preset::map_hifi(ChainOpts& c, AnchorOpts& a, ExtendOpts& e, AlignOpts& al)
     e.gap_open = 6;
     e.gap_extend = 2;
     e.min_align_score = 200;
-    e.dyn_zdrop = -1000;
+    e.dyn_zdrop = 1e3;
     return;
 }
 
 void Preset::map_illumina(ChainOpts& c, AnchorOpts& a, ExtendOpts& e, AlignOpts& al) {
     c.bw = /*200*/10; c.chn_pen_gap = 4; c.gap_ext = 2;
-    e.dyn_zdrop = -100; e.gap_open = 4; e.gap_extend = 2;
+    e.dyn_zdrop = 100; e.gap_open = 4; e.gap_extend = 2;
     return;
 }
 
@@ -121,20 +121,20 @@ void Preset::map_asm_5(ChainOpts& c, AnchorOpts& a, ExtendOpts& e, AlignOpts& al
     e.dyn_max_query_bp    = 1.5e4;
     e.dyn_max_ref_bp      = 1.5e4;
     e.dyn_max_steps       = 250;
-    e.dyn_zdrop           = -1e3;
+    e.dyn_zdrop           = 5e3;
     e.min_qry_local_identity  = 0.80f;
     e.min_ref_local_identity  = 0.80f;
     e.min_qry_global_identity = 0.80f;
 
-    // e.max_wfa_bp  = 200'000;   // rseg+qseg > 200 kb 不跑 WFA，直接用 =/I/D 退化
-    // e.max_gap_wfa = 150'000;   // 单向 gap > 150 kb 直接 I/D，不跑 WFA
+    // e.max_wfa_bp  = 200'000;   // If rseg + qseg > 200 kb, do not run WFA; instead, directly fall back to using =/I/D.
+    // e.max_gap_wfa = 150'000;   // For unidirectional gaps > 150 kb, perform direct insertion/deletion (I/D) alignment without running WFA.
 
     al.sec_pri_num = 1;
 }
 
 void Preset::map_other(ChainOpts& c, AnchorOpts& a, ExtendOpts& e, AlignOpts& al) {
     c.bw = 500; c.chn_pen_gap = 5; c.gap_ext = 2;
-    e.dyn_zdrop = -1000; e.gap_open = 8; e.gap_extend = 1;
+    e.dyn_zdrop = 1e3; e.gap_open = 8; e.gap_extend = 1;
     return;
 }
 

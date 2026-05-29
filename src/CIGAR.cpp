@@ -469,4 +469,77 @@ bool query_interval_fwd(const uint32_t* cigar, uint32_t n, bool is_rev, uint32_t
     return qb < qe;
 }
 
+double match_ratio(std::string_view cigar) {
+    uint32_t match = 0;
+    uint32_t denom = 0;
+    uint32_t num = 0;
+
+    for (char c : cigar) {
+        if (std::isdigit((unsigned char)c)) {
+            num = num * 10 + (uint32_t)(c - '0');
+            continue;
+        }
+
+        switch (c) {
+            case 'M':
+            case '=':
+                match += num;
+                denom += num;
+                break;
+
+            case 'X':
+            case 'I':
+            case 'D':
+                denom += num;
+                break;
+
+            case 'S':
+            case 'H':
+            case 'N':
+            case 'P':
+            default:
+                break;
+        }
+
+        num = 0;
+    }
+
+    return denom == 0 ? 0.0 : (double)match / (double)denom;
+}
+
+double match_ratio(const uint32_t* cigar, uint32_t n) {
+    if (!cigar || n == 0) return 0.0;
+
+    uint32_t match = 0;
+    uint32_t denom = 0;
+
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t op  = bam_cigar_op_u32(cigar[i]);
+        const uint32_t len = bam_cigar_oplen_u32(cigar[i]);
+
+        switch (op) {
+            case OP_M:
+            case OP_EQ:
+                match += len;
+                denom += len;
+                break;
+
+            case OP_X:
+            case OP_I:
+            case OP_D:
+                denom += len;
+                break;
+
+            case OP_S:
+            case OP_H:
+            case OP_N:
+            case OP_P:
+            default:
+                break;
+        }
+    }
+
+    return denom == 0 ? 0.0 : (double)match / (double)denom;
+}
+
 } // namespace CIGAR

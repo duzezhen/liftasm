@@ -95,7 +95,7 @@ private:
     const std::vector<std::string> names_;
     const RuleMap* rules_;
     RuleMap memo_;
-    std::unordered_set<Seg, U128Hash, U128Eq>            in_stack_;
+    std::unordered_set<Seg, U128Hash, U128Eq> in_stack_;
 
     // Expand a segment
     Expansion expand_(Seg s);

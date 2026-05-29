@@ -1,6 +1,7 @@
 #include "../include/gfa_parser.hpp"
 #include "../include/gfa_walker.hpp"
 #include "../include/gfa_name.hpp"
+#include "../include/gfa_name_check.hpp"
 
 #include <iomanip>
 #include <cstring>
@@ -16,38 +17,66 @@ using namespace wfa; // WFAlignerGapAffine
 GfaGraph::GfaGraph()  = default;
 GfaGraph::~GfaGraph() = default;
 
-// Load GFA file into the graph structure
-void GfaGraph::load_from_GFA(const std::string& filename) {
-    log_stream() << "Loading genome graph from '" << filename << "' ...\n";
+// Load GFA file(s) into the graph structure
+void GfaGraph::load_from_GFA(const std::vector<std::string>& filenames) {
+    if (filenames.empty()) {
+        error_stream() << "No GFA input file provided.\n";
+        std::exit(1);
+    }
 
-    /* pass-1: register S names */
-    {
+    std::vector<gfa_name_check::FileRenamePlan> plans;
+    plans.reserve(filenames.size());
+
+    /* pass-1: register S names file by file */
+    for (const auto& filename : filenames) {
+        gfa_name_check::FileRenamePlan plan(/*max_log_examples=*/5);
+
         GzChunkReader zr(filename);
         std::string line;
         while (zr.readLine(line)) {
             if (line.empty() || line[0] != 'S') continue;
             if (line.back() == '\n' || line.back() == '\r') line.pop_back();
+
             std::stringstream ss(line);
-            char c; std::string name;
-            ss >> c >> name;
-            if (name.empty()) continue;
-            if (name_to_id_map_.insert({name, total_segments_}).second)
+            char c;
+            std::string raw_name;
+            ss >> c >> raw_name;
+            if (raw_name.empty()) continue;
+
+            const std::string fixed_name = plan.register_segment_name(raw_name, name_to_id_map_, filename);
+
+            if (name_to_id_map_.insert({fixed_name, total_segments_}).second) {
                 ++total_segments_;
+            }
         }
         zr.close();
+
+        plans.emplace_back(std::move(plan));
     }
+
     nodes_.resize(total_segments_);
 
-    /* pass-2: full parse */
-    {
+    /* pass-2: rewrite names with the corresponding file plan, then parse */
+    for (std::size_t i = 0; i < filenames.size(); ++i) {
+        const auto& filename = filenames[i];
+        const auto& plan = plans[i];
+
+        log_stream() << "Loading genome graph from '" << filename << "' ...\n";
+
         GzChunkReader zr(filename);
         std::string line;
         while (zr.readLine(line)) {
             if (line.empty()) continue;
             if (line.back() == '\n' || line.back() == '\r') line.pop_back();
+
+            line = plan.rewrite_gfa_line(line);
+
             std::stringstream ss(line);
-            char type; ss >> type;
-            ss.clear(); ss.str(line);
+            char type;
+            ss >> type;
+            ss.clear();
+            ss.str(line);
+
             switch (type) {
                 case 'S': parseSLine(ss); break;
                 case 'L': parseLLine(ss); break;
@@ -57,6 +86,8 @@ void GfaGraph::load_from_GFA(const std::string& filename) {
             }
         }
         zr.close();
+
+        plan.print_log(filename);
     }
 
     if (forbid_overlap_ && has_overlap_) {
@@ -67,19 +98,27 @@ void GfaGraph::load_from_GFA(const std::string& filename) {
     // Finalize the graph after loading
     finalize_();
 
+    // print graph stats
+    print_graph_stats();
+
     return;
 }
 
-uint32_t GfaGraph::get_or_add_segment(const std::string& name) {
-    auto it = name_to_id_map_.find(name);
-    if (it != name_to_id_map_.end()) return it->second;
 
-    /* unseen before */
+uint32_t GfaGraph::get_or_add_segment(const std::string& name, bool* is_new) {
+    auto it = name_to_id_map_.find(name);
+    if (it != name_to_id_map_.end()) {
+        if (is_new) *is_new = false;
+        return it->second;
+    }
+
     uint32_t id = static_cast<uint32_t>(total_segments_);
     name_to_id_map_[name] = id;
     nodes_.resize(id + 1);
     nodes_[id].name = name;
     ++total_segments_;
+
+    if (is_new) *is_new = true;
     return id;
 }
 
@@ -95,33 +134,170 @@ std::string GfaGraph::slice_seq_or_star_(
     return sub;
 }
 
-std::string GfaGraph::get_oriented_sequence(uint32_t vertex) const {
-    uint32_t seg_id = NodeHandle::get_segment_id(vertex);
-    bool rev = NodeHandle::get_is_reverse(vertex);
+std::string GfaGraph::get_oriented_sequence(Vertex vertex, uint32_t ow) const {
+    uint32_t seg_id = vertex.segment_id();
+    bool rev = vertex.is_reverse();
     const std::string& seq = nodes_[seg_id].sequence;
-    if (seq == "*") return std::string(); // unknown
-    return rev ? seqUtils::revcomp(seq) : seq;
+    if (seq == "*") return std::string();
+    if (ow >= seq.size()) return std::string();
+    if (rev) {
+        std::string rc = seqUtils::revcomp(seq);
+        return rc.substr(ow);
+    }
+    return seq.substr(ow);
 }
 
-std::string GfaGraph::get_path_sequence(const std::vector<uint32_t>& path) const {
-    if (path.empty()) return "*";
+std::string GfaGraph::get_path_sequence(const std::vector<uint32_t>& path_vtx_ids) const {
+    if (path_vtx_ids.empty()) return "*";
 
     size_t total_len = 0;
-    for (uint32_t v : path) {
-        uint32_t seg_id = NodeHandle::get_segment_id(v);
+    for (uint32_t vtx_id : path_vtx_ids) {
+        uint32_t seg_id = NodeHandle::get_segment_id(vtx_id);
         total_len += getNodeLength(seg_id);
     }
 
     std::string out;
     out.reserve(total_len);
 
-    for (uint32_t v : path) {
-        std::string s = get_oriented_sequence(v);
+    bool first = true;
+    uint32_t prev_vtx_id = 0;
+
+    for (uint32_t vtx_id : path_vtx_ids) {
+        std::string s = get_oriented_sequence(Vertex(vtx_id));
         if (s.empty()) return "*";
-        out += s;
+
+        if (first) {
+            out += s;
+            first = false;
+        } else {
+            uint32_t ovlp = 0;
+            auto arcs = getArcsFromVertex(prev_vtx_id);
+            for (const auto* arc : arcs) {
+                if (arc && arc->w == vtx_id) {
+                    ovlp = arc->ow > 0 ? static_cast<uint32_t>(arc->ow) : 0u;
+                    break;
+                }
+            }
+            if (ovlp >= s.size()) out += "";
+            else out += s.substr(ovlp);
+        }
+
+        prev_vtx_id = vtx_id;
     }
+
     return out;
 }
+
+std::string GfaGraph::get_path_sequence(const std::vector<Vertex>& path_vtxs) const {
+    if (path_vtxs.empty()) return "*";
+
+    size_t total_len = 0;
+    for (const Vertex& vtx : path_vtxs) {
+        uint32_t seg_id = vtx.segment_id();
+        total_len += getNodeLength(seg_id);
+    }
+
+    std::string out;
+    out.reserve(total_len);
+
+    bool first = true;
+    Vertex prev_vtx = Vertex(UINT32_MAX);
+
+    for (const Vertex& vtx : path_vtxs) {
+        std::string s = get_oriented_sequence(vtx);
+        if (s.empty()) return "*";
+
+        if (first) {
+            out += s;
+            first = false;
+        } else {
+            uint32_t ovlp = 0;
+            auto arcs = getArcsFromVertex(prev_vtx.vertex_id());
+            for (const auto* arc : arcs) {
+                if (arc && arc->w == vtx.vertex_id()) {
+                    ovlp = arc->ow > 0 ? static_cast<uint32_t>(arc->ow) : 0u;
+                    break;
+                }
+            }
+            if (ovlp >= s.size()) out += "";
+            else out += s.substr(ovlp);
+        }
+
+        prev_vtx = vtx;
+    }
+
+    return out;
+}
+
+std::vector<uint32_t> GfaGraph::get_path_overlaps(const std::vector<uint32_t>& path_vtx_ids) const {
+    std::vector<uint32_t> overlaps;
+    if (path_vtx_ids.size() <= 1) return overlaps;
+
+    overlaps.reserve(path_vtx_ids.size() - 1);
+
+    for (size_t i = 1; i < path_vtx_ids.size(); ++i) {
+        const uint32_t prev_v = path_vtx_ids[i - 1];
+        const uint32_t curr_v = path_vtx_ids[i];
+
+        uint32_t ovlp = 0;
+        const auto& arcs = getArcsFromVertex(prev_v);
+        for (const auto* arc : arcs) {
+            if (arc && !arc->get_del() && arc->w == curr_v) {
+                ovlp = (arc->ow > 0 ? static_cast<uint32_t>(arc->ow) : 0u);
+                break;
+            }
+        }
+
+        overlaps.push_back(ovlp);
+    }
+
+    return overlaps;
+}
+
+std::vector<uint32_t> GfaGraph::get_path_overlaps(const std::vector<Vertex>& path_vtxs) const {
+    std::vector<uint32_t> overlaps;
+    if (path_vtxs.size() <= 1) return overlaps;
+
+    overlaps.reserve(path_vtxs.size() - 1);
+
+    for (size_t i = 1; i < path_vtxs.size(); ++i) {
+        const uint32_t prev_v = path_vtxs[i - 1].vertex_id();
+        const uint32_t curr_v = path_vtxs[i].vertex_id();
+
+        uint32_t ovlp = 0;
+        const auto& arcs = getArcsFromVertex(prev_v);
+        for (const auto* arc : arcs) {
+            if (arc && !arc->get_del() && arc->w == curr_v) {
+                ovlp = (arc->ow > 0 ? static_cast<uint32_t>(arc->ow) : 0u);
+                break;
+            }
+        }
+
+        overlaps.push_back(ovlp);
+    }
+
+    return overlaps;
+}
+
+uint32_t GfaGraph::get_edge_ow(uint32_t from_vtx_id, uint32_t to_vtx_id) const {
+    const auto& arcs = getArcsFromVertex(from_vtx_id);
+    for (const auto* arc : arcs) {
+        if (!arc || arc->get_del()) continue;
+        if (arc->w != to_vtx_id) continue;
+        return (arc->ow > 0 ? static_cast<uint32_t>(arc->ow) : 0u);
+    }
+    return 0u;
+}
+uint32_t GfaGraph::get_edge_ow(Vertex from_vtx, Vertex to_vtx) const {
+    const auto& arcs = getArcsFromVertex(from_vtx.vertex_id());
+    for (const auto* arc : arcs) {
+        if (!arc || arc->get_del()) continue;
+        if (arc->w != to_vtx.vertex_id()) continue;
+        return (arc->ow > 0 ? static_cast<uint32_t>(arc->ow) : 0u);
+    }
+    return 0u;
+}
+
 
 GfaArc* GfaGraph::add_arc(
     uint32_t v, uint32_t w, int32_t ov, int32_t ow,
@@ -160,7 +336,7 @@ GfaArc* GfaGraph::add_arc(
         arc.rank = arcs_[real_link_id].rank;
 
     /* ---------- 4. push to arcs_ ---------- */
-    arcs_.push_back(arc);                                 // Now arcs_.size() is equal to link_aux_.size()
+    arcs_.push_back(arc);
 
     return &arcs_.back();
 }
@@ -204,6 +380,7 @@ bool GfaGraph::parseSLine(std::stringstream& ss) {
     uint32_t id = get_or_add_segment(name);
     GfaNode& n = nodes_[id];
     n.name = name;
+    std::transform(seq.begin(), seq.end(), seq.begin(), [](unsigned char c) { return std::toupper(c); });  // 2026-04-16
     n.sequence = seq;
     n.length = len;
     n.aux.aux_data = std::move(aux_vec);
@@ -294,8 +471,18 @@ bool GfaGraph::parseLLine(std::stringstream& ss) {
     if (pL1 && *pL1 == 'i') {
         int32_t l1 = *reinterpret_cast<const int32_t*>(pL1 + 1);
         if (ov != INT32_MAX) {
-            nodes_[v_seg].length = std::max<uint32_t>(nodes_[v_seg].length, static_cast<uint32_t>(ov + l1));
-            prim->set_source_segment_len(nodes_[v_seg].length - ov);
+            uint32_t new_len = static_cast<uint32_t>(std::max<int64_t>(0, static_cast<int64_t>(ov) + l1));
+
+            if (!nodes_[v_seg].sequence.empty() && nodes_[v_seg].sequence != "*") {
+                uint32_t seq_len = static_cast<uint32_t>(nodes_[v_seg].sequence.size());
+                if (new_len > seq_len) new_len = seq_len;
+            }
+
+            nodes_[v_seg].length = std::max<uint32_t>(nodes_[v_seg].length, new_len);
+
+            uint32_t ov_u = (ov < 0 ? 0u : static_cast<uint32_t>(ov));
+            if (ov_u > nodes_[v_seg].length) ov_u = nodes_[v_seg].length;
+            prim->set_source_segment_len(nodes_[v_seg].length - ov_u);
         }
         GfaAuxParser::delete_aux_tag(laux.aux_data, pL1);
     }
@@ -303,7 +490,14 @@ bool GfaGraph::parseLLine(std::stringstream& ss) {
     if (pL2 && *pL2 == 'i') {
         int32_t l2 = *reinterpret_cast<const int32_t*>(pL2 + 1);
         if (ow != INT32_MAX) {
-            nodes_[w_seg].length = std::max<uint32_t>(nodes_[w_seg].length, static_cast<uint32_t>(ow + l2));
+            uint32_t new_len = static_cast<uint32_t>(std::max<int64_t>(0, static_cast<int64_t>(ow) + l2));
+
+            if (!nodes_[w_seg].sequence.empty() && nodes_[w_seg].sequence != "*") {
+                uint32_t seq_len = static_cast<uint32_t>(nodes_[w_seg].sequence.size());
+                if (new_len > seq_len) new_len = seq_len;
+            }
+
+            nodes_[w_seg].length = std::max<uint32_t>(nodes_[w_seg].length, new_len);
         }
         GfaAuxParser::delete_aux_tag(laux.aux_data, pL2);
     }
@@ -328,7 +522,7 @@ bool GfaGraph::parsePLine(std::stringstream& ss) {
         char ori = tok.back();
         auto it = name_to_id_map_.find(seg_name);
         if (it == name_to_id_map_.end()) {
-            warning_stream() << "Path references undefined segment '" << seg_name << "'\n";
+            warning_stream() << "  ! Path references undefined segment '" << seg_name << "'\n";
             continue;
         }
         p.segments.push_back({it->second, ori=='-'});
@@ -348,7 +542,7 @@ bool GfaGraph::parseALine(std::stringstream& ss) {
 
     auto it = name_to_id_map_.find(unitig);
     if (it == name_to_id_map_.end()) {
-        warning_stream() << "A-line refers undefined unitig '" << unitig << "'\n";
+        warning_stream() << "  ! A-line refers undefined unitig '" << unitig << "'\n";
         return false;
     }
     GfaAlignment a;
@@ -385,7 +579,7 @@ void GfaGraph::fixNoSeg() {
     for (auto& n : nodes_) {
         if (n.length == 0) {
             n.deleted = true;
-            warning_stream() << "Delete zero-length segment '" << n.name << "'\n";
+            warning_stream() << "  ! Delete zero-length segment '" << n.name << "'\n";
         }
     }
 }
@@ -446,7 +640,7 @@ void GfaGraph::fixSemiArc() {
             if (needOv) a.ov = b.ow;
         } else {
             a.set_del(true);
-            warning_stream() << "[W] arc " << nodes_[NodeHandle::get_segment_id(a.get_source_vertex_id())].name
+            warning_stream() << "  ! arc " << nodes_[NodeHandle::get_segment_id(a.get_source_vertex_id())].name
                 << " -> " << nodes_[NodeHandle::get_segment_id(a.get_target_vertex_id())].name
                 << " removed (missing overlap)\n";
         }
@@ -502,19 +696,42 @@ void GfaGraph::fixSymmAdd() {
 void GfaGraph::fixArcLen() {
     for (GfaArc& a : arcs_) {
         if (a.get_del()) continue;
+
         uint32_t sseg = NodeHandle::get_segment_id(a.get_source_vertex_id());
         uint32_t tseg = NodeHandle::get_segment_id(a.get_target_vertex_id());
 
         if (nodes_[sseg].deleted || nodes_[tseg].deleted) {
-            a.set_del(true); continue;
+            a.set_del(true);
+            continue;
         }
-    
-        uint32_t slen = nodes_[sseg].length;
+
+        uint32_t slen = (!nodes_[sseg].sequence.empty() && nodes_[sseg].sequence != "*")
+                        ? static_cast<uint32_t>(nodes_[sseg].sequence.size())
+                        : nodes_[sseg].length;
+
+        uint32_t tlen = (!nodes_[tseg].sequence.empty() && nodes_[tseg].sequence != "*")
+                        ? static_cast<uint32_t>(nodes_[tseg].sequence.size())
+                        : nodes_[tseg].length;
+
+        if (a.ov == INT32_MAX) a.ov = 0;
+        if (a.ow == INT32_MAX) a.ow = 0;
+
+        if (a.ov < 0) a.ov = 0;
+        if (a.ow < 0) a.ow = 0;
+
         if (a.ov > static_cast<int32_t>(slen)) {
-            warning_stream() << "ov longer than segment '" << nodes_[sseg].name << "': " << a.ov << " > " << slen << '\n';
-            a.ov = slen;
+            warning_stream() << "  ! ov longer than source segment '" << nodes_[sseg].name << "': " << a.ov << " > " << slen << ", clamp to " << slen << '\n';
+            a.ov = static_cast<int32_t>(slen);
+            a.ow = a.ov;
         }
-        a.set_source_segment_len(slen - a.ov);
+
+        if (a.ow > static_cast<int32_t>(tlen)) {
+            warning_stream() << "  ! ow longer than target segment '" << nodes_[tseg].name << "': " << a.ow << " > " << tlen << ", clamp to " << tlen << '\n';
+            a.ow = static_cast<int32_t>(tlen);
+            a.ov = a.ow;
+        }
+
+        a.set_source_segment_len(slen - static_cast<uint32_t>(a.ov));
     }
 }
 
@@ -656,47 +873,302 @@ GfaGraph::walk_bfs(
     return walker.bfs(start_v, dir, max_paths, max_steps);
 }
 
- std::vector<std::vector<uint32_t>> GfaGraph::enumerate_paths_DFS(
+std::vector<std::vector<uint32_t>> GfaGraph::enumerate_paths_DFS(
     const uint32_t src, const uint32_t sink, const std::unordered_set<uint32_t>& region_set,
     const uint32_t max_depth, const uint32_t max_paths,
-    const bool skip_comp, bool& hit_limits, const uint64_t DFS_guard
+    const bool skip_comp, bool& hit_limits, const uint64_t DFS_guard, const uint32_t stall_round_limit
 ) const {
     GfaWalker walker(*this);
-    return walker.enumerate_paths_DFS(src, sink, region_set, max_depth, max_paths, skip_comp, hit_limits, DFS_guard);
+    return walker.enumerate_paths_DFS(src, sink, region_set, max_depth, max_paths, skip_comp, hit_limits, DFS_guard, stall_round_limit);
+};
+
+std::vector<std::vector<uint32_t>> GfaGraph::enumerate_paths_greedy_DFS(
+    const uint32_t src, const uint32_t sink, const std::unordered_set<uint32_t>& region_set,
+    const uint32_t max_depth, const uint32_t max_paths,
+    const bool skip_comp, bool& hit_limits, const uint64_t DFS_guard, const uint32_t stall_round_limit
+) const {
+    GfaWalker walker(*this);
+    return walker.enumerate_paths_greedy_DFS(src, sink, region_set, max_depth, max_paths, skip_comp, hit_limits, DFS_guard, stall_round_limit);
 };
 
 
-bool GfaGraph::is_connected_vertex(uint32_t v_from, uint32_t v_to, uint32_t step_cap) const {
-    const uint32_t V = (uint32_t)arc_indexs_.size();
-    if (v_from >= V || v_to >= V) return false;
+bool GfaGraph::build_nodes_connectivity_index(bool skip_comp)
+{
+    log_stream() << "Building nodes connectivity index ...\n";
 
-    // Skip if source/target segments are deleted
-    auto ok_seg = [&](uint32_t v)->bool{
-        uint32_t s = NodeHandle::get_segment_id(v);
-        return s < nodes_.size() && !nodes_[s].deleted;
+    std::vector<uint32_t>().swap(connectivity_index_);  // clear and free memory
+
+    const uint32_t nseg = static_cast<uint32_t>(getNumNodes());
+    connectivity_index_.assign(nseg, UINT32_MAX);
+    if (nseg == 0) return false;
+
+    std::vector<uint32_t> parent(nseg, UINT32_MAX);
+    std::vector<uint8_t> rank(nseg, 0);
+    for (uint32_t s = 0; s < nseg; ++s) {
+        if (!getNodeDeleted(s)) parent[s] = s;
+    }
+
+    auto find_root = [&](uint32_t x) -> uint32_t {
+        while (parent[x] != x) {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        return x;
     };
-    if (!ok_seg(v_from) || !ok_seg(v_to)) return false;
+    auto unite = [&](uint32_t a, uint32_t b) {
+        uint32_t ra = find_root(a);
+        uint32_t rb = find_root(b);
+        if (ra == rb) return;
+        if (rank[ra] < rank[rb]) std::swap(ra, rb);
+        parent[rb] = ra;
+        if (rank[ra] == rank[rb]) ++rank[ra];
+    };
 
-    std::vector<uint8_t> vis(V, 0);
-    std::queue<uint32_t> q;
-    q.push(v_from); vis[v_from] = 1;
+    for (const GfaArc& a : getAllArcs()) {
+        if (a.get_del() || (skip_comp && a.get_comp())) continue;
+        const uint32_t s = a.get_source_segment_id();
+        const uint32_t t = a.get_target_segment_id();
+        if (s >= nseg || t >= nseg) continue;
+        if (parent[s] == UINT32_MAX || parent[t] == UINT32_MAX) continue;
+        unite(s, t);
+    }
 
-    uint32_t pops = 0;
-    while (!q.empty()) {
-        uint32_t u = q.front(); q.pop();
-        if (u == v_to) return true;
-        if (++pops > step_cap) break;
+    std::vector<uint32_t> root_to_comp(nseg, UINT32_MAX);
+    uint32_t ncomp = 0;
+    for (uint32_t s = 0; s < nseg; ++s) {
+        if (parent[s] == UINT32_MAX) continue;
+        const uint32_t r = find_root(s);
+        if (root_to_comp[r] == UINT32_MAX) {
+            root_to_comp[r] = ncomp++;
+        }
+        connectivity_index_[s] = root_to_comp[r];
+    }
 
-        auto outs = getArcsFromVertex(u);
-        for (const GfaArc* a : outs) {
-            if (!a || a->get_del()) continue;
-            uint32_t w = a->get_target_vertex_id();
-            if (!ok_seg(w)) continue;
-            if (!vis[w]) { vis[w] = 1; q.push(w); }
+    log_stream() << "  - Nodes connectivity components indexed: " << ncomp << "\n" << "\n";
+
+    return true;
+}
+
+uint32_t GfaGraph::node_connectivity_id(Vertex v) const
+{
+    if (connectivity_index_.empty()) {
+        warning_stream() << "  ! Connectivity index not built yet\n";
+        return UINT32_MAX;
+    }
+    const uint32_t sid = v.segment_id();
+    if (sid >= connectivity_index_.size()) return UINT32_MAX;
+    return connectivity_index_[sid];
+}
+
+bool GfaGraph::nodes_connected(Vertex a, Vertex b) const
+{
+    const uint32_t ca = node_connectivity_id(a);
+    const uint32_t cb = node_connectivity_id(b);
+    return (ca != UINT32_MAX && cb != UINT32_MAX && ca == cb);
+}
+
+bool GfaGraph::build_vertex_topological_index(bool skip_comp)
+{
+    log_stream() << "Building nodes topological index ...\n";
+
+    const uint32_t nseg = static_cast<uint32_t>(getNumNodes());
+    const uint32_t V = nseg * 2;
+
+    topo_index_.clear();
+    topo_index_.resize(V);
+
+    auto valid_vertex = [&](uint32_t v) -> bool {
+        const uint32_t sid = NodeHandle::get_segment_id(v);
+        return sid < nseg && !getNodeDeleted(sid);
+    };
+
+    std::vector<uint32_t> disc(V, UINT32_MAX);
+    std::vector<uint32_t> low(V, UINT32_MAX);
+    std::vector<uint8_t> on_stack(V, 0);
+    std::vector<uint32_t> stack;
+    stack.reserve(V);
+
+    std::vector<uint32_t> comp_id(V, UINT32_MAX);
+    std::vector<uint32_t> comp_size;
+    std::vector<uint32_t> comp_min_v;
+
+    uint32_t timer = 0;
+
+    std::function<void(uint32_t)> dfs = [&](uint32_t u) {
+        disc[u] = low[u] = timer++;
+        stack.push_back(u);
+        on_stack[u] = 1;
+
+        for (const GfaArc* a : getArcsFromVertex(u)) {
+            if (!a || a->get_del() || (skip_comp && a->get_comp())) continue;
+
+            const uint32_t w = a->get_target_vertex_id();
+            if (w == u || !valid_vertex(w)) continue;
+
+            if (disc[w] == UINT32_MAX) {
+                dfs(w);
+                low[u] = std::min(low[u], low[w]);
+            } else if (on_stack[w]) {
+                low[u] = std::min(low[u], disc[w]);
+            }
+        }
+
+        if (low[u] != disc[u]) return;
+
+        const uint32_t cid = static_cast<uint32_t>(comp_size.size());
+        uint32_t sz = 0;
+        uint32_t min_v = UINT32_MAX;
+
+        while (true) {
+            uint32_t x = stack.back();
+            stack.pop_back();
+            on_stack[x] = 0;
+
+            comp_id[x] = cid;
+            ++sz;
+            min_v = std::min(min_v, x);
+
+            if (x == u) break;
+        }
+
+        comp_size.push_back(sz);
+        comp_min_v.push_back(min_v);
+    };
+
+    for (uint32_t v = 0; v < V; ++v) {
+        if (!valid_vertex(v)) continue;
+        if (disc[v] == UINT32_MAX) dfs(v);
+    }
+
+    const uint32_t C = static_cast<uint32_t>(comp_size.size());
+
+    std::vector<std::vector<uint32_t>> dag(C);
+    std::vector<uint32_t> indeg(C, 0);
+
+    for (uint32_t u = 0; u < V; ++u) {
+        if (!valid_vertex(u)) continue;
+
+        const uint32_t cu = comp_id[u];
+        if (cu == UINT32_MAX) continue;
+
+        for (const GfaArc* a : getArcsFromVertex(u)) {
+            if (!a || a->get_del() || (skip_comp && a->get_comp())) continue;
+
+            const uint32_t w = a->get_target_vertex_id();
+            if (!valid_vertex(w)) continue;
+
+            const uint32_t cw = comp_id[w];
+            if (cw == UINT32_MAX || cu == cw) continue;
+
+            dag[cu].push_back(cw);
         }
     }
-    return false;
+
+    for (uint32_t c = 0; c < C; ++c) {
+        auto& xs = dag[c];
+        std::sort(xs.begin(), xs.end());
+        xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
+
+        for (uint32_t y : xs) {
+            ++indeg[y];
+        }
+    }
+
+    auto cmp = [&](uint32_t a, uint32_t b) {
+        return comp_min_v[a] > comp_min_v[b];
+    };
+
+    std::priority_queue<uint32_t, std::vector<uint32_t>, decltype(cmp)> q(cmp);
+
+    for (uint32_t c = 0; c < C; ++c) {
+        if (indeg[c] == 0) q.push(c);
+    }
+
+    std::vector<uint32_t> comp_rank(C, UINT32_MAX);
+    uint32_t rank = 0;
+
+    while (!q.empty()) {
+        const uint32_t c = q.top();
+        q.pop();
+
+        comp_rank[c] = rank++;
+
+        for (uint32_t y : dag[c]) {
+            if (--indeg[y] == 0) q.push(y);
+        }
+    }
+
+    for (uint32_t v = 0; v < V; ++v) {
+        if (!valid_vertex(v)) continue;
+
+        const uint32_t c = comp_id[v];
+        topo_index_[v].scc_id = c;
+        topo_index_[v].topo_rank = comp_rank[c];
+        topo_index_[v].scc_size = comp_size[c];
+        topo_index_[v].in_cycle = (comp_size[c] > 1);
+    }
+
+    log_stream() << "  - SCCs: " << C << "\n";
+    log_stream() << "  - Node topological ranks indexed\n\n";
+
+    if (DEBUG_ENABLED) {
+        std::vector<uint32_t> vertices;
+        vertices.reserve(V);
+
+        for (uint32_t v = 0; v < V; ++v) {
+            if (valid_vertex(v)) vertices.push_back(v);
+        }
+
+        std::sort(vertices.begin(), vertices.end(), [&](uint32_t a, uint32_t b) {
+            if (topo_index_[a].topo_rank != topo_index_[b].topo_rank)
+                return topo_index_[a].topo_rank < topo_index_[b].topo_rank;
+            return a < b;
+        });
+
+        for (uint32_t v : vertices) {
+            const uint32_t sid = Vertex::get_segment_id(v);
+            const std::string seg_name = getNodeName(sid);
+            const char strand = Vertex::get_is_reverse(v) ? '-' : '+';
+
+            debug_stream()
+                << "  - rank=" << topo_index_[v].topo_rank
+                << " name=" << seg_name << strand
+                << " scc_id=" << topo_index_[v].scc_id
+                << " scc_size=" << topo_index_[v].scc_size
+                << " in_cycle=" << static_cast<int>(topo_index_[v].in_cycle)
+                << "\n";
+        }
+
+        debug_stream() << "\n";
+    }
+
+    return topo_index_.size() == V;
 }
+
+uint32_t GfaGraph::vertex_topo_rank(Vertex v) const
+{
+    if (topo_index_.empty()) {
+        warning_stream() << "  ! Topological index not built yet\n";
+        return UINT32_MAX;
+    }
+    const uint32_t vid = v.vertex_id();
+    if (vid >= topo_index_.size()) return UINT32_MAX;
+    return topo_index_[vid].topo_rank;
+}
+
+const GfaTopoIndex& GfaGraph::vertex_topo_info(Vertex v) const
+{
+    static const GfaTopoIndex empty;
+    if (topo_index_.empty()) {
+        warning_stream() << "  ! Topological index not built yet\n";
+        return empty;
+    }
+    const uint32_t vid = v.vertex_id();
+    if (vid >= topo_index_.size()) return empty;
+    return topo_index_[vid];
+}
+
+
 
 namespace { inline uint64_t clamp0_i64(int64_t x){ return x>0 ? (uint64_t)x : 0ULL; } }
 bool GfaGraph::shortest_distance_between_offsets(
@@ -798,8 +1270,8 @@ uint32_t GfaGraph::add_segment(const std::string& name, const std::string& seque
                 return existing_id;
             } else {
                 error_stream() << "Duplicated segment name with different sequence: " << name << "\n";
-                error_stream() << "   - Existing: " << existing_seq << "\n";
-                error_stream() << "   - New: " << sequence << "\n";
+                error_stream() << "  - Existing: " << existing_seq << "\n";
+                error_stream() << "  - New: " << sequence << "\n";
                 std::exit(1);
             }
         } else {
@@ -875,7 +1347,7 @@ PathSequence GfaGraph::extend_left_from(
         const auto& nd = nodes_[seg];
         if (nd.deleted || nd.length == 0) return 0u;
 
-        const std::string oriented = get_oriented_sequence(v);
+        const std::string oriented = get_oriented_sequence(Vertex(v));
         if (oriented.empty() || oriented == "*") return 0u;
 
         const uint32_t lim  = std::min<uint32_t>(upto, nd.length);
@@ -995,7 +1467,7 @@ PathSequence GfaGraph::extend_right_from(
         const auto& nd = nodes_[seg];
         if (nd.deleted || nd.length == 0) return 0u;
 
-        const std::string oriented = get_oriented_sequence(v);
+        const std::string oriented = get_oriented_sequence(Vertex(v));
         if (oriented.empty() || oriented == "*") return 0u;
 
         uint32_t ow_u = (ow == INT32_MAX) ? 0u : (ow < 0 ? 0u : static_cast<uint32_t>(ow));
@@ -1243,19 +1715,19 @@ std::vector<std::string> GfaGraph::getAllSegmentNames() const {
 void GfaGraph::print_graph_stats() const {
     const int label_width = 25, value_width = 12;
     log_stream() << std::left << std::setw(label_width) << "GFA Graph stats:" << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Segments (S):" << std::right << std::setw(value_width) << getNumNodes() << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Links (unique):" << std::right << std::setw(value_width) << getNumUniqLinks() << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Directed arcs:" << std::right << std::setw(value_width) << arcs_.size() << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Max rank:" << std::right << std::setw(value_width) << getMaxRank() << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Paths (P):" << std::right << std::setw(value_width) << getNumPaths() << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Alignments (A):" << std::right << std::setw(value_width) << getNumAlignments() << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Total segment length:" << std::right << std::setw(value_width) << total_segment_length_ << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Average segment len:" << std::right << std::setw(value_width)
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Segments (S):" << std::right << std::setw(value_width) << getNumNodes() << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Links (unique):" << std::right << std::setw(value_width) << getNumUniqLinks() << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Directed arcs:" << std::right << std::setw(value_width) << arcs_.size() << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Max rank:" << std::right << std::setw(value_width) << getMaxRank() << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Paths (P):" << std::right << std::setw(value_width) << getNumPaths() << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Alignments (A):" << std::right << std::setw(value_width) << getNumAlignments() << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Total segment length:" << std::right << std::setw(value_width) << total_segment_length_ << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Average segment len:" << std::right << std::setw(value_width)
                  << std::fixed << std::setprecision(3) << getAveSegmentsLength() << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Total degree:" << std::right << std::setw(value_width) << getTotalDeg() << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Max degree:" << std::right << std::setw(value_width) << getMaxDeg() << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Average degree:" << std::right << std::setw(value_width)
-                 << std::fixed << std::setprecision(3) << getAveDeg() << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Total degree:" << std::right << std::setw(value_width) << getTotalDeg() << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Max degree:" << std::right << std::setw(value_width) << getMaxDeg() << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Average degree:" << std::right << std::setw(value_width)
+                 << std::fixed << std::setprecision(3) << getAveDeg() << '\n' << "\n";
 }
 
 // debug

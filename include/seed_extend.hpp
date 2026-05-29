@@ -17,6 +17,14 @@
 
 namespace seedExtend {
 
+void run_wfa_fragment(
+    std::string_view rseq,
+    std::string_view qseq,
+    std::string& cigar_out,
+    int& score_out, 
+    const opt::ExtendOpts& ExtendOpts
+);
+
 /* --------------------------------------------------------------- *
  * extend_chain_wfa()
  *

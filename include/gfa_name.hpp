@@ -158,6 +158,16 @@ public:
         return render_many_(merged);
     }
 
+    /**
+     * @param name    path/segment name, possibly containing multiple range tokens
+     * @param is_rev  target direction; false for forward, true for reverse
+     *
+     * @return the normalized name in the requested direction. Each token is rewritten to match the target strand, and when is_rev == true the token order is also reversed.
+     *
+     * @example
+     *   force_name_dir("A:10-20;B:30-40", false) -> "A:10-20;B:30-40"
+     *   force_name_dir("A:10-20;B:30-40", true)  -> "B:40-30;A:20-10"
+     */
     std::string force_name_dir(const std::string& name, bool is_rev) const {
         if (name.empty()) return name;
 
@@ -241,7 +251,23 @@ public:
         return false;
     }
 
-    // utg000657l:1715746-1748768;utg001413l:68019-69627 -> [utg000657l:1715746-1748768, utg001413l:68019-69627]
+    /**
+     * @param base  composite range name, containing one or more tokens such as
+     *              "utg1:100-200;utg2:300-400" or "utg1:200-100+utg2:300-400"
+     *
+     * @return a list of Piece entries in input order, each storing root, normalized
+     *         interval [lo, hi], per-token direction flag, and span length (hi - lo).
+     *         Returns an empty vector if base does not look like a range name.
+     *         Aborts on malformed tokens in a composite string.
+     *
+     * @example
+     *   parse_composite_with_dir_("utg1:100-200")
+     *     -> [Piece{"utg1", 100, 200, false, 100}]
+     *
+     *   parse_composite_with_dir_("utg1:200-100;utg2:300-360")
+     *     -> [Piece{"utg1", 100, 200, true, 100},
+     *         Piece{"utg2", 300, 360, false, 60}]
+     */
     std::vector<Piece> parse_composite_with_dir(const std::string& base) const {
         return parse_composite_with_dir_(base);
     }
@@ -270,7 +296,21 @@ private:
         return toks;
     }
 
-    // Parse "root:lo-hi" or "root:hi-lo"; return lo,hi plus rev flag.
+    /**
+     * @param s     token in the form "root:lo-hi" or "root:hi-lo"
+     * @param root  parsed contig/unit name
+     * @param lo    smaller coordinate of the interval
+     * @param hi    larger coordinate of the interval
+     * @param rev   true if the token is written in reverse order (hi-lo)
+     *
+     * @return true if parsing succeeds; otherwise false.
+     *
+     * @example
+     *   parse_token_dir_("utg1:100-200", root, lo, hi, rev)
+     *     -> root="utg1", lo=100, hi=200, rev=false
+     *   parse_token_dir_("utg1:200-100", root, lo, hi, rev)
+     *     -> root="utg1", lo=100, hi=200, rev=true
+     */
     static inline bool parse_token_dir_(
         const std::string& s,
         std::string& root, uint64_t& lo, uint64_t& hi, bool& rev
@@ -290,8 +330,22 @@ private:
         return true;
     }
 
-    // Parse composite with per-token direction preserved.
-    // utg000657l:1715746-1748768;utg001413l:68019-69627 -> [utg000657l:1715746-1748768, utg001413l:68019-69627]
+    /**
+     * @param base  composite range name, containing one or more tokens such as "utg1:100-200;utg2:300-400" or "utg1:200-100+utg2:300-400"
+     *
+     * @return a list of Piece entries in input order, each storing root, normalized
+     *         interval [lo, hi], per-token direction flag, and span length (hi - lo).
+     *         Returns an empty vector if base does not look like a range name.
+     *         Aborts on malformed tokens in a composite string.
+     *
+     * @example
+     *   parse_composite_with_dir_("utg1:100-200")
+     *     -> [Piece{"utg1", 100, 200, false, 100}]
+     *
+     *   parse_composite_with_dir_("utg1:200-100;utg2:300-360")
+     *     -> [Piece{"utg1", 100, 200, true, 100},
+     *         Piece{"utg2", 300, 360, false, 60}]
+     */
     std::vector<Piece> parse_composite_with_dir_(const std::string& base) const {
         if (base.find(':') == std::string::npos) return {};
         // Single token

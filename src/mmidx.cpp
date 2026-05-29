@@ -1161,9 +1161,9 @@ void MinimizerIndex::print_chains(
         const char  strand      = it_b->dir() ? '-' : '+';
 
         debug_stream() << "Chain " << ci << " (" << contig_name << " vs " << read_name << ")\n";
-        debug_stream() << "   - score: "  << score  << '\n';
-        debug_stream() << "   - strand: " << strand << '\n';
-        debug_stream() << "   - seeds: "  << len    << '\n';
+        debug_stream() << "  - score: "  << score  << '\n';
+        debug_stream() << "  - strand: " << strand << '\n';
+        debug_stream() << "  - seeds: "  << len    << '\n';
 
         debug_stream()
             << "      "
@@ -1231,12 +1231,12 @@ void MinimizerIndex::print_anchors(
             std::string ref_range   = "ref: [" + std::to_string(r_beg) + ", " + std::to_string(r_end) + ")";
             std::string qry_range   = "qry: [" + std::to_string(q_beg) + ", " + std::to_string(q_end) + ")";
 
-            debug_stream() << "   - " << score_info << std::endl;
-            debug_stream() << "   - " << strand_info << std::endl;
-            debug_stream() << "   - " << seed_info << std::endl;
-            debug_stream() << "   - " << length_info << std::endl;
-            debug_stream() << "   - " << ref_range << std::endl;
-            debug_stream() << "   - " << qry_range << std::endl << std::endl;
+            debug_stream() << "  - " << score_info << std::endl;
+            debug_stream() << "  - " << strand_info << std::endl;
+            debug_stream() << "  - " << seed_info << std::endl;
+            debug_stream() << "  - " << length_info << std::endl;
+            debug_stream() << "  - " << ref_range << std::endl;
+            debug_stream() << "  - " << qry_range << std::endl << std::endl;
         }
         debug_stream() << "\n";
     }
@@ -1267,30 +1267,22 @@ void MinimizerIndex::print_index_stats() const {
 
     // Minimizer Index stats
     log_stream() << std::left << std::setw(label_width) << "Minimizer Index stats:" << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "k-mer size:" << std::right << std::setw(value_width) << chainOpts_.k << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Window size:" << std::right << std::setw(value_width) << chainOpts_.w << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Sequences number:" << std::right << std::setw(value_width) << n_seqs << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Distinct minimizers:" << std::right << std::setw(value_width) << distinct << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Singletons (%):" << std::right << std::setw(value_width) << std::fixed << std::setprecision(2) << pct_singleton << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Avg occurrences:" << std::right << std::setw(value_width) << std::fixed << std::setprecision(3) << avg_occ << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Avg spacing:" << std::right << std::setw(value_width) << avg_spacing << '\n';
-    log_stream() << "   - " << std::left << std::setw(label_width) << "Total length:" << std::right << std::setw(value_width) << total_len << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "k-mer size:" << std::right << std::setw(value_width) << chainOpts_.k << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Window size:" << std::right << std::setw(value_width) << chainOpts_.w << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Sequences number:" << std::right << std::setw(value_width) << n_seqs << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Distinct minimizers:" << std::right << std::setw(value_width) << distinct << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Singletons (%):" << std::right << std::setw(value_width) << std::fixed << std::setprecision(2) << pct_singleton << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Avg occurrences:" << std::right << std::setw(value_width) << std::fixed << std::setprecision(3) << avg_occ << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Avg spacing:" << std::right << std::setw(value_width) << avg_spacing << '\n';
+    log_stream() << "  - " << std::left << std::setw(label_width) << "Total length:" << std::right << std::setw(value_width) << total_len << '\n';
 
     if (chainOpts_.mid_occ_frac > 0.0f) {
-        log_stream() << "   - " << std::left << std::setw(label_width) << "Drop fraction:" << std::right << std::setw(value_width) << std::setprecision(4) << chainOpts_.mid_occ_frac << '\n';
-        log_stream() << "   - " << std::left << std::setw(label_width) << "Max occ threshold:" << std::right << std::setw(value_width) << chainOpts_.mid_occ << '\n';
+        log_stream() << "  - " << std::left << std::setw(label_width) << "Drop fraction:" << std::right << std::setw(value_width) << std::setprecision(4) << chainOpts_.mid_occ_frac << '\n';
+        log_stream() << "  - " << std::left << std::setw(label_width) << "Max occ threshold:" << std::right << std::setw(value_width) << chainOpts_.mid_occ << '\n';
     }
 }
 
 
-
-
-
-
-inline bool MinimizerIndex::is_connected_vertex_(uint32_t v_from, uint32_t v_to) const {
-    if (!graph_) return false;
-    return graph_->is_connected_vertex(v_from, v_to, /*step_cap=*/200000);
-}
 
 // ============= Cross-segment transition score A->B =============
 // Notes: dq uses read gap + previous segment length (A.r_end-A.r_beg);
@@ -1333,7 +1325,7 @@ int32_t MinimizerIndex::score_transition_seg_(const SegNode& A, const SegNode& B
     uint32_t off_to   = A.rev ? (lenB > B.r_end ? (lenB - B.r_end) : 0u) : B.r_beg;
 
     // --- Optional fast pruning using oriented connectivity ---
-    if (!graph_->is_connected_vertex(v_from, v_to, /*step_cap=*/200000)) return INT32_MIN;
+    if (!graph_->nodes_connected(Vertex(v_from), Vertex(v_to))) return INT32_MIN;
 
     // --- Shortest added-bases distance on the graph (ow-rule aware, oriented) ---
     uint64_t dist = 0;
@@ -1528,7 +1520,8 @@ int32_t MinimizerIndex::mm_comput_sc_graph_(const MM128* ai, const MM128* aj) co
     const uint32_t v_to   = (ai->r_id() << 1) | ori;
 
     // Fast connectivity pruning
-    if (!is_connected_vertex_(v_from, v_to)) return INT32_MIN;
+
+    if (!graph_->nodes_connected(Vertex(v_from), Vertex(v_to))) return INT32_MIN;
 
     // forward -> oriented offsets
     // Start point (leave A covered tail):

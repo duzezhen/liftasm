@@ -107,10 +107,10 @@ std::vector<std::string> GfaSeq::extract_from_paths_(const std::vector<std::stri
             // Extract
             bool unknown = false;
             bool first = true;
-            uint32_t prev_vtx = 0;
+            Vertex prev_vtx(0, false);
 
             for (const auto &it : items) {
-                uint32_t vtx = (it.sid << 1) | (it.rev ? 1u : 0u);
+                Vertex vtx(it.sid, it.rev);
                 std::string s = get_oriented_sequence(vtx);  // If "*", then empty
                 if (s.empty()) { unknown = true; break; }
 
@@ -119,9 +119,9 @@ std::vector<std::string> GfaSeq::extract_from_paths_(const std::vector<std::stri
                     first = false;
                 } else {
                     uint32_t ovlp = 0;
-                    auto arcs = getArcsFromVertex(prev_vtx);
+                    auto arcs = getArcsFromVertex(prev_vtx.vertex_id());
                     for (const auto* arc : arcs) {
-                        if (arc && arc->w == vtx) {
+                        if (arc && arc->w == vtx.vertex_id()) {
                             ovlp = arc->ow > 0 ? static_cast<uint32_t>(arc->ow) : 0u;
                             break;
                         }

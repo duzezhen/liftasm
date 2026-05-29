@@ -283,10 +283,18 @@ public:
     std::vector<std::vector<uint32_t>> enumerate_paths_DFS(
         const uint32_t src, const uint32_t sink, const std::unordered_set<uint32_t>& region_set,
         const uint32_t max_depth, const uint32_t max_paths,
-        bool skip_comp, bool& hit_limits, const uint64_t DFS_guard
+        bool skip_comp, bool& hit_limits, const uint64_t DFS_guard, const uint32_t stall_round_limit
     ) const {
-        return enumerate_paths_DFS_(src, sink, region_set, max_depth, max_paths, skip_comp, hit_limits, DFS_guard);
+        return enumerate_paths_DFS_(src, sink, region_set, max_depth, max_paths, skip_comp, hit_limits, DFS_guard, stall_round_limit);
     }
+    std::vector<std::vector<uint32_t>> enumerate_paths_greedy_DFS(
+        const uint32_t src, const uint32_t sink, const std::unordered_set<uint32_t>& region_set,
+        const uint32_t max_depth, const uint32_t max_paths,
+        bool skip_comp, bool& hit_limits, const uint64_t DFS_guard, const uint32_t stall_round_limit
+    ) const {
+        return enumerate_paths_greedy_DFS_(src, sink, region_set, max_depth, max_paths, skip_comp, hit_limits, DFS_guard, stall_round_limit);
+    }
+    
 
 private:
     static uint64_t hash_vec_(std::vector<uint32_t> vec, bool use_direction = true) {
@@ -334,7 +342,7 @@ private:
         const GfaNode* nd  = graph.getNode(seg);
         if (!nd || nd->deleted || nd->length == 0) return 0u;
 
-        const std::string oriented = graph.get_oriented_sequence(v);
+        const std::string oriented = graph.get_oriented_sequence(Vertex(v));
         if (oriented.empty() || oriented == "*") return 0u;
 
         uint32_t ow_u = (ow == INT32_MAX) ? 0u : (ow < 0 ? 0u : static_cast<uint32_t>(ow));
@@ -350,7 +358,7 @@ private:
         const GfaNode* nd  = graph.getNode(seg);
         if (!nd || nd->deleted || nd->length == 0) return 0u;
 
-        const std::string oriented = graph.get_oriented_sequence(v);
+        const std::string oriented = graph.get_oriented_sequence(Vertex(v));
         if (oriented.empty() || oriented == "*") return 0u;
 
         const uint32_t lim  = std::min<uint32_t>(upto, nd->length);
@@ -574,82 +582,6 @@ private:
         return results;
     }
 
-    // // Enumerate all paths from src to sink using DFS, with optional depth and path limits.
-    // std::vector<std::vector<uint32_t>> enumerate_paths_DFS_(
-    //     const uint32_t src, const uint32_t sink, 
-    //     const uint32_t max_depth, const uint32_t max_paths,
-    //     const bool skip_comp = false
-    // ) const {
-    //     std::vector<std::vector<uint32_t>> out;
-        
-    //     // Check
-    //     const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
-    //     if (V == 0 || src >= V || sink >= V) return out;
-
-    //     // used to detect cycles on the current path
-    //     std::unordered_set<uint32_t> on_path;
-    //     on_path.reserve(max_depth + 1);
-
-    //     // used to avoid duplicate paths (by hash)
-    //     std::unordered_set<uint64_t> seen_path; seen_path.reserve(32);
-
-    //     // DFS stack
-    //     std::vector<uint32_t> path; path.reserve(max_depth + 1);
-    //     std::vector<DFSFrame> stk;  stk.reserve(max_depth + 1);
-
-    //     on_path.insert(src);
-    //     path.push_back(src);
-    //     stk.push_back({src, 0, static_cast<uint64_t>(max_depth)});
-
-    //     // Limit the number of DFS states to prevent excessive CPU time usage
-    //     static constexpr std::uint64_t MAX_DFS_STATES = 500'000;
-    //     std::uint64_t dfs_states = 0;
-
-    //     while (!stk.empty() && out.size() < max_paths) {
-    //         if (++dfs_states > MAX_DFS_STATES) {
-    //             out.clear();
-    //             return out;
-    //         }
-
-    //         DFSFrame& fr = stk.back();
-    //         uint32_t  v  = fr.v;
-    //         if (v == sink) {
-    //             uint64_t hv = hash_vec_(path);  // Deduplicate by hash
-    //             if (seen_path.insert(hv).second) {
-    //                 out.push_back(path);
-    //                 if (out.size() >= max_paths) break;
-    //             }
-    //             on_path.erase(v);
-    //             path.pop_back();
-    //             stk.pop_back();
-    //             continue;
-    //         }
-
-    //         const auto& arcs = graph_.getArcsFromVertex(v);
-    //         bool advanced = false;
-    //         while (fr.nextIdx < arcs.size()) {
-    //             const GfaArc* a = arcs[fr.nextIdx++];
-    //             if (!a || a->get_del() || (skip_comp && a->get_comp())) continue;
-    //             uint32_t w = a->get_target_vertex_id();
-    //             if (w == v) continue;
-    //             if (on_path.find(w) != on_path.end()) continue;
-    //             if (fr.depthLeft == 0) continue;
-    //             on_path.insert(w);
-    //             path.push_back(w);
-    //             stk.push_back({w, 0, static_cast<uint64_t>(fr.depthLeft - 1)});
-    //             advanced = true;
-    //             break;
-    //         }
-    //         if (!advanced) {
-    //             on_path.erase(v);
-    //             path.pop_back();
-    //             stk.pop_back();
-    //         }
-    //     }
-
-    //     return out;
-    // }
-
     const std::string& get_node_name(uint32_t v) const {
         uint32_t sid = NodeHandle::get_segment_id(v);
         const GfaNode* nd = graph_.getNode(sid);
@@ -657,18 +589,54 @@ private:
         return nd ? nd->name : empty;
     }
 
+    /**
+     * @brief Enumerate representative DFS paths from src to sink within a local region.
+     *
+     * Two stages:
+     *
+     *   1. From 'src', it explores forward and stores the best prefix path for each reachable vertex under the current scoring rule.
+     *   2. Using these prefix vertices as pivots, it performs DFS extensions toward 'sink' and records unique full paths.
+     *
+     * Stops when:
+     *
+     *   - 'max_paths' unique paths have been collected, or
+     *   - no new unique path is found for 'stall_round_limit' consecutive pivot rounds, or
+     *   - DFS exploration exceeds 'DFS_guard', or
+     *   - no more pivot vertices remain to try.
+     *
+     * Traversal can be restricted to 'region_set' (except that 'sink' is always allowed), and cycles on the current path are avoided.
+     *
+     * @param src                source vertex id
+     * @param sink               sink vertex id
+     * @param region_set         allowed internal vertices for traversal; if empty, no region restriction is applied
+     * @param max_depth          maximum DFS depth allowed for a full path
+     * @param max_paths          maximum number of unique paths to return; 0 means no explicit path-count cap
+     * @param skip_comp          whether to skip arcs marked as complementary
+     * @param hit_limits         output flag; set to true if traversal is aborted due to 'DFS_guard'
+     * @param DFS_guard          hard upper bound on explored DFS states
+     * @param stall_round_limit  stop after this many consecutive pivot rounds without finding a new unique path
+     *
+     * @return a list of unique src-to-sink paths, each represented as a vertex-id vector
+     */
     std::vector<std::vector<uint32_t>> enumerate_paths_DFS_(
         const uint32_t src,
         const uint32_t sink,
         const std::unordered_set<uint32_t>& region_set,
         const uint32_t max_depth,
         const uint32_t max_paths,
-        const bool skip_comp, 
-        bool& hit_limits, 
-        const uint64_t DFS_guard
+        const bool skip_comp,
+        bool& hit_limits,
+        const uint64_t DFS_guard, 
+        const uint32_t stall_round_limit = 2
     ) const
     {
         std::vector<std::vector<uint32_t>> out;
+        hit_limits = false;
+
+        if (src == sink) {
+            out.push_back({src});
+            return out;
+        }
 
         std::unordered_set<uint32_t> covered;
         covered.reserve(region_set.size() + 8);
@@ -676,17 +644,47 @@ private:
         const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
         if (V == 0 || src >= V || sink >= V) return out;
 
-        debug_stream() << "=========================================\n";
-        debug_stream() << "[ENUM-DFS] src=" << get_node_name(src)
-                    << " sink=" << get_node_name(sink)
-                    << " max_depth=" << max_depth
-                    << " max_paths=" << max_paths
-                    << "\n";
+        // Only vertices whose topo_rank is between src and sink are allowed.
+        uint32_t src_rank = graph_.vertex_topo_rank(Vertex(src));
+        uint32_t sink_rank = graph_.vertex_topo_rank(Vertex(sink));
+        const bool use_topo_filter = graph_.get_vertex_topological_index().size() >= V && src_rank != UINT32_MAX && sink_rank != UINT32_MAX;
 
-        // print region_set
-        debug_stream() << "[ENUM-DFS] region_set nodes:\n";
-        for (uint32_t v : region_set) {
-            debug_stream() << "  " << get_node_name(v) << "\n";
+        if (src_rank > sink_rank) std::swap(src_rank, sink_rank);
+
+        // Used to check if a vertex is within the topo window defined by src and sink. If topo ranks are not available, this always returns true.
+        auto in_topo_window = [&](uint32_t v) -> bool {
+            if (!use_topo_filter) return true;
+            const uint32_t r = graph_.vertex_topo_rank(Vertex(v));
+            return r != UINT32_MAX && r >= src_rank && r <= sink_rank;
+        };
+
+        // Used for debugging
+        auto log_indent = [&](int level) -> std::string {
+            return std::string(level * 2, ' ');
+        };
+
+        auto log_path = [&](const std::vector<uint32_t>& p, int level, const std::string& title) {
+            if (!DEBUG_ENABLED) return;
+            debug_stream() << log_indent(level) << title << "\n";
+            for (uint32_t x : p) {
+                debug_stream() << log_indent(level + 1) << get_node_name(x) << "\n";
+            }
+        };
+
+        if (DEBUG_ENABLED) {
+            debug_stream() << "=========================================\n";
+            debug_stream() << "Enumerate DFS paths\n";
+            debug_stream() << log_indent(1) << "src       : " << get_node_name(src) << "\n";
+            debug_stream() << log_indent(1) << "sink      : " << get_node_name(sink) << "\n";
+            debug_stream() << log_indent(1) << "max_depth : " << max_depth << "\n";
+            debug_stream() << log_indent(1) << "max_paths : " << max_paths << "\n";
+            if (use_topo_filter) {
+                debug_stream() << log_indent(1) << "topo_win  : " << src_rank << " .. " << sink_rank << "\n";
+            }
+            debug_stream() << log_indent(1) << "region_set:\n";
+            for (uint32_t v : region_set) {
+                debug_stream() << log_indent(2) << get_node_name(v) << "\n";
+            }
         }
 
         // ================== Step 1: From src, record best prefix paths (half DFS) ================== //
@@ -705,7 +703,7 @@ private:
             info.path  = { src };
             info.depth = 0;
             info.score = 0;
-            best_prefix[src] = info;
+            best_prefix[src] = std::move(info);
         }
 
         std::queue<uint32_t> q;
@@ -713,7 +711,11 @@ private:
 
         uint64_t prefix_states = 0;
 
-        debug_stream() << "[PREFIX] start forward exploration from src\n";
+        if (DEBUG_ENABLED) {
+            debug_stream() << "\n";
+            debug_stream() << "  Prefix exploration\n";
+            debug_stream() << log_indent(2) << "start from " << get_node_name(src) << "\n";
+        }
 
         while (!q.empty()) {
             uint32_t v = q.front();
@@ -724,7 +726,10 @@ private:
             const PrefixInfo &cur = it_v->second;
 
             if (++prefix_states > DFS_guard) {
-                debug_stream() << "[PREFIX] STOP: exceed DFS_guard=" << DFS_guard << "\n";
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(2) << "stop: exceed DFS_guard = " << DFS_guard << "\n";
+                }
+                hit_limits = true;
                 break;
             }
 
@@ -733,11 +738,12 @@ private:
 
             GfaNodeSelector::NodeSimpleStats stats = selector_.build_stats_for_path(cur.path);
 
-            debug_stream() << "[PREFIX] expand from " << get_node_name(v)
-                << " depth=" << cur.depth
-                << " score=" << cur.score
-                << " path_len=" << cur.path.size()
-                << "\n";
+            if (DEBUG_ENABLED) {
+                debug_stream() << log_indent(2) << "expand " << get_node_name(v)
+                               << "  depth=" << cur.depth
+                               << "  score=" << cur.score
+                               << "  path_len=" << cur.path.size() << "\n";
+            }
 
             const auto &arcs = graph_.getArcsFromVertex(v);
             for (const GfaArc* a : arcs) {
@@ -745,14 +751,16 @@ private:
 
                 uint32_t w = a->get_target_vertex_id();
 
-                if (w == v) continue;  // Self-loop
-                if (w != sink && region_set.find(w) == region_set.end()) continue;  // Not in region
-                if (std::find(cur.path.begin(), cur.path.end(), w) != cur.path.end()) continue;  // Avoid cycles in the prefix path
+                if (w == v) continue;  // self-loop
+                if (!in_topo_window(w)) continue;  // skip vertices outside the topo window defined by src and sink
+                // If region_set is provided, restrict traversal to region_set.
+                if (!region_set.empty() && w != sink && region_set.find(w) == region_set.end()) continue;
+                if (std::find(cur.path.begin(), cur.path.end(), w) != cur.path.end()) continue;  // avoid cycle in prefix path
 
                 uint32_t new_depth = cur.depth + 1;
                 if (new_depth > max_depth) continue;
 
-                // Canculate score
+                // Calculate score
                 GfaNodeSelector::ScoreContext sc;
                 sc.region_nodes  = &region_set;
                 sc.covered_nodes = &covered;
@@ -775,12 +783,15 @@ private:
                     }
                 }
 
-                debug_stream() << "  [PREFIX-CAND] from " << get_node_name(v)
-                            << " to "   << get_node_name(w)
-                            << " step_score=" << step_score
-                            << " new_score="  << new_score
-                            << " new_depth="  << new_depth
-                            << (better ? " [UPDATE]\n" : " [KEEP-OLD]\n");
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(3)
+                                   << get_node_name(v) << " -> " << get_node_name(w)
+                                   << "  step=" << step_score
+                                   << "  total=" << new_score
+                                   << "  depth=" << new_depth
+                                   << (better ? "  update" : "  keep_old")
+                                   << "\n";
+                }
 
                 if (!better) continue;
 
@@ -791,34 +802,43 @@ private:
                 np.path.push_back(w);
 
                 best_prefix[w] = std::move(np);
-
                 covered.insert(w);
 
-                // Push node into queue
                 if (w != sink) {
                     q.push(w);
                 }
             }
         }
 
-        // print best_prefix
-        for (const auto &kv : best_prefix) {
-            debug_stream() << "[BEST_PREFIX]  node=" << get_node_name(kv.first) << " path_len=" << kv.second.path.size() << " depth=" << kv.second.depth << " score=" << kv.second.score << "\n";
+        if (DEBUG_ENABLED) {
+            debug_stream() << log_indent(2) << "best prefixes:\n";
+            for (const auto &kv : best_prefix) {
+                debug_stream() << log_indent(3)
+                               << get_node_name(kv.first)
+                               << "  path_len=" << kv.second.path.size()
+                               << "  depth=" << kv.second.depth
+                               << "  score=" << kv.second.score << "\n";
+            }
         }
 
         if (best_prefix.size() <= 1) {
-            debug_stream() << "[PREFIX] only src reachable, no paths.\n";
-            debug_stream() << "=========================================\n\n";
+            if (DEBUG_ENABLED) {
+                debug_stream() << log_indent(2) << "only src reachable, no paths\n";
+                debug_stream() << "=========================================\n\n";
+            }
             return out;
         }
 
-        debug_stream() << "[PREFIX] total nodes with prefix=" << best_prefix.size() << "\n";
+        if (DEBUG_ENABLED) {
+            debug_stream() << log_indent(2) << "reachable nodes with prefix: " << best_prefix.size() << "\n";
+        }
 
         // Construct pivot candidates from best_prefix
         struct NodeStart {
             uint32_t v;
             uint32_t depth;
             int64_t  score;
+            uint32_t len;
         };
         std::vector<NodeStart> starts;
         starts.reserve(best_prefix.size());
@@ -830,77 +850,122 @@ private:
         for (const auto &kv : best_prefix) {
             uint32_t v = kv.first;
             const PrefixInfo &info = kv.second;
+
+            if (!in_topo_window(v)) continue;  // skip vertices outside the topo window defined by src and sink
+
             to_cover.insert(v);
 
             if (v == src) continue;
-            starts.push_back(NodeStart{v, info.depth, info.score});
+            starts.push_back(NodeStart{
+                v, 
+                info.depth, 
+                info.score, 
+                graph_.getNodeLength(NodeHandle::get_segment_id(v))
+            });
         }
 
         // Sort starts by depth , score , v
         std::sort(starts.begin(), starts.end(),
             [](const NodeStart &a, const NodeStart &b) {
+                if (a.len != b.len) return a.len > b.len;
                 if (a.depth != b.depth) return a.depth < b.depth;
-                if (a.score != b.score) return a.score < b.score;
+                if (a.score != b.score) return a.score > b.score;
                 return a.v < b.v;
             }
         );
 
-        debug_stream() << "[PREFIX] pivot candidates (by depth desc):\n";
-        for (const auto &ns : starts) {
-            debug_stream() << "  pivot=" << get_node_name(ns.v) << " depth=" << ns.depth << " score=" << ns.score << "\n";
+        if (DEBUG_ENABLED) {
+            debug_stream() << log_indent(2) << "pivot candidates:\n";
+            for (const auto &ns : starts) {
+                debug_stream() << log_indent(3)
+                               << get_node_name(ns.v)
+                               << "  depth=" << ns.depth
+                               << "  score=" << ns.score << "\n";
+            }
         }
 
-        // ================== Step 2: From pivots, do DFS to sink, until all nodes covered ================== //
+        // ================== Step 2: From pivots, do DFS to sink ================== //
 
         covered.clear();
         covered.reserve(region_set.size() + 8);
 
         // Deduplication
         std::unordered_set<uint64_t> seen_path;
-        seen_path.reserve(64);
+        seen_path.reserve(64 + starts.size());
 
-        // Defensive upper bound
+        // record which pivots have been tried
+        std::unordered_set<uint32_t> tried_pivots;
+        tried_pivots.reserve(starts.size() * 2 + 8);
+
+        uint32_t stall_rounds = 0;
+
         uint64_t dfs_states = 0;
 
-        auto all_covered = [&]() -> bool {
-            if (to_cover.empty()) return true;
-            for (uint32_t v : to_cover) {
-                if (covered.find(v) == covered.end()) return false;
-            }
-            return true;
-        };
-
-        debug_stream() << "[DFS] start second-phase DFS from pivots.\n";
+        if (DEBUG_ENABLED) {
+            debug_stream() << "\n";
+            debug_stream() << "  Pivot-to-sink DFS\n";
+            debug_stream() << log_indent(2) << "stall_round_limit: " << stall_round_limit << "\n";
+        }
 
         while (true) {
-            debug_stream() << "-------------------------------------------\n";
-            debug_stream() << "[DFS-ROUND] covered=" << covered.size() << " / need_cover=" << to_cover.size() << "  paths=" << out.size() << "\n";
+            if (DEBUG_ENABLED) {
+                debug_stream() << "\n";
+                debug_stream() << log_indent(2) << "round\n";
+                debug_stream() << log_indent(3) << "covered      : " << covered.size() << " / " << to_cover.size() << "\n";
+                debug_stream() << log_indent(3) << "path_count   : " << out.size() << "\n";
+                debug_stream() << log_indent(3) << "stall_rounds : " << stall_rounds << "\n";
+                debug_stream() << log_indent(3) << "tried_pivots : " << tried_pivots.size() << " / " << starts.size() << "\n";
+            }
 
-            if (all_covered()) break;
             if (max_paths > 0 && out.size() >= max_paths) break;
+            if (stall_rounds >= stall_round_limit) break;
 
-            // Select next pivot
             uint32_t pivot = UINT32_MAX;
+
+            // First priority: not tried && not covered
             for (const auto &ns : starts) {
-                if (to_cover.find(ns.v) == to_cover.end()) continue;
-                if (covered.find(ns.v) != covered.end()) continue;
                 if (ns.depth == 0) continue;
+                if (tried_pivots.find(ns.v) != tried_pivots.end()) continue;
+                if (covered.find(ns.v) != covered.end()) continue;
                 pivot = ns.v;
                 break;
             }
 
-            if (pivot == UINT32_MAX) break;
+            // Second priority: not tried (even if already covered, continue trying)
+            if (pivot == UINT32_MAX) {
+                for (const auto &ns : starts) {
+                    if (ns.depth == 0) continue;
+                    if (tried_pivots.find(ns.v) != tried_pivots.end()) continue;
+                    pivot = ns.v;
+                    break;
+                }
+            }
+
+            if (pivot == UINT32_MAX) {
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(2) << "no more pivots to try\n";
+                }
+                break;
+            }
+
+            tried_pivots.insert(pivot);
 
             auto it_pfx = best_prefix.find(pivot);
             if (it_pfx == best_prefix.end()) {
-                warning_stream() << get_node_name(pivot) << " has no prefix info, skip.\n";
+                warning_stream() << "  ! " << get_node_name(pivot) << " has no prefix info, skip.\n";
                 covered.insert(pivot);
+                ++stall_rounds;
                 continue;
             }
 
             const PrefixInfo &pfx = it_pfx->second;
 
-            debug_stream() << "[PIVOT] node=" << get_node_name(pivot) << " depth=" << pfx.depth << " score=" << pfx.score << "\n";
+            if (DEBUG_ENABLED) {
+                debug_stream() << log_indent(2) << "pivot: " << get_node_name(pivot)
+                            << "  depth=" << pfx.depth
+                            << "  score=" << pfx.score << "\n";
+                log_path(pfx.path, 3, "prefix path:");
+            }
 
             std::vector<uint32_t> path = pfx.path;
             std::unordered_set<uint32_t> on_path(path.begin(), path.end());
@@ -909,7 +974,7 @@ private:
                 uint32_t v;
                 uint32_t depth_left;
                 std::vector<uint32_t> cand_vs;
-                size_t idx;
+                size_t idx{0};
                 std::string state = "normal";
             };
 
@@ -919,7 +984,11 @@ private:
                 fr.depth_left = depth_left;
                 fr.idx = 0;
 
-                debug_stream() << "[FRAME] at " << get_node_name(v) << " depth_left=" << depth_left << "\n";
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(3)
+                                << "frame at " << get_node_name(v)
+                                << "  depth_left=" << depth_left << "\n";
+                }
 
                 const auto &arcs = graph_.getArcsFromVertex(v);
 
@@ -931,10 +1000,13 @@ private:
                 fr.cand_vs.reserve(arcs.size());
                 for (const GfaArc* a : arcs) {
                     if (!a || a->get_del() || (skip_comp && a->get_comp())) continue;
+
                     uint32_t w = a->get_target_vertex_id();
                     if (w == v) continue;
                     if (depth_left == 0) continue;
-                    if (on_path.find(w) != on_path.end()) continue;  // Acoid cycles on current path
+                    if (!in_topo_window(w)) continue;  // skip vertices outside the topo window defined by src and sink
+                    if (!region_set.empty() && w != sink && region_set.find(w) == region_set.end()) continue;
+                    if (on_path.find(w) != on_path.end()) continue;  // avoid cycle on current path
 
                     fr.cand_vs.push_back(w);
                 }
@@ -944,17 +1016,6 @@ private:
                     sc.region_nodes  = &region_set;
                     sc.covered_nodes = &covered;
                     selector_.sort_candidates(v, path, fr.cand_vs, &sc);
-                }
-
-                // Print log
-                if (!fr.cand_vs.empty()) {
-                    GfaNodeSelector::NodeSimpleStats stats = selector_.build_stats_for_path(path);
-                    for (auto w : fr.cand_vs) {
-                        GfaNodeSelector::ScoreContext sc;
-                        sc.region_nodes  = &region_set;
-                        sc.covered_nodes = &covered;
-                        int64_t wt = selector_.compute_weight(v, w, stats, &sc);
-                    }
                 }
 
                 return fr;
@@ -974,26 +1035,39 @@ private:
                 uint32_t v = fr.v;
 
                 if (++dfs_states > DFS_guard) {
-                    debug_stream() << "   - Region too complex from " << get_node_name(src) << " to " << get_node_name(sink) << " at " << get_node_name(v) << ", skip enumeration.\n";
-                    out.clear();
+                    if (DEBUG_ENABLED) {
+                        debug_stream() << log_indent(3)
+                                    << "stop: region too complex from "
+                                    << get_node_name(src) << " to " << get_node_name(sink)
+                                    << " at " << get_node_name(v) << "\n";
+                    }
                     hit_limits = true;
                     return out;
                 }
 
                 if (v == sink) {
                     reached_sink = true;
-                    debug_stream() << "[HIT-SINK] path:\n";
-                    for (auto x : path) debug_stream() << "  +node " << get_node_name(x) << "\n";
+                    if (DEBUG_ENABLED) {
+                        log_path(path, 3, "reached sink, full path:");
+                    }
                     break;
                 }
 
                 if ((fr.state == "end" || fr.depth_left == 0) && v != sink) {
                     legal_path = false;
+                    if (DEBUG_ENABLED) {
+                        debug_stream() << log_indent(3)
+                                    << "dead end at " << get_node_name(v)
+                                    << " before reaching sink\n";
+                    }
                     break;
                 }
 
                 if (fr.idx >= fr.cand_vs.size()) {
-                    debug_stream() << "[BACKTRACK] at " << get_node_name(v) << "\n";
+                    if (DEBUG_ENABLED) {
+                        debug_stream() << log_indent(4)
+                                    << "backtrack from " << get_node_name(v) << "\n";
+                    }
                     on_path.erase(v);
                     path.pop_back();
                     stk.pop_back();
@@ -1001,7 +1075,11 @@ private:
                 }
 
                 uint32_t w = fr.cand_vs[fr.idx++];
-                debug_stream() << "[TRY] " << get_node_name(v) << " -> " << get_node_name(w) << "\n";
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(4)
+                                << "try " << get_node_name(v)
+                                << " -> " << get_node_name(w) << "\n";
+                }
 
                 on_path.insert(w);
                 path.push_back(w);
@@ -1011,39 +1089,525 @@ private:
             }
 
             if (!legal_path || !reached_sink) {
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(3)
+                                << "path discarded, mark pivot/path nodes as covered\n";
+                }
                 covered.insert(pivot);
                 for (uint32_t v : path) {
                     covered.insert(v);
                 }
+                ++stall_rounds;
                 continue;
             }
 
-            // Record path
-            uint64_t hv = hash_vec_(path);
-            if (!seen_path.insert(hv).second) {
-                debug_stream() << "[DUP-PATH] already seen, but still update coverage.\n";
+            // Record path and update covered
+            bool is_new_path = false;
+            {
+                uint64_t hv = hash_vec_(path);
+                is_new_path = seen_path.insert(hv).second;
             }
 
-            debug_stream() << "[RECORD-PATH] idx=" << (out.size() + 1) << " len=" << path.size() << "\n";
-            out.push_back(path);
+            if (is_new_path) {
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(3)
+                                << "record unique path #" << (out.size() + 1)
+                                << "  len=" << path.size() << "\n";
+                }
+                out.push_back(path);
+                stall_rounds = 0;  // New paths found, reset to zero
+            } else {
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(3)
+                                << "duplicate path, skip record\n";
+                }
+                ++stall_rounds;
+            }
 
-            bool new_cover = false;
             for (uint32_t v : path) {
                 if (to_cover.find(v) != to_cover.end()) {
-                    if (covered.insert(v).second) {
-                        new_cover = true;
-                        debug_stream() << "  +cover " << get_node_name(v) << "\n";
-                    }
+                    covered.insert(v);
                 }
-            }
-
-            if (!new_cover) {
-                debug_stream() << "[NO-NEW-COVER] this path does not cover new nodes.\n";
             }
         }
 
-        debug_stream() << "[ENUM-DFS-END] total paths=" << out.size() << "\n";
-        debug_stream() << "=========================================\n";
+        if (DEBUG_ENABLED) {
+            debug_stream() << "\n";
+            debug_stream() << "  Enumeration finished\n";
+            debug_stream() << log_indent(2) << "total paths: " << out.size() << "\n";
+            debug_stream() << "=========================================\n";
+        }
+
+        return out;
+    }
+
+    /**
+     * @brief Enumerate representative paths between two vertices using greedy DFS.
+     *
+     * Strategy:
+     *   1. Start from @p src.
+     *   2. At each step, enumerate all valid outgoing neighbors.
+     *   3. Rank candidates using the following priority:
+     *        a. Prefer vertices not yet present in @p covered.
+     *        b. Prefer larger edge overlap (get_edge_ow()).
+     *        c. Prefer longer node sequence length.
+     *        d. Prefer smaller vertex ID for deterministic tie-breaking.
+     *   4. Choose the best candidate and continue until:
+     *        - @p sink is reached,
+     *        - maximum depth is reached,
+     *        - no valid successor exists,
+     *        - DFS_guard is exceeded.
+     *   5. Record the path if it is unique.
+     *   6. Mark all visited vertices as covered so subsequent rounds prefer unexplored branches.
+     *   7. Stop when:
+     *        - max_paths paths have been found,
+     *        - too many consecutive rounds produce no new path
+     *          (stall_round_limit),
+     *        - DFS_guard is exceeded.
+     *
+     * Special case:
+     *   - If @p src == @p sink, the function returns a single path containing only @p src.
+     *
+     * @param src                Source oriented vertex ID.
+     * @param sink               Sink oriented vertex ID.
+     * @param region_set         Optional set restricting allowed internal vertices. If empty, all vertices are allowed.
+     * @param max_depth          Maximum number of edges traversed in a single path.
+     * @param max_paths          Maximum number of unique paths to return. If 0, no explicit path-count limit is applied.
+     * @param skip_comp          If true, edges marked as composite (GfaArc::get_comp()) are ignored.
+     * @param hit_limits         Output flag set to true if DFS_guard is exceeded.
+     * @param DFS_guard          Maximum total number of DFS state expansions across all rounds.
+     * @param stall_round_limit  Maximum number of consecutive rounds that fail to produce a new unique path.
+     *
+     * @return A vector of unique paths from @p src to @p sink. Each path is represented as a vector of oriented vertex IDs.
+     */
+    std::vector<std::vector<uint32_t>> enumerate_paths_greedy_DFS_(
+        const uint32_t src,
+        const uint32_t sink,
+        const std::unordered_set<uint32_t>& region_set,
+        const uint32_t max_depth,
+        const uint32_t max_paths,
+        const bool skip_comp,
+        bool& hit_limits,
+        const uint64_t DFS_guard,
+        const uint32_t stall_round_limit = 2
+    ) const
+    {
+        // ------------------------------------------------ Initialization ------------------------------------------------
+        std::vector<std::vector<uint32_t>> out;
+        hit_limits = false;
+
+        // source and sink are the same.
+        if (src == sink) {
+            out.push_back({src});
+            return out;
+        }
+
+        const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
+        if (V == 0 || src >= V || sink >= V) return out;
+
+        // ------------------------------------------------ Topological window ------------------------------------------------
+        // Restrict the DFS walk to the topological interval between src and sink.
+        uint32_t src_rank = graph_.vertex_topo_rank(Vertex(src));
+        uint32_t sink_rank = graph_.vertex_topo_rank(Vertex(sink));
+
+        const bool use_topo_filter =
+            graph_.get_vertex_topological_index().size() >= V &&
+            src_rank != UINT32_MAX &&
+            sink_rank != UINT32_MAX;
+
+        if (src_rank > sink_rank) std::swap(src_rank, sink_rank);
+
+        auto in_topo_window = [&](uint32_t v) -> bool {
+            if (!use_topo_filter) return true;
+
+            const uint32_t r = graph_.vertex_topo_rank(Vertex(v));
+            return r != UINT32_MAX && r >= src_rank && r <= sink_rank;
+        };
+
+        // ------------------------------------------------ Helper functions ------------------------------------------------
+        auto valid_next = [&](uint32_t from, uint32_t w, const std::unordered_set<uint32_t>& on_path_seg ) -> bool {
+            if (w == from) return false;
+            if (!in_topo_window(w)) return false;
+
+            // If region_set is provided, internal vertices must stay inside it.
+            // The sink is always allowed.
+            if (!region_set.empty() && w != sink && region_set.find(w) == region_set.end()) {
+                return false;
+            }
+
+            // Segment-level cycle prevention.
+            const uint32_t w_seg = NodeHandle::get_segment_id(w);
+            if (on_path_seg.find(w_seg) != on_path_seg.end()) return false;
+
+            return true;
+        };
+
+        // Encode a directed edge as a 64-bit key.
+        auto edge_key = [](uint32_t a, uint32_t b) -> uint64_t {
+            return (uint64_t(a) << 32) | uint64_t(b);
+        };
+
+        auto log_indent = [&](int level) -> std::string {
+            return std::string(level * 2, ' ');
+        };
+
+        auto log_path = [&](const std::vector<uint32_t>& p, int level, const std::string& title) {
+            if (!DEBUG_ENABLED) return;
+
+            debug_stream() << log_indent(level) << title << "\n";
+            for (uint32_t x : p) {
+                debug_stream() << log_indent(level + 1) << get_node_name(x) << "\n";
+            }
+        };
+
+        // ------------------------------------------------ Debug header ------------------------------------------------
+        if (DEBUG_ENABLED) {
+            debug_stream() << "=========================================\n";
+            debug_stream() << "Enumerate greedy DFS paths\n";
+            debug_stream() << log_indent(1) << "src       : " << get_node_name(src) << "\n";
+            debug_stream() << log_indent(1) << "sink      : " << get_node_name(sink) << "\n";
+            debug_stream() << log_indent(1) << "max_depth : " << max_depth << "\n";
+            debug_stream() << log_indent(1) << "max_paths : " << max_paths << "\n";
+            debug_stream() << log_indent(1) << "DFS_guard : " << DFS_guard << "\n";
+            debug_stream() << log_indent(1) << "stall_lim : " << stall_round_limit << "\n";
+
+            if (use_topo_filter) {
+                debug_stream() << log_indent(1) << "topo_win  : " << src_rank << " .. " << sink_rank << "\n";
+            }
+
+            debug_stream() << log_indent(1) << "region_set size: " << region_set.size() << "\n";
+
+            if (!region_set.empty()) {
+                debug_stream() << log_indent(1) << "region_set:\n";
+                for (uint32_t v : region_set) {
+                    debug_stream() << log_indent(2) << get_node_name(v) << "\n";
+                }
+            }
+        }
+
+        // ------------------------------------------------ Global state across greedy rounds ------------------------------------------------
+        // Used to sort the candidates nodes at each step, to prefer those not yet covered by previous paths.
+        std::unordered_set<uint32_t> covered;
+        covered.reserve(region_set.size() + 8);
+        covered.insert(src);
+
+        // Deduplicate complete paths.
+        std::unordered_set<uint64_t> seen_path;
+        seen_path.reserve(64);
+
+        /**
+        * @brief Count how many times each directed edge was chosen.
+        * @date 2026-05-18
+        * @version 0.1.3-r2
+        * @note Used to prevent the greedy DFS from repeatedly choosing the same edge (used in sorting) and getting stuck in a local region.
+        */
+        std::unordered_map<uint64_t, uint32_t> edge_try_count;
+        edge_try_count.reserve(256);
+
+        uint64_t dfs_states = 0;
+        uint32_t stall_rounds = 0;
+        uint32_t round_id = 0;
+
+        // ------------------------------------------------ Greedy path enumeration ------------------------------------------------
+        // Each round performs one greedy walk from src to sink:
+        //   1. Start from src.
+        //   2. At each vertex, collect valid outgoing candidates.
+        //   3. Sort candidates by priority.
+        //   4. Choose the best candidate only.
+        //   5. If sink is reached, record the path.
+        while (true) {
+            if (DEBUG_ENABLED) {
+                debug_stream() << "\n";
+                debug_stream() << log_indent(1) << "round " << round_id << "\n";
+                debug_stream() << log_indent(2) << "path_count   : " << out.size() << "\n";
+                debug_stream() << log_indent(2) << "covered      : " << covered.size() << "\n";
+                debug_stream() << log_indent(2) << "stall_rounds : " << stall_rounds << "\n";
+                debug_stream() << log_indent(2) << "dfs_states   : " << dfs_states << "\n";
+            }
+
+            // Stop when enough paths have been collected.
+            if (max_paths > 0 && out.size() >= max_paths) {
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(2) << "stop: reach max_paths\n";
+                }
+                break;
+            }
+
+            // Stop after repeated rounds fail to produce new valid paths.
+            if (stall_rounds >= stall_round_limit) {
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(2) << "stop: reach stall_round_limit\n";
+                }
+                break;
+            }
+
+            ++round_id;
+
+            // Current greedy path.
+            std::vector<uint32_t> path;
+            path.reserve(max_depth + 1);
+            path.push_back(src);
+
+            // Segment-level nodes already used in the current path.
+            std::unordered_set<uint32_t> on_path_seg;
+            on_path_seg.reserve(max_depth + 1);
+            on_path_seg.insert(NodeHandle::get_segment_id(src));
+
+            uint32_t v = src;
+            uint32_t depth = 0;
+            bool reached_sink = false;
+
+            if (DEBUG_ENABLED) {
+                debug_stream() << log_indent(2) << "start greedy walk from " << get_node_name(src) << "\n";
+            }
+
+            // ------------------------------------------------ One greedy walk ------------------------------------------------
+            while (depth < max_depth) {
+                // Global guard to avoid complex local graph structures.
+                if (++dfs_states > DFS_guard) {
+                    if (DEBUG_ENABLED) {
+                        debug_stream() << log_indent(2) << "stop: exceed DFS_guard = " << DFS_guard << " at " << get_node_name(v) << "\n";
+                        log_path(path, 3, "current path:");
+                        debug_stream() << "=========================================\n";
+                    }
+
+                    hit_limits = true;
+                    return out;
+                }
+
+                if (v == sink) {
+                    reached_sink = true;
+
+                    if (DEBUG_ENABLED) {
+                        debug_stream() << log_indent(2) << "reached sink\n";
+                    }
+
+                    break;
+                }
+
+                // ------------------------------------------------ Candidate collection ------------------------------------------------
+                std::vector<uint32_t> cand;
+
+                const auto& arcs = graph_.getArcsFromVertex(v);
+                cand.reserve(arcs.size());
+
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(2) << "expand " << get_node_name(v) << "  depth=" << depth << "  out_arcs=" << arcs.size() << "\n";
+                }
+
+                for (const GfaArc* a : arcs) {
+                    if (!a) {
+                        if (DEBUG_ENABLED) {
+                            debug_stream() << log_indent(3) << "skip null arc\n";
+                        }
+                        continue;
+                    }
+
+                    if (a->get_del()) {
+                        if (DEBUG_ENABLED) {
+                            debug_stream() << log_indent(3) << "skip deleted arc\n";
+                        }
+                        continue;
+                    }
+
+                    if (skip_comp && a->get_comp()) {
+                        if (DEBUG_ENABLED) {
+                            debug_stream() << log_indent(3) << "skip comp arc\n";
+                        }
+                        continue;
+                    }
+
+                    const uint32_t w = a->get_target_vertex_id();
+
+                    if (!valid_next(v, w, on_path_seg)) {
+                        if (DEBUG_ENABLED) {
+                            debug_stream() << log_indent(3) << "skip " << get_node_name(v) << " -> " << get_node_name(w);
+
+                            if (w == v) {
+                                debug_stream() << "  reason=self-loop";
+                            } else if (!in_topo_window(w)) {
+                                debug_stream() << "  reason=outside-topo-window";
+                            } else if (!region_set.empty() && w != sink && region_set.find(w) == region_set.end()) {
+                                debug_stream() << "  reason=outside-region";
+                            } else if (on_path_seg.find(NodeHandle::get_segment_id(w)) != on_path_seg.end()) {
+                                debug_stream() << "  reason=cycle-on-path";
+                            }
+
+                            debug_stream() << "\n";
+                        }
+
+                        continue;
+                    }
+
+                    cand.push_back(w);
+
+                    if (DEBUG_ENABLED) {
+                        const uint64_t ek = edge_key(v, w);
+
+                        const auto it_try = edge_try_count.find(ek);
+                        const uint32_t tried = (it_try == edge_try_count.end()) ? 0u : it_try->second;
+
+                        debug_stream() << log_indent(3) << "candidate " << get_node_name(w) << "  len=" << graph_.getNodeLength(NodeHandle::get_segment_id(w)) << "  used=" << (covered.find(w) != covered.end() ? "yes" : "no") << "  edge_try=" << tried << "\n";
+                    }
+                }
+
+                if (cand.empty()) {
+                    if (DEBUG_ENABLED) {
+                        debug_stream() << log_indent(2) << "dead end at " << get_node_name(v) << ", no valid candidate\n";
+                    }
+
+                    break;
+                }
+
+                // ------------------------------------------------ Candidate selection ------------------------------------------------
+                // Candidate priority:
+                //   1. Edges used fewer times in previous greedy rounds.
+                //   2. Vertices not covered by previous paths.
+                //   3. Larger overlap weight.
+                //   4. Longer node length.
+                //   5. Smaller vertex ID as deterministic tie-breaker.
+                uint32_t best = UINT32_MAX;
+
+                if (cand.size() == 1) {
+                    best = cand.front();
+
+                    if (DEBUG_ENABLED) {
+                        debug_stream() << log_indent(2) << "choose only candidate: " << get_node_name(best) << "\n";
+                    }
+                } else {
+                    std::sort(cand.begin(), cand.end(),
+                        [&](uint32_t a, uint32_t b) {
+                            const uint64_t eka = edge_key(v, a);
+                            const uint64_t ekb = edge_key(v, b);
+
+                            const auto ita = edge_try_count.find(eka);
+                            const auto itb = edge_try_count.find(ekb);
+
+                            const uint32_t ta = (ita == edge_try_count.end()) ? 0u : ita->second;
+                            const uint32_t tb = (itb == edge_try_count.end()) ? 0u : itb->second;
+
+                            if (ta != tb) return ta < tb;
+
+                            const bool a_unused = covered.find(a) == covered.end();
+                            const bool b_unused = covered.find(b) == covered.end();
+
+                            if (a_unused != b_unused) return a_unused > b_unused;
+
+                            const uint32_t oa = graph_.get_edge_ow(v, a);
+                            const uint32_t ob = graph_.get_edge_ow(v, b);
+
+                            if (oa != ob) return oa > ob;
+
+                            const uint32_t la = graph_.getNodeLength(NodeHandle::get_segment_id(a));
+                            const uint32_t lb = graph_.getNodeLength(NodeHandle::get_segment_id(b));
+
+                            if (la != lb) return la > lb;
+
+                            return a < b;
+                        }
+                    );
+
+                    best = cand.front();
+
+                    if (DEBUG_ENABLED) {
+                        debug_stream() << log_indent(2) << "sorted candidates:\n";
+
+                        for (uint32_t x : cand) {
+                            const uint64_t ek = edge_key(v, x);
+
+                            const auto it_try = edge_try_count.find(ek);
+                            const uint32_t tried = (it_try == edge_try_count.end()) ? 0u : it_try->second;
+
+                            debug_stream() << log_indent(3) << get_node_name(x) << "  len=" << graph_.getNodeLength(NodeHandle::get_segment_id(x)) << "  used=" << (covered.find(x) != covered.end() ? "yes" : "no") << "  edge_try=" << tried << "\n";
+                        }
+
+                        debug_stream() << log_indent(2) << "choose best candidate: " << get_node_name(best) << "\n";
+                    }
+                }
+
+                if (best == UINT32_MAX) {
+                    if (DEBUG_ENABLED) {
+                        debug_stream() << log_indent(2) << "no best candidate, break\n";
+                    }
+
+                    break;
+                }
+
+                // Mark the selected directed edge as tried.
+                ++edge_try_count[edge_key(v, best)];
+
+                // Extend the current path.
+                path.push_back(best);
+                on_path_seg.insert(NodeHandle::get_segment_id(best));
+
+                v = best;
+                ++depth;
+            }
+
+            if (v == sink) reached_sink = true;
+
+            // ------------------------------------------------ Handle failed path ------------------------------------------------
+            // If this greedy walk did not reach sink, the partial path is discarded, but its vertices are still marked as covered.
+            if (!reached_sink) {
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(2) << "path discarded, did not reach sink\n";
+                    log_path(path, 3, "discarded path:");
+                    debug_stream() << log_indent(2) << "mark path nodes as covered\n";
+                }
+
+                for (uint32_t x : path) {
+                    covered.insert(x);
+                }
+
+                ++stall_rounds;
+
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(2) << "stall_rounds -> " << stall_rounds << "\n";
+                }
+
+                continue;
+            }
+
+            // ------------------------------------------------ Deduplicate complete path ------------------------------------------------
+            // Only exactly identical vertex sequences are considered duplicates.
+            bool is_new_path = false;
+            {
+                const uint64_t hv = hash_vec_(path);
+                is_new_path = seen_path.insert(hv).second;
+            }
+
+            for (uint32_t x : path) {
+                covered.insert(x);
+            }
+
+            if (is_new_path) {
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(2) << "record unique path #" << (out.size() + 1) << "  len=" << path.size() << "\n";
+                    log_path(path, 3, "full path:");
+                }
+
+                out.push_back(path);
+                stall_rounds = 0;
+            } else {
+                if (DEBUG_ENABLED) {
+                    debug_stream() << log_indent(2) << "duplicate path, skip record\n";
+                    log_path(path, 3, "duplicate path:");
+                }
+
+                ++stall_rounds;
+            }
+        }
+
+        // ------------------------------------------------ Summary ------------------------------------------------
+        if (DEBUG_ENABLED) {
+            debug_stream() << "\n";
+            debug_stream() << "  Greedy enumeration finished\n";
+            debug_stream() << log_indent(2) << "total paths : " << out.size() << "\n";
+            debug_stream() << log_indent(2) << "covered     : " << covered.size() << "\n";
+            debug_stream() << log_indent(2) << "dfs_states  : " << dfs_states << "\n";
+            debug_stream() << log_indent(2) << "rounds      : " << round_id << "\n";
+            debug_stream() << "=========================================\n";
+        }
 
         return out;
     }

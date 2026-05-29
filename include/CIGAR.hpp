@@ -87,4 +87,13 @@ uint32_t total_block_bases(const std::vector<std::pair<uint32_t,uint32_t>>& bloc
 bool query_interval_fwd(std::string_view cigar, bool is_rev, uint32_t& qb, uint32_t& qe);
 bool query_interval_fwd(const uint32_t* cigar, uint32_t n, bool is_rev, uint32_t& qb, uint32_t& qe);
 
+/**
+ * @brief Match ratio from CIGAR string.
+ * Count matches as M/=.
+ * Count denominator as M/=/X/I/D.
+ * Ignore S/H/N/P.
+ */
+double match_ratio(std::string_view cigar);
+double match_ratio(const uint32_t* cigar, uint32_t n);
+
 } // namespace CIGAR

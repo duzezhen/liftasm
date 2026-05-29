@@ -5,12 +5,18 @@ namespace seqUtils {
 
 static std::array<unsigned char,256> make_rc_table() {
     std::array<unsigned char,256> t{};
-    for (int i = 0; i < 256; ++i) t[i] = static_cast<unsigned char>(i);
-    t['A']='T'; t['T']='A';
-    t['C']='G'; t['G']='C';
-    t['a']='t'; t['t']='a';
-    t['c']='g'; t['g']='c';
-    t['N']='N'; t['n']='n';
+
+    for (int i = 0; i < 256; ++i)
+        t[i] = 'N';
+
+    t['A'] = 'T'; t['T'] = 'A';
+    t['C'] = 'G'; t['G'] = 'C';
+    t['N'] = 'N';
+
+    t['a'] = 'T'; t['t'] = 'A';
+    t['c'] = 'G'; t['g'] = 'C';
+    t['n'] = 'N';
+
     return t;
 }
 

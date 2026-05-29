@@ -7,7 +7,53 @@
 
 #include "gfa_parser_AUX.hpp"
 
-// NodeHandle: (segment_id, is_reverse)
+
+// Vertex layout (uint32_t):
+//   [ segment_id (31 bits) | rev (1 bit) ]
+//
+// rev:
+//   0 -> forward
+//   1 -> reverse
+struct Vertex {
+protected:
+    uint32_t vtx_id_{0};
+
+public:
+    Vertex() = default;
+    explicit Vertex(uint32_t vtx_id) : vtx_id_(vtx_id) {}
+    explicit Vertex(uint32_t segment_id, bool is_reverse) : vtx_id_(make_vertex(segment_id, is_reverse)) {}
+    
+    static uint32_t make_vertex( uint32_t segment_id, bool is_reverse) {return (segment_id << 1) | (is_reverse ? 1u : 0u); }
+
+    bool set_vertex_id(uint32_t vtx_id) { vtx_id_ = vtx_id; return true; }
+    bool set_vertex_id(uint32_t segment_id, bool is_reverse) { vtx_id_ = make_vertex(segment_id, is_reverse); return true; }
+    uint32_t vertex_id() const { return vtx_id_; }
+
+    uint32_t segment_id() const { return vtx_id_ >> 1; }
+    bool is_reverse() const { return vtx_id_ & 1u; }
+    static uint32_t get_segment_id(uint32_t vtx_id) { return vtx_id >> 1; }
+    static bool get_is_reverse(uint32_t vtx_id) { return vtx_id & 1u; }
+
+    void reverse() { vtx_id_ ^= 1u; return; }
+    static Vertex get_reverse(Vertex vtx) { return Vertex(vtx.vertex_id() ^ 1u); }
+
+    bool operator==(const Vertex& o) const { return vtx_id_ == o.vertex_id(); }
+    bool operator!=(const Vertex& o) const { return vtx_id_ != o.vertex_id(); }
+    bool operator<(const Vertex& o)  const { return vtx_id_ < o.vertex_id(); }
+    bool operator<=(const Vertex& o) const { return vtx_id_ <= o.vertex_id(); }
+    bool operator>(const Vertex& o)  const { return vtx_id_ > o.vertex_id(); }
+    bool operator>=(const Vertex& o) const { return vtx_id_ >= o.vertex_id(); }
+};
+
+namespace std {
+template <>
+struct hash<Vertex> {
+    size_t operator()(const Vertex& v) const noexcept {
+        return static_cast<size_t>(v.vertex_id());
+    }
+};
+}
+
 struct NodeHandle {
     uint64_t id{0};
     bool is_reverse{false};
@@ -104,4 +150,11 @@ struct ExpandedSeqs {
     std::vector<std::string> names = {};
     std::vector<std::string_view> seqs = {};
     std::vector<std::vector<std::string>> right_seqs = {};    // k-1 bases expanded from the right
+};
+
+struct GfaTopoIndex {
+    uint32_t scc_id{UINT32_MAX};     // ID of the strongly connected component (SCC) this vertex belongs to
+    uint32_t topo_rank{UINT32_MAX};  // Topological order of the SCC in the condensed DAG (smaller = earlier)
+    uint32_t scc_size{0};            // Number of vertices in this SCC
+    bool in_cycle{false};            // True if the vertex is in a cycle (i.e., scc_size > 1)
 };

@@ -19,6 +19,8 @@
 #include "../include/progress_tracker.hpp"
 #include "../include/ThreadPool.hpp"
 
+KSEQ_INIT(gzFile, gzread)
+
 namespace liftover {
 
 namespace detail {
@@ -68,26 +70,11 @@ namespace detail {
         s.push_back(h.rev ? '-' : '+');
         return s;
     }
-
-    static inline char comp_base(char b) {
-        switch (b) {
-            case 'A': return 'T'; case 'C': return 'G'; case 'G': return 'C'; case 'T': return 'A';
-            case 'R': return 'Y'; case 'Y': return 'R'; case 'S': return 'S'; case 'W': return 'W';
-            case 'K': return 'M'; case 'M': return 'K'; case 'B': return 'V'; case 'D': return 'H';
-            case 'H': return 'D'; case 'V': return 'B';
-            default:  return b;
-        }
-    }
-
-    void rc_inplace(std::string& s) {
-        std::reverse(s.begin(), s.end());
-        for (char& c : s) c = comp_base((char)std::toupper((unsigned char)c));
-    }
 } // namespace detail
 
 
 RunOpts set_opts(
-    std::string map_file, std::string bed_file, std::string ref_file, std::string out_file, 
+    std::vector<std::string> map_files, std::string bed_file, std::string ref_file, std::string out_file, 
     std::string regex, double min_frac, 
     uint32_t flank_win, uint32_t max_flank, uint32_t max_gap, uint16_t max_hit,
     std::string paf_file, uint32_t min_mapq, uint32_t min_len,
@@ -96,7 +83,7 @@ RunOpts set_opts(
     int threads
 ) {
     RunOpts o;
-    o.map_file          = map_file;
+    o.map_files         = map_files;
     o.bed_file          = bed_file;
     o.ref_file          = ref_file;
     o.out_file          = out_file;
@@ -123,7 +110,7 @@ RunOpts set_opts(
 
     o.threads           = threads;
 
-    if (o.map_file.empty()) { error_stream() << "--map is required"; std::exit(1); }
+    if (o.map_files.empty()) { error_stream() << "--map is required"; std::exit(1); }
     if (o.do_check) {
         if (o.ref_file.empty()) { error_stream() << "--check requires --ref"; std::exit(1); }
     } else {
@@ -133,152 +120,157 @@ RunOpts set_opts(
     return o;
 }
 
-int file_reader(
-    const RunOpts& opt, 
-    std::unordered_map<std::string, std::vector<BEDinfo>>& beds, 
-    coordmap::CoordMap& M, 
-    std::unordered_map<std::string, std::vector<Pafinfo>>& pafs,
-    std::unordered_map<std::string, std::vector<uint32_t>>& paf_ends,
-    std::unordered_map<std::string, std::vector<uint32_t>>& paf_idx_ends
+int bed_reader(
+    const std::string& bed_file, 
+    std::unordered_map<std::string, std::vector<BEDinfo>>& beds
 ) {
-    // BED load
-    {
-        kio::LineReader lr(opt.bed_file);
-        std::string line;
-        while (lr.getline(line)) {
-            std::string_view chrom, s0, s1, rest;
-            if (!detail::split3_bed(line, chrom, s0, s1, rest)) continue;
+    kio::LineReader lr(bed_file);
+    std::string line;
+    while (lr.getline(line)) {
+        std::string_view chrom, s0, s1, rest;
+        if (!detail::split3_bed(line, chrom, s0, s1, rest)) continue;
 
-            uint32_t b=0, e=0;
-            if (!detail::parse_u32(s0, b) || !detail::parse_u32(s1, e)) continue;
-            if (b > e) std::swap(b, e);
-            if (b == e) continue;
+        uint32_t b=0, e=0;
+        if (!detail::parse_u32(s0, b) || !detail::parse_u32(s1, e)) continue;
+        if (b > e) std::swap(b, e);
+        if (b == e) continue;
 
-            beds[std::string(chrom)].push_back(BEDinfo{b, e, std::string{rest}});
-        }
-
-        // Sort
-        for (auto& kv : beds) {
-            auto& v = kv.second;
-            std::sort(v.begin(), v.end(), [](const BEDinfo& a, const BEDinfo& b){
-                if (a.beg != b.beg) return a.beg < b.beg;
-                return a.end < b.end;
-            });
-        }
+        beds[std::string(chrom)].push_back(BEDinfo{b, e, std::string{rest}});
     }
 
-    // MAP load
-    {
-        M.load(opt.map_file);
-        log_stream() << "Loaded records: " << M.num_records() << "\n";
-    }
-
-    // PAF load
-    {
-        auto cigar_check = [](const std::string& cg) ->bool {
-            uint64_t num = 0;
-            for (char c : cg) {
-                if (c >= '0' && c <= '9') { num = num*10 + (uint64_t)(c - '0'); continue; }
-                if (num == 0) continue;
-                if (c!='M' && c!='I' && c!='D' && c!='=' && c!='X') return false;
-                num = 0;
-            }
-            return true;
-        };
-
-        if (!opt.paf_file.empty()) {
-            paf::Reader pr(opt.paf_file);
-            paf::Record r;
-            while (pr.next(r)) {
-                if (r.mapq < opt.min_mapq || r.alen < opt.min_len) continue;
-                if (r.strand != '+' && r.strand != '-') continue;
-                if (r.tname == r.qname) {
-                    error_stream() << "PAF record with identical query and target: " << r.qname << std::endl;
-                    std::exit(1);
-                }
-
-                char tp_type=0; std::string_view tp_val;
-                char cg_type=0; std::string_view cg_val;
-                if (!paf::find_tag(r, "tp", tp_type, tp_val) || tp_type!='A' || tp_val.empty()) continue;
-                if (!paf::find_tag(r, "cg", cg_type, cg_val) || cg_type!='Z' || cg_val.empty()) continue;
-
-                const char tp = tp_val[0];
-                if (!(tp=='P' || tp=='I')) continue;
-
-                Pafinfo a;
-                a.qlen   = r.qlen;
-                a.qstart = r.qstart;
-                a.qend   = r.qend;
-                a.strand = r.strand;
-                a.tname  = r.tname;
-                a.tlen   = r.tlen;
-                a.tstart = r.tstart;
-                a.tend   = r.tend;
-                a.nmatch = r.nmatch;
-                a.alen   = r.alen;
-                a.mapq   = r.mapq;
-                a.tp     = tp;
-                a.cg.assign(cg_val);
-                if (!cigar_check(a.cg)) {
-                    error_stream() << "Invalid CIGAR string in PAF record: " << a.cg << std::endl;
-                    error_stream() << "Only M/I/D/=/X operations are allowed." << std::endl;
-                    std::exit(1);
-                }
-                pafs[r.qname].push_back(std::move(a));
-
-                // Swap ref and qry
-                Pafinfo b;
-                b.qlen   = r.tlen;
-                b.qstart = r.tstart;
-                b.qend   = r.tend;
-                b.strand = r.strand;
-                b.tname  = r.qname;
-                b.tlen   = r.qlen;
-                b.tstart = r.qstart;
-                b.tend   = r.qend;
-                b.nmatch = r.nmatch;
-                b.alen   = r.alen;
-                b.mapq   = r.mapq;
-                b.tp     = tp;
-                b.cg     = paf::cigar_swap(cg_val);
-                pafs[r.tname].push_back(std::move(b));
-            }
-        }
-
-        // Sort PAFs by query positions and build end-indexes
-        paf_ends.reserve(pafs.size()); paf_idx_ends.reserve(pafs.size());
-
-        for (auto& kv : pafs) {
-            const std::string& qname = kv.first;
-            auto& v = kv.second;
-            if (v.empty()) continue;
-
-            std::sort(v.begin(), v.end(), [](const Pafinfo& a, const Pafinfo& b){
-                if (a.qstart != b.qstart) return a.qstart < b.qstart;
-                if (a.qend   != b.qend)   return a.qend   < b.qend;
-                return a.mapq > b.mapq;
-            });
-
-            auto& ends = paf_ends[qname];
-            ends.resize(v.size());
-            for (size_t i = 0; i < v.size(); ++i) ends[i] = v[i].qend;
-
-            auto& idx = paf_idx_ends[qname];
-            idx.resize(v.size());
-            for (uint32_t i = 0; i < (uint32_t)v.size(); ++i) idx[i] = i;
-
-            std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b){
-                if (ends[a] != ends[b]) return ends[a] < ends[b];
-                if (v[a].qstart != v[b].qstart) return v[a].qstart < v[b].qstart;
-                return v[a].mapq > v[b].mapq;
-            });
-        }
+    // Sort
+    for (auto& kv : beds) {
+        auto& v = kv.second;
+        std::sort(v.begin(), v.end(), [](const BEDinfo& a, const BEDinfo& b){
+            if (a.beg != b.beg) return a.beg < b.beg;
+            return a.end < b.end;
+        });
     }
 
     return 0;
 }
 
-std::vector<std::string> liftover(const RunOpts& opt) {
+int map_reader(
+    const std::vector<std::string>& map_files,
+    coordmap::CoordMap& M
+) {
+    M.load(map_files);
+    return 0;
+}
+
+int paf_reader(
+    const std::string paf_file, 
+    const uint32_t min_mapq, 
+    const uint32_t min_len, 
+    std::unordered_map<std::string, std::vector<Pafinfo>>& pafs,
+    std::unordered_map<std::string, std::vector<uint32_t>>& paf_ends,
+    std::unordered_map<std::string, std::vector<uint32_t>>& paf_idx_ends
+) {
+    // PAF load
+    auto cigar_check = [](const std::string& cg) ->bool {
+        uint64_t num = 0;
+        for (char c : cg) {
+            if (c >= '0' && c <= '9') { num = num*10 + (uint64_t)(c - '0'); continue; }
+            if (num == 0) continue;
+            if (c!='M' && c!='I' && c!='D' && c!='=' && c!='X') return false;
+            num = 0;
+        }
+        return true;
+    };
+
+    if (!paf_file.empty()) {
+        paf::Reader pr(paf_file);
+        paf::Record r;
+        while (pr.next(r)) {
+            if (r.mapq < min_mapq || r.alen < min_len) continue;
+            if (r.strand != '+' && r.strand != '-') continue;
+            if (r.tname == r.qname) {
+                error_stream() << "PAF record with identical query and target: " << r.qname << std::endl;
+                std::exit(1);
+            }
+
+            char tp_type=0; std::string_view tp_val;
+            char cg_type=0; std::string_view cg_val;
+            if (!paf::find_tag(r, "tp", tp_type, tp_val) || tp_type!='A' || tp_val.empty()) continue;
+            if (!paf::find_tag(r, "cg", cg_type, cg_val) || cg_type!='Z' || cg_val.empty()) continue;
+
+            const char tp = tp_val[0];
+            if (!(tp=='P' || tp=='I')) continue;
+
+            Pafinfo a;
+            a.qlen   = r.qlen;
+            a.qstart = r.qstart;
+            a.qend   = r.qend;
+            a.strand = r.strand;
+            a.tname  = r.tname;
+            a.tlen   = r.tlen;
+            a.tstart = r.tstart;
+            a.tend   = r.tend;
+            a.nmatch = r.nmatch;
+            a.alen   = r.alen;
+            a.mapq   = r.mapq;
+            a.tp     = tp;
+            a.cg.assign(cg_val);
+            if (!cigar_check(a.cg)) {
+                error_stream() << "Invalid CIGAR string in PAF record: " << a.cg << std::endl;
+                error_stream() << "Only M/I/D/=/X operations are allowed." << std::endl;
+                std::exit(1);
+            }
+            pafs[r.qname].push_back(std::move(a));
+
+            // Swap ref and qry
+            Pafinfo b;
+            b.qlen   = r.tlen;
+            b.qstart = r.tstart;
+            b.qend   = r.tend;
+            b.strand = r.strand;
+            b.tname  = r.qname;
+            b.tlen   = r.qlen;
+            b.tstart = r.qstart;
+            b.tend   = r.qend;
+            b.nmatch = r.nmatch;
+            b.alen   = r.alen;
+            b.mapq   = r.mapq;
+            b.tp     = tp;
+            b.cg     = paf::cigar_swap(cg_val);
+            pafs[r.tname].push_back(std::move(b));
+        }
+    }
+
+    // Sort PAFs by query positions and build end-indexes
+    paf_ends.reserve(pafs.size()); paf_idx_ends.reserve(pafs.size());
+
+    for (auto& kv : pafs) {
+        const std::string& qname = kv.first;
+        auto& v = kv.second;
+        if (v.empty()) continue;
+
+        std::sort(v.begin(), v.end(), [](const Pafinfo& a, const Pafinfo& b){
+            if (a.qstart != b.qstart) return a.qstart < b.qstart;
+            if (a.qend   != b.qend)   return a.qend   < b.qend;
+            return a.mapq > b.mapq;
+        });
+
+        auto& ends = paf_ends[qname];
+        ends.resize(v.size());
+        for (size_t i = 0; i < v.size(); ++i) ends[i] = v[i].qend;
+
+        auto& idx = paf_idx_ends[qname];
+        idx.resize(v.size());
+        for (uint32_t i = 0; i < (uint32_t)v.size(); ++i) idx[i] = i;
+
+        std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b){
+            if (ends[a] != ends[b]) return ends[a] < ends[b];
+            if (v[a].qstart != v[b].qstart) return v[a].qstart < v[b].qstart;
+            return v[a].mapq > v[b].mapq;
+        });
+    }
+
+    return 0;
+}
+
+std::vector<std::string> liftover(const RunOpts& opt)
+{
     std::vector<std::string> blocks;
 
     std::unordered_map<std::string, std::vector<BEDinfo>> beds;
@@ -287,7 +279,12 @@ std::vector<std::string> liftover(const RunOpts& opt) {
     std::unordered_map<std::string, std::vector<uint32_t>> paf_ends;
     std::unordered_map<std::string, std::vector<uint32_t>> paf_idx_ends;
 
-    file_reader(opt, beds, M, pafs, paf_ends, paf_idx_ends);
+    // file_reader(opt, beds, M, pafs, paf_ends, paf_idx_ends);
+    bed_reader(opt.bed_file, beds);
+    map_reader(opt.map_files, M);
+    paf_reader(opt.paf_file, opt.min_mapq, opt.min_len, pafs, paf_ends, paf_idx_ends);
+
+    log_stream() << "Liftover BED intervals ..." << "\n";
 
     // Check mode
     if (opt.do_check) {
@@ -354,8 +351,8 @@ std::vector<std::string> liftover(const RunOpts& opt) {
     }
 
     // Collect
-    blocks.reserve(futs.size());
     ProgressTracker prog(futs.size());
+    blocks.reserve(futs.size());
     for (auto& f : futs) {
         prog.hit();
         blocks.emplace_back(f.get());
@@ -363,8 +360,124 @@ std::vector<std::string> liftover(const RunOpts& opt) {
 
     pool.stop();
 
+    log_stream() << "  - Generated " << blocks.size() << " liftover blocks" << "\n" << "\n";
+
     return blocks;
 }
+
+// std::vector<LIFTresult> paf_liftover(
+//     const std::unordered_map<std::string, std::vector<Pafinfo>>& pafs,
+//     const std::unordered_map<std::string, std::vector<uint32_t>>& paf_ends,
+//     const std::unordered_map<std::string, std::vector<uint32_t>>& paf_idx_ends,
+//     std::string qname, uint32_t qbeg, uint32_t qend
+// ) {
+//     auto find_ovlp_paf = [&](std::vector<const Pafinfo*>& out) ->bool {
+//         out.clear();
+//         auto it = pafs.find(qname);
+//         if (it == pafs.end() || it->second.empty()) return false;
+
+//         const auto& v    = it->second;
+//         const auto& ends = paf_ends.at(qname);
+//         const auto& idxE = paf_idx_ends.at(qname);
+
+//         size_t lo = 0, hi = idxE.size();
+//         while (lo < hi) {
+//             size_t mid = (lo + hi) >> 1;
+//             uint32_t id = idxE[mid];
+//             if (ends[id] <= qbeg) lo = mid + 1;
+//             else hi = mid;
+//         }
+
+//         for (size_t k = lo; k < idxE.size(); ++k) {
+//             uint32_t id = idxE[k];
+//             const auto& a = v[id];
+//             if (a.qstart < qend) out.push_back(&a);
+//         }
+//         if (out.empty()) return false;
+
+//         return true;
+//     };
+
+//     auto lift_by_cg = [](const Pafinfo& a, uint32_t qpos) ->int64_t {
+//         uint32_t qpos_oriented = qpos;
+//         if (a.strand == '-') {
+//             if (qpos >= a.qlen) return -1;
+//             qpos_oriented = a.qlen - qpos - 1;
+//         }
+        
+//         // Start positions in oriented query coordinate
+//         uint32_t y = (a.strand == '+') ? a.qstart : (a.qlen - a.qend);
+//         uint32_t x = a.tstart;
+
+//         const uint32_t y_end = (a.strand == '+') ? a.qend : (a.qlen - a.qstart);
+//         if (qpos_oriented < y || qpos_oriented >= y_end) return -1;
+
+//         uint64_t num = 0;
+//         for (size_t i = 0; i < a.cg.size(); ++i) {
+//             char op = a.cg[i];
+//             if (op >= '0' && op <= '9') { num = num * 10 + (uint64_t)(op - '0'); continue; }
+//             if (num == 0) continue;
+
+//             const uint32_t len = (uint32_t)num;
+
+//             if (op == 'D') {
+//                 x += len;
+//             } else if (op == 'I') {
+//                 if (qpos_oriented >= y && qpos_oriented < y + len) return (int64_t)x;
+//                 y += len;
+//             } else {
+//                 if (qpos_oriented >= y && qpos_oriented < y + len) {
+//                     return (int64_t)x + (int64_t)(qpos_oriented - y);
+//                 }
+//                 y += len;
+//                 x += len;
+//             }
+
+//             num = 0;
+//         }
+//         return -1;
+//     };
+
+//     std::vector<LIFTresult> results;
+
+//     std::vector<const Pafinfo*> hits;
+//     hits.reserve(16);
+
+//     if (pafs.find(qname) == pafs.end()) return results;
+
+//     if (qbeg >= qend) return results;
+
+//     if (!find_ovlp_paf(hits)) return results;
+
+//     for (const Pafinfo* a : hits) {
+//         if (qbeg >= qend || qend == 0) return results;
+
+//         uint32_t q0 = a->strand == '+' ? qbeg : qend - 1;
+//         uint32_t q1 = a->strand == '+' ? (qend - 1) : qbeg;
+
+//         int64_t tb0 = lift_by_cg(*a, q0);
+//         int64_t tb1 = lift_by_cg(*a, q1);
+
+//         std::string suffix;
+//         if (tb0 < 0) { suffix += "_t5"; tb0 = (int64_t)a->tstart; }
+//         if (tb1 < 0) { suffix += "_t3"; tb1 = (int64_t)a->tend - 1; }
+
+//         int64_t tb = tb0;
+//         int64_t te = tb1 + 1;
+
+//         if (tb < 0 || te < 0 || te <= tb) continue;
+
+//         if ((uint64_t)tb > (uint64_t)a->tlen) tb = (int64_t)a->tlen;
+//         if ((uint64_t)te > (uint64_t)a->tlen) te = (int64_t)a->tlen;
+//         std::string rest = qname + "_" + std::to_string(qbeg) + "_" + std::to_string(qend);
+//         rest += suffix;
+//         rest += "\t" + std::string(a->strand == '+' ? "+" : "-");
+
+//         results.emplace_back(a->tname, tb, te, qbeg, qend, a->strand, rest);
+//     }
+
+//     return results;
+// }
 
 std::vector<LIFTresult> paf_liftover(
     const std::unordered_map<std::string, std::vector<Pafinfo>>& pafs,
@@ -372,8 +485,9 @@ std::vector<LIFTresult> paf_liftover(
     const std::unordered_map<std::string, std::vector<uint32_t>>& paf_idx_ends,
     std::string qname, uint32_t qbeg, uint32_t qend
 ) {
-    auto find_ovlp_paf = [&](std::vector<const Pafinfo*>& out) ->bool {
+    auto find_ovlp_paf = [&](std::vector<const Pafinfo*>& out) -> bool {
         out.clear();
+
         auto it = pafs.find(qname);
         if (it == pafs.end() || it->second.empty()) return false;
 
@@ -394,18 +508,19 @@ std::vector<LIFTresult> paf_liftover(
             const auto& a = v[id];
             if (a.qstart < qend) out.push_back(&a);
         }
-        if (out.empty()) return false;
 
-        return true;
+        return !out.empty();
     };
 
-    auto lift_by_cg = [](const Pafinfo& a, uint32_t qpos) ->int64_t {
+    auto lift_by_cg = [](const Pafinfo& a, uint32_t qpos, uint32_t& mapped_qpos) -> int64_t {
+        mapped_qpos = qpos;
+
         uint32_t qpos_oriented = qpos;
         if (a.strand == '-') {
             if (qpos >= a.qlen) return -1;
             qpos_oriented = a.qlen - qpos - 1;
         }
-        
+
         // Start positions in oriented query coordinate
         uint32_t y = (a.strand == '+') ? a.qstart : (a.qlen - a.qend);
         uint32_t x = a.tstart;
@@ -416,19 +531,25 @@ std::vector<LIFTresult> paf_liftover(
         uint64_t num = 0;
         for (size_t i = 0; i < a.cg.size(); ++i) {
             char op = a.cg[i];
-            if (op >= '0' && op <= '9') { num = num * 10 + (uint64_t)(op - '0'); continue; }
+
+            if (op >= '0' && op <= '9') {
+                num = num * 10 + static_cast<uint64_t>(op - '0');
+                continue;
+            }
             if (num == 0) continue;
 
-            const uint32_t len = (uint32_t)num;
+            const uint32_t len = static_cast<uint32_t>(num);
 
             if (op == 'D') {
                 x += len;
             } else if (op == 'I') {
-                if (qpos_oriented >= y && qpos_oriented < y + len) return (int64_t)x;
+                if (qpos_oriented >= y && qpos_oriented < y + len) {
+                    return static_cast<int64_t>(x);
+                }
                 y += len;
             } else {
                 if (qpos_oriented >= y && qpos_oriented < y + len) {
-                    return (int64_t)x + (int64_t)(qpos_oriented - y);
+                    return static_cast<int64_t>(x) + static_cast<int64_t>(qpos_oriented - y);
                 }
                 y += len;
                 x += len;
@@ -436,6 +557,7 @@ std::vector<LIFTresult> paf_liftover(
 
             num = 0;
         }
+
         return -1;
     };
 
@@ -445,36 +567,64 @@ std::vector<LIFTresult> paf_liftover(
     hits.reserve(16);
 
     if (pafs.find(qname) == pafs.end()) return results;
-
     if (qbeg >= qend) return results;
-
     if (!find_ovlp_paf(hits)) return results;
 
     for (const Pafinfo* a : hits) {
         if (qbeg >= qend || qend == 0) return results;
 
-        uint32_t q0 = a->strand == '+' ? qbeg : qend - 1;
-        uint32_t q1 = a->strand == '+' ? (qend - 1) : qbeg;
+        const uint32_t q0 = (a->strand == '+') ? qbeg       : qend - 1;
+        const uint32_t q1 = (a->strand == '+') ? qend - 1   : qbeg;
 
-        int64_t tb0 = lift_by_cg(*a, q0);
-        int64_t tb1 = lift_by_cg(*a, q1);
+        uint32_t mq0 = q0;
+        uint32_t mq1 = q1;
+
+        int64_t tb0 = lift_by_cg(*a, q0, mq0);
+        int64_t tb1 = lift_by_cg(*a, q1, mq1);
 
         std::string suffix;
-        if (tb0 < 0) { suffix += "_t5"; tb0 = (int64_t)a->tstart; }
-        if (tb1 < 0) { suffix += "_t3"; tb1 = (int64_t)a->tend - 1; }
 
-        int64_t tb = tb0;
-        int64_t te = tb1 + 1;
+        if (tb0 < 0) {
+            suffix += "_t5";
+            tb0 = static_cast<int64_t>(a->tstart);
+            mq0 = q0;
+        }
+
+        if (tb1 < 0) {
+            suffix += "_t3";
+            tb1 = static_cast<int64_t>(a->tend) - 1;
+            mq1 = q1;
+        }
+
+        int64_t tb = std::min(tb0, tb1);
+        int64_t te = std::max(tb0, tb1) + 1;
+
+        uint32_t real_qbeg = std::min(mq0, mq1);
+        uint32_t real_qend = std::max(mq0, mq1) + 1;
 
         if (tb < 0 || te < 0 || te <= tb) continue;
 
-        if ((uint64_t)tb > (uint64_t)a->tlen) tb = (int64_t)a->tlen;
-        if ((uint64_t)te > (uint64_t)a->tlen) te = (int64_t)a->tlen;
-        std::string rest = qname + "_" + std::to_string(qbeg) + "_" + std::to_string(qend);
+        if (static_cast<uint64_t>(tb) > static_cast<uint64_t>(a->tlen)) {
+            tb = static_cast<int64_t>(a->tlen);
+        }
+        if (static_cast<uint64_t>(te) > static_cast<uint64_t>(a->tlen)) {
+            te = static_cast<int64_t>(a->tlen);
+        }
+        if (te <= tb) continue;
+
+        std::string rest = qname + "_" + std::to_string(real_qbeg) + "_" + std::to_string(real_qend);
         rest += suffix;
         rest += "\t" + std::string(a->strand == '+' ? "+" : "-");
 
-        results.emplace_back(a->tname, tb, te, qbeg, qend, a->strand, rest);
+        results.emplace_back(
+            a->tname,
+            tb,
+            te,
+            real_qbeg,
+            real_qend,
+            a->strand,
+            rest
+        );
     }
 
     return results;
@@ -760,6 +910,41 @@ void save_liftover_results(const std::string out_file, const std::vector<std::st
     }
 }
 
+bool SeqDB::load(const std::string& path) {
+    gzFile fp = gzopen(path.c_str(), "rb");
+    if (!fp) {
+        error_stream() << path << ": No such file or directory" << std::endl;
+        std::exit(1);
+    }
+
+    kseq_t* ks = kseq_init(fp);
+    if (!ks) {
+        gzclose(fp);
+        error_stream() << "kseq_init failed" << std::endl;
+        std::exit(1);
+    }
+
+    while (kseq_read(ks) >= 0) {
+        if (!ks->name.s || ks->name.l == 0) continue;
+        std::string name(ks->name.s, ks->name.l);
+
+        std::string s;
+        s.assign(ks->seq.s ? ks->seq.s : "", (size_t)ks->seq.l);
+        for (char& c : s) c = (char)std::toupper((unsigned char)c);
+
+        names.push_back(name);
+        seq.emplace(std::move(name), std::move(s));
+    }
+
+    kseq_destroy(ks);
+    gzclose(fp);
+    return true;
+}
+const std::string* SeqDB::get(std::string_view name) const {
+    auto it = seq.find(name);
+    return (it == seq.end()) ? nullptr : &it->second;
+}
+
 // Function check
 void check(const coordmap::CoordMap& M, const RunOpts& opt) {
     struct CheckStats {
@@ -803,7 +988,7 @@ void check(const coordmap::CoordMap& M, const RunOpts& opt) {
                 if (!dst_seq || h.qend > src_seq->size() || h.end > dst_seq->size()) {
                     ++st.bounds_error;
                     if (st.examples < opt.max_examples) {
-                        warning_stream() << "[BOUNDS] " << ctg << ":" << h.qbeg << "-" << h.qend
+                        warning_stream() << "  ! " << ctg << ":" << h.qbeg << "-" << h.qend
                                          << " -> " << tname << ":" << h.beg << "-" << h.end
                                          << (h.rev ? " (-)\n" : " (+)\n");
                         ++st.examples;
@@ -813,7 +998,7 @@ void check(const coordmap::CoordMap& M, const RunOpts& opt) {
                 if (!qlen || qlen != dlen) {
                     ++st.len_mismatch;
                     if (st.examples < opt.max_examples) {
-                        warning_stream() << "[LEN] " << ctg << ":" << h.qbeg << "-" << h.qend
+                        warning_stream() << "  ! " << ctg << ":" << h.qbeg << "-" << h.qend
                                          << " -> " << tname << ":" << h.beg << "-" << h.end
                                          << " qlen=" << qlen << " dlen=" << dlen
                                          << (h.rev ? " (-)\n" : " (+)\n");
@@ -824,7 +1009,7 @@ void check(const coordmap::CoordMap& M, const RunOpts& opt) {
 
                 std::string src = src_seq->substr(h.qbeg, qlen);
                 std::string dst = dst_seq->substr(h.beg,  dlen);
-                if (h.rev) detail::rc_inplace(dst);
+                if (h.rev) dst = seqUtils::revcomp(dst);
 
                 st.mapped_bases += qlen;
 
@@ -838,7 +1023,7 @@ void check(const coordmap::CoordMap& M, const RunOpts& opt) {
                 if (diffs && st.examples < opt.max_examples) {
                     const uint32_t ctx0 = (first > 10 ? first - 10 : 0);
                     const uint32_t ctx1 = std::min<uint32_t>(first + 10, qlen);
-                    warning_stream() << "[DIFF] " << ctg << ":" << h.qbeg << "-" << h.qend
+                    warning_stream() << "  ! " << ctg << ":" << h.qbeg << "-" << h.qend
                                      << " -> " << tname << ":" << h.beg << "-" << h.end
                                      << (h.rev ? " (-)" : " (+)")
                                      << " first=" << first << " diffs=" << diffs << "\n"
@@ -851,7 +1036,7 @@ void check(const coordmap::CoordMap& M, const RunOpts& opt) {
     }
 
     log_stream()
-        << "[check] windows=" << st.windows_total
+        << "  - windows=" << st.windows_total
         << " hit=" << st.windows_hit
         << " mapped=" << st.mapped_bases
         << " equal=" << st.equal_bases

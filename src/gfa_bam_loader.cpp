@@ -117,7 +117,7 @@ bool GfaBamLoader::loadFromBam(
         compute_record_stats(rec, seg_id, cov_base);
         ++n_loaded;
         if (n_loaded % 100000 == 0) {
-            log_stream() << "   - Loaded " << n_loaded << " alignments\n";
+            log_stream() << "  - Loaded " << n_loaded << " alignments\n";
         }
     }
 

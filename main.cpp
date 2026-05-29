@@ -17,22 +17,26 @@
 #include "include/liftover.hpp"
 #include "include/coordmap.hpp"
 #include "include/MapqBoost.hpp"
+#include "include/restriction_sites.hpp"
 #include "include/aligner.hpp"
 #include "include/sys.hpp"
 
 using namespace wfa;
 
-static inline bool is_top_help_flag(const char* s) {
-    return (std::string(s) == "-h" || std::string(s) == "--help");
-}
-static inline bool is_top_ver_flag(const char* s) {
-    return (std::string(s) == "-v" || std::string(s) == "--version");
-}
+static inline bool is_top_help_flag(const char* s) { return (std::string(s) == "-h" || std::string(s) == "--help"); }
+static inline bool is_top_help_advanced_flag(const char* s) { return (std::string(s) == "-H" || std::string(s) == "--advanced"); }
+static inline bool is_top_ver_flag(const char* s) { return (std::string(s) == "-v" || std::string(s) == "--version"); }
 
 int main(int argc, char** argv) {
     if (argc < 2) { help(argv); return 1; }
     if (is_top_help_flag(argv[1])) { help(argv); return 0; }
+    if (is_top_help_advanced_flag(argv[1])) { help(argv, true); return 0; }
     if (is_top_ver_flag(argv[1]))  { std::cerr << program::version << "\n"; return 0; }
+
+    // Informations
+    log_stream() << "Version: " << program::version << "\n";
+    log_stream() << "Data: " << getTime() << "\n";
+    log_stream() << "Command: " << program::cmdline(argc, argv) << "\n" << "\n";
 
     // Dispatch by subcommand
     const std::string sub = argv[1];
@@ -43,27 +47,19 @@ int main(int argc, char** argv) {
     if (sub == "stat") {
         AppConfig cfg = main_stat(argc, argv);
         GfaGraph G;
-        G.load_from_GFA(cfg.in.gfaFile);
-        G.print_graph_stats();
-    } else if (sub == "bubble") {
-        AppConfig cfg = main_bubble(argc, argv);
-        GfaGraph G;
-        G.load_from_GFA(cfg.in.gfaFile);
-        GfaBubble::GfaBubbleFinder finder(
-            G, cfg.bubble.max_depth, cfg.bubble.max_paths, cfg.bubble.DFS_guard, 
-            cfg.bubble.cx_depth, cfg.bubble.cx_nodes, cfg.bubble.cx_branches, cfg.bubble.cx_deg_branch, cfg.bubble.cx_deg_hub, cfg.bubble.cx_deg_cap, 
-            cfg.bubble.path_diff, /*skip_comp=*/false, cfg.bubble.keep_nested, cfg.global.threads
-        );
-        finder.find_bubbles();
-        const auto& bubbles = finder.get_bubbles();
-        finder.save_bubble_as_gfa(cfg.out.gfaBubbles, cfg.bubble.min_len, cfg.bubble.min_num);
+        G.load_from_GFA(cfg.stat.gfaFiles);
     } else if (sub == "seq") {
         AppConfig cfg = main_seq(argc, argv);
         GfaSeq G;
-        G.load_from_GFA(cfg.in.gfaFile);
+        G.load_from_GFA(cfg.seq.gfaFiles);
         std::vector<std::string> paths, seqs;
-        G.extract_from_file(cfg.in.pathFile, paths, seqs);
-        G.save_to_file(cfg.out.gfaSeq, paths, seqs);
+        G.extract_from_file(cfg.seq.pathFile, paths, seqs);
+        G.save_to_file(cfg.seq.outFile, paths, seqs);
+    } else if (sub == "gfa2fa") {
+        AppConfig cfg = main_gfa2fa(argc, argv);
+        Gfa2fa G(cfg.gfa2fa.min_len_xbp, cfg.gfa2fa.extend_ybp, cfg.gfa2fa.wrap_width, cfg.gfa2fa.skip_unknown);
+        G.load_from_GFA(cfg.gfa2fa.gfaFiles);
+        G.dump_to_file(cfg.gfa2fa.outFile);
     } else if (sub == "depth") {
         AppConfig cfg = main_depth(argc, argv);
         opt::ChainOpts  chainOpts;
@@ -78,82 +74,142 @@ int main(int argc, char** argv) {
         );
 
         // Load graph
-        bool forbid_overlap = (!cfg.in.reads.empty() || !cfg.in.gafFile.empty());
+        bool forbid_overlap = (!cfg.depth.reads.empty() || !cfg.depth.gafFile.empty());
         GfaDepth G(cfg.depth.min_mapq, cfg.depth.min_frac, cfg.depth.base_depth, forbid_overlap);
-        G.load_from_GFA(cfg.in.gfaFile);
+        G.load_from_GFA(cfg.depth.gfaFiles);
 
-        if (cfg.in.reads.size() > 0) {
+        if (cfg.depth.reads.size() > 0) {
             auto name_seqs = G.getSeqVec(cfg.global.kmerLen);
             mmidx::MinimizerIndex GIndex(name_seqs.names, name_seqs.seqs, name_seqs.right_seqs, chainOpts, anchorOpts);
             GIndex.build_mm(true);
             GIndex.print_index_stats();
-            GIndex.count_depth(cfg.in.reads);
-            G.count_from_kmer(GIndex, cfg.out.gfaDepth);
-        } else if (cfg.in.gafFile.size() > 0) {
-            G.count_from_gaf(cfg.in.gafFile, cfg.out.gfaDepth);
+            GIndex.count_depth(cfg.depth.reads);
+            G.count_from_kmer(GIndex, cfg.depth.outFile);
+        } else if (cfg.depth.gafFile.size() > 0) {
+            G.count_from_gaf(cfg.depth.gafFile, cfg.depth.outFile);
         } else {
-            G.count_from_A(cfg.out.gfaDepth);
+            G.count_from_A(cfg.depth.outFile);
+        }
+    } else if (sub == "bubble") {
+        AppConfig cfg = main_bubble(argc, argv);
+        GfaGraph G;
+        G.load_from_GFA(cfg.bubble.gfaFiles);
+        G.build_nodes_connectivity_index();
+        G.build_vertex_topological_index();
+
+        GfaBubble::GfaBubbleFinder finder(
+            G, cfg.bubble.max_depth, cfg.bubble.max_paths, cfg.bubble.DFS_guard, 
+            cfg.bubble.cx_depth, cfg.bubble.cx_nodes, cfg.bubble.cx_branches, cfg.bubble.cx_deg_branch, cfg.bubble.cx_deg_hub, 
+            cfg.bubble.path_diff, cfg.bubble.stall_round_limit, /*skip_comp=*/false, cfg.bubble.keep_nested, 
+            cfg.bubble.same_sim, cfg.bubble.same_min_num, cfg.bubble.same_min_len,
+            cfg.bubble.diff_min_src, cfg.bubble.diff_sim, cfg.bubble.diff_min_num, cfg.bubble.diff_min_len, 
+            cfg.bubble.homo_num, cfg.bubble.homo_k, cfg.bubble.homo_w, 
+            cfg.bubble.homo_boot_bp, cfg.bubble.homo_cnt_len, cfg.bubble.homo_bloom_bits, cfg.bubble.homo_bloom_hash,
+            cfg.global.threads
+        );
+        finder.find_bubbles();
+        finder.find_homologous_paths();
+
+        if (DEBUG_ENABLED) finder.print_bubbles();
+        if (DEBUG_ENABLED) finder.print_homologous_paths();
+
+        finder.save_bubble_as_gfa(cfg.bubble.out_prefix + ".bubbles.gfa", cfg.bubble.min_len, cfg.bubble.min_num);
+        finder.save_bubble_as_gfa(cfg.bubble.out_prefix + ".bubbles.noseq.gfa", cfg.bubble.min_len, cfg.bubble.min_num, /*write_seq=*/false);
+        if (cfg.bubble.write_vcf) {
+            finder.save_bubble_as_vcf(cfg.bubble.out_prefix, cfg.bubble.paf_file, cfg.bubble.ref_file, cfg.bubble.ali_min_mapq, cfg.bubble.ali_min_len);
         }
     } else if (sub == "deoverlap") {
         AppConfig cfg = main_deoverlap(argc, argv);
-        opt::ChainOpts  chainOpts;
-        opt::AnchorOpts anchorOpts;
-        opt::ExtendOpts extendOpts;
-        opt::AlignOpts  alignOpts;
-        init_opts(
-            cfg.global.kmerLen, cfg.global.minimizerW,
-            cfg.map.sec_pri_ratio, cfg.map.sec_pri_num,
-            cfg.map.outPAF, cfg.global.threads,
-            chainOpts, anchorOpts, extendOpts, alignOpts
-        );
-        // Preset
-        opt::Preset::map_asm_5(chainOpts, anchorOpts, extendOpts, alignOpts);
 
-        GfaDeoverlapper G(cfg.collapse.min_eq, cfg.collapse.max_iters);
-        G.set_opts(chainOpts, anchorOpts, extendOpts, alignOpts, cfg.global.use_wfa);
-        G.load_from_GFA(cfg.in.gfaFile);
+        GfaDeoverlapper G(cfg.collapse.min_eq, cfg.collapse.min_match_ratio, cfg.collapse.max_iters, cfg.collapse.max_abnormal_cut_len, cfg.collapse.min_abnormal_cut_count);
+        G.set_opts(cfg.map.chainOpts, cfg.map.anchorOpts, cfg.map.extendOpts, cfg.map.alignOpts, cfg.map.use_wfa);
+        G.load_from_GFA(cfg.collapse.gfaFiles);
         G.print_graph_stats();
-        G.deoverlap(cfg.out.prefix);
-        G.save_to_disk(cfg.out.prefix + ".deoverlap.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/true);
-        G.save_to_disk(cfg.out.prefix + ".deoverlap.noseq.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/false);
+        G.deoverlap(cfg.collapse.prefix);
+        G.save_to_disk(cfg.collapse.prefix + ".deoverlap.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/true);
+        G.save_to_disk(cfg.collapse.prefix + ".deoverlap.noseq.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/false);
     } else if (sub == "collapse") {
         AppConfig cfg = main_collapse(argc, argv);
-        opt::ChainOpts  chainOpts;
-        opt::AnchorOpts anchorOpts;
-        opt::ExtendOpts extendOpts;
-        opt::AlignOpts  alignOpts;
-        init_opts(
-            cfg.global.kmerLen, cfg.global.minimizerW,
-            cfg.map.sec_pri_ratio, cfg.map.sec_pri_num,
-            cfg.map.outPAF, cfg.global.threads,
-            chainOpts, anchorOpts, extendOpts, alignOpts
-        );
-        // Preset
-        opt::Preset::map_asm_5(chainOpts, anchorOpts, extendOpts, alignOpts);
 
-        GfaCollapser G(cfg.collapse.min_jaccard, cfg.collapse.min_new_frac, cfg.collapse.min_eq, cfg.collapse.max_iters);
-        G.set_opts(chainOpts, anchorOpts, extendOpts, alignOpts, cfg.global.use_wfa);
-        G.load_from_GFA(cfg.in.gfaFile);
-        G.collapse_unitigs();
-        G.save_to_disk(cfg.out.prefix + ".collapse.unitig.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/true);
+        GfaCollapser G(
+            cfg.collapse.min_jaccard, 
+            cfg.collapse.min_eq, 
+            cfg.collapse.min_match_ratio, 
+            cfg.collapse.max_iters, 
+            cfg.bubble.homo_k, 
+            cfg.bubble.homo_w, 
+            cfg.collapse.repeat_mask_min_len,
+            cfg.collapse.repeat_mask_max_period,
+            cfg.collapse.repeat_mask_max_mismatch, 
+            cfg.collapse.max_abnormal_cut_len,
+            cfg.collapse.min_abnormal_cut_count
+        );
+        G.set_opts(cfg.map.chainOpts, cfg.map.anchorOpts, cfg.map.extendOpts, cfg.map.alignOpts, cfg.map.use_wfa);
+        G.load_from_GFA(cfg.collapse.gfaFiles);
+        G.build_nodes_connectivity_index();
+        G.build_vertex_topological_index();
 
         // Detect Bubbles and Forks
         GfaBubble::GfaBubbleFinder finder(
             G, cfg.bubble.max_depth, cfg.bubble.max_paths, cfg.bubble.DFS_guard, 
-            cfg.bubble.cx_depth, cfg.bubble.cx_nodes, cfg.bubble.cx_branches, cfg.bubble.cx_deg_branch, cfg.bubble.cx_deg_hub, cfg.bubble.cx_deg_cap, 
-            cfg.bubble.path_diff, /*skip_comp=*/false, /*keep_nested=*/true, cfg.global.threads
+            cfg.bubble.cx_depth, cfg.bubble.cx_nodes, cfg.bubble.cx_branches, cfg.bubble.cx_deg_branch, cfg.bubble.cx_deg_hub, 
+            cfg.bubble.path_diff, cfg.bubble.stall_round_limit, /*skip_comp=*/false, /*keep_nested=*/true,  
+            cfg.bubble.same_sim, cfg.bubble.same_min_num, cfg.bubble.same_min_len,
+            cfg.bubble.diff_min_src, cfg.bubble.diff_sim, cfg.bubble.diff_min_num, cfg.bubble.diff_min_len, 
+            cfg.bubble.homo_num, cfg.bubble.homo_k, cfg.bubble.homo_w, 
+            cfg.bubble.homo_boot_bp, cfg.bubble.homo_cnt_len, cfg.bubble.homo_bloom_bits, cfg.bubble.homo_bloom_hash,
+            cfg.global.threads
         );
         finder.find_forks();
         const auto& forks = finder.get_forks();
-
         finder.find_bubbles();
         const auto& bubbles = finder.get_bubbles();
-        G.collapse_bubbles(bubbles, forks, cfg.out.prefix, finder);
-        G.collapse_unitigs(); // collapse again after bubble collapse
+        if (DEBUG_ENABLED) finder.print_bubbles();
+        finder.find_homologous_paths();
+        const auto& homologous_paths = finder.get_homologous_paths();
+        if (DEBUG_ENABLED) finder.print_homologous_paths();
+
+        G.collapse_homologous_seq(bubbles, forks, homologous_paths, cfg.collapse.prefix, finder);
 
         // Output
-        G.save_to_disk(cfg.out.prefix + ".collapse.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/true);
-        G.save_to_disk(cfg.out.prefix + ".collapse.noseq.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/false);
+        G.save_to_disk(cfg.collapse.prefix + ".collapse.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/true);
+        G.save_to_disk(cfg.collapse.prefix + ".collapse.noseq.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/false);
+    } else if (sub == "file2map") {
+        AppConfig cfg = main_file2map(argc, argv);
+        mapconv::file_to_map_auto(cfg.file2map.inputFiles, cfg.file2map.outFile, cfg.file2map.paf_primary_only, cfg.file2map.min_len, cfg.file2map.min_mapq);
+    } else if (sub == "liftover") {
+        AppConfig cfg = main_liftover(argc, argv);
+        liftover::RunOpts opt = liftover::set_opts(
+            cfg.liftover.mapFiles, cfg.liftover.bedFile, cfg.liftover.referenceFile, cfg.liftover.outFile,
+            cfg.liftover.regex, cfg.liftover.min_frac, 
+            cfg.liftover.flank_win, cfg.liftover.max_flank, cfg.liftover.max_gap, cfg.liftover.max_hit,
+            cfg.liftover.pafFile, cfg.liftover.min_mapq, cfg.liftover.min_len,
+            cfg.liftover.do_check, cfg.liftover.win, cfg.liftover.step, cfg.liftover.max_examples, 
+            cfg.coordmap.max_hops, cfg.coordmap.max_fanout, cfg.coordmap.min_len, cfg.coordmap.min_frac, cfg.coordmap.max_total_hits, 
+            cfg.global.threads
+        );
+        std::vector<std::string> blocks = liftover::liftover(opt);
+        liftover::save_liftover_results(opt.out_file, blocks);
+    } else if (sub == "mapq_boost") {
+        AppConfig cfg = main_mapq_boost(argc, argv);
+        coordmap::CoordMap coormap_idx;
+        coormap_idx.load(cfg.homq.mapFiles);
+
+        // Restriction-site index (optional)
+        rsite::Index rsite_idx;
+        if (!cfg.ressit.genome_file.empty() || cfg.ressit.enzymes.size() > 0) {
+            rsite_idx.build(cfg.ressit.genome_file, cfg.ressit.enzymes, cfg.ressit.scan_revcomp, cfg.global.threads);
+        }
+
+        mapqboost::MapqBooster booster(
+            coormap_idx, rsite_idx, 
+            cfg.homq.batch_size, cfg.homq.mapq_low, cfg.homq.mapq_cap, cfg.homq.name_check,
+            cfg.coordmap.max_hops, cfg.coordmap.max_fanout, cfg.coordmap.min_len, cfg.coordmap.min_frac, cfg.coordmap.max_total_hits,
+            cfg.homq.sub_ovlp_frac, 
+            cfg.homq.K_mapq, cfg.homq.K_rs, cfg.homq.K_as, cfg.homq.K_ml, cfg.homq.K_nm, cfg.homq.W_mapq, cfg.homq.W_rs, cfg.homq.W_as, cfg.homq.W_ml, cfg.homq.W_nm, cfg.homq.close_as_eps,
+            cfg.global.threads, cfg.global.IOthreads
+        );
+        booster.run(cfg.homq.in_bam, cfg.homq.out_bam);
     } else if (sub == "align") {
         AppConfig cfg = main_align(argc, argv);
         opt::ChainOpts  chainOpts;
@@ -176,7 +232,8 @@ int main(int argc, char** argv) {
 
         // Build index
         GfaGraph G;
-        G.load_from_GFA(cfg.in.gfaFile);
+        G.load_from_GFA(cfg.map.gfaFiles);
+        G.build_nodes_connectivity_index();
         auto name_seqs = G.getSeqVec();
         mmidx::MinimizerIndex GIndex(name_seqs.names, name_seqs.seqs, name_seqs.right_seqs, chainOpts, anchorOpts);
         GIndex.build_mm();
@@ -184,42 +241,16 @@ int main(int argc, char** argv) {
 
         // Align
         aligner::Alignmenter A(GIndex, name_seqs.names, name_seqs.seqs, extendOpts, alignOpts);
-        A.align(cfg.in.reads, cfg.out.alignOut, program::cmdline(argc, argv));
-    } else if (sub == "gfa2fa") {
-        AppConfig cfg = main_gfa2fa(argc, argv);
-        Gfa2fa G(cfg.gfa2fa.min_len_xbp, cfg.gfa2fa.extend_ybp, cfg.gfa2fa.wrap_width, cfg.gfa2fa.skip_unknown);
-        G.load_from_GFA(cfg.in.gfaFile);
-        G.dump_to_file(cfg.out.gfa2faOut);
-    } else if (sub == "file2map") {
-        AppConfig cfg = main_file2map(argc, argv);
-        mapconv::file_to_map_auto(cfg.in.inputFile, cfg.out.outFile, cfg.file2map.paf_primary_only, cfg.file2map.min_len, cfg.file2map.min_mapq);
-    } else if (sub == "liftover") {
-        AppConfig cfg = main_liftover(argc, argv);
-        liftover::RunOpts opt = liftover::set_opts(
-            cfg.in.mapFile, cfg.in.bedFile, cfg.in.referenceFile, cfg.out.outFile,
-            cfg.liftover.regex, cfg.liftover.min_frac, 
-            cfg.liftover.flank_win, cfg.liftover.max_flank, cfg.liftover.max_gap, cfg.liftover.max_hit,
-            cfg.in.pafFile, cfg.liftover.min_mapq, cfg.liftover.min_len,
-            cfg.liftover.do_check, cfg.liftover.win, cfg.liftover.step, cfg.liftover.max_examples, 
-            cfg.coordmap.max_hops, cfg.coordmap.max_fanout, cfg.coordmap.min_len, cfg.coordmap.min_frac, cfg.coordmap.max_total_hits, 
-            cfg.global.threads
-        );
-        std::vector<std::string> blocks = liftover::liftover(opt);
-        liftover::save_liftover_results(opt.out_file, blocks);
-    } else if (sub == "mapq_boost") {
-        AppConfig cfg = main_mapq_boost(argc, argv);
-        coordmap::CoordMap map;
-        map.load(cfg.in.mapFile);
-        log_stream() << "Loaded records: " << map.num_records() << "\n";
+        A.align(cfg.map.reads, cfg.map.outFile, program::cmdline(argc, argv));
+    } else if (sub == "ressit") {
+        AppConfig cfg = main_res_cut(argc, argv);
 
-        mapqboost::MapqBooster booster(
-            map, 
-            cfg.homq.batch_size, cfg.homq.mapq_low, cfg.homq.mapq_new, cfg.homq.min_frac, cfg.homq.min_equiv, cfg.homq.name_check,
-            cfg.coordmap.max_hops, cfg.coordmap.max_fanout, cfg.coordmap.min_len, cfg.coordmap.min_frac, cfg.coordmap.max_total_hits,
-            cfg.homq.sub_ovlp_frac,
-            cfg.global.threads, cfg.global.IOthreads
-        );
-        booster.run(cfg.homq.in_bam, cfg.homq.out_bam);
+        rsite::Index idx;
+        idx.build(cfg.ressit.genome_file, cfg.ressit.enzymes, cfg.ressit.scan_revcomp, cfg.global.threads);
+
+        if (!cfg.ressit.out_bed.empty()) {
+            idx.save_bed(cfg.ressit.out_bed);
+        }
     } else {
         error_stream() << "Unknown subcommand: " << sub << "\n";
         help(argv);

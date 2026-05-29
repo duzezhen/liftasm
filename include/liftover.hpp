@@ -17,8 +17,7 @@
 #include "kseq.h"
 #include "coordmap.hpp"
 #include "kpaf.hpp"
-
-KSEQ_INIT(gzFile, gzread)
+#include "seq_utils.hpp"
 
 namespace liftover {
 
@@ -27,12 +26,11 @@ namespace detail {
     bool parse_u32(std::string_view sv, uint32_t& out);
     bool split3_bed(std::string_view line, std::string_view& chrom, std::string_view& s0, std::string_view& s1, std::string_view& rest);
     std::string hit_label(const coordmap::CoordMap& M, const coordmap::Hit& h);
-    void rc_inplace(std::string& s);
 } // namespace detail
 
 // ============================ High-level runner ============================
 struct RunOpts {
-    std::string map_file;  // required
+    std::vector<std::string> map_files;  // required
     std::string bed_file;  // required if !do_check
     std::string ref_file;  // required if do_check
     std::string out_file;  // empty => stdout
@@ -68,7 +66,7 @@ struct RunOpts {
 };
 
 RunOpts set_opts(
-    std::string map_file, std::string bed_file, std::string ref_file, std::string out_file, 
+    std::vector<std::string> map_files, std::string bed_file, std::string ref_file, std::string out_file, 
     std::string regex, double min_frac, 
     uint32_t flank_win, uint32_t max_flank, uint32_t max_gap, uint16_t max_hit,
     std::string paf_file, uint32_t min_mapq, uint32_t min_len,
@@ -89,13 +87,24 @@ struct Pafinfo {
     char tp = 0;          // 'P' or 'I'
     std::string cg;
 };
-int file_reader(
-    const RunOpts& opt, 
-    std::unordered_map<std::string, std::vector<BEDinfo>>& bed, 
-    coordmap::CoordMap& M, 
-    std::unordered_map<std::string, std::vector<Pafinfo>>& paf,
-    std::unordered_map<std::string, std::vector<uint32_t>>& paf_end,
-    std::unordered_map<std::string, std::vector<uint32_t>>& paf_idx_end
+
+int bed_reader(
+    const std::string& bed_file, 
+    std::unordered_map<std::string, std::vector<BEDinfo>>& bed
+);
+
+int map_reader(
+    const std::vector<std::string>& map_files, 
+    coordmap::CoordMap& M
+);
+
+int paf_reader(
+    const std::string paf_file, 
+    const uint32_t min_mapq, 
+    const uint32_t min_len, 
+    std::unordered_map<std::string, std::vector<Pafinfo>>& pafs,
+    std::unordered_map<std::string, std::vector<uint32_t>>& paf_ends,
+    std::unordered_map<std::string, std::vector<uint32_t>>& paf_idx_ends
 );
 
 
@@ -159,41 +168,9 @@ struct SeqDB {
     std::unordered_map<std::string, std::string, SvHash, SvEq> seq;
     std::vector<std::string> names;
 
-    bool load(const std::string& path) {
-        gzFile fp = gzopen(path.c_str(), "rb");
-        if (!fp) {
-            error_stream() << path << ": No such file or directory" << std::endl;
-            std::exit(1);
-        }
+    bool load(const std::string& path);
 
-        kseq_t* ks = kseq_init(fp);
-        if (!ks) {
-            gzclose(fp);
-            error_stream() << "kseq_init failed" << std::endl;
-            std::exit(1);
-        }
-
-        while (kseq_read(ks) >= 0) {
-            if (!ks->name.s || ks->name.l == 0) continue;
-            std::string name(ks->name.s, ks->name.l);
-
-            std::string s;
-            s.assign(ks->seq.s ? ks->seq.s : "", (size_t)ks->seq.l);
-            for (char& c : s) c = (char)std::toupper((unsigned char)c);
-
-            names.push_back(name);
-            seq.emplace(std::move(name), std::move(s));
-        }
-
-        kseq_destroy(ks);
-        gzclose(fp);
-        return true;
-    }
-
-    const std::string* get(std::string_view name) const {
-        auto it = seq.find(name);
-        return (it == seq.end()) ? nullptr : &it->second;
-    }
+    const std::string* get(std::string_view name) const;
 };
 
 void check(const coordmap::CoordMap& M, const RunOpts& opt);
