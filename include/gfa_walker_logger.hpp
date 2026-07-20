@@ -58,8 +58,7 @@ public:
     void greedy_summary(size_t path_count, size_t covered_count, uint64_t dfs_states, uint32_t rounds) const;
 
     void open_header(uint32_t src, uint64_t walk_bp, uint32_t max_depth, uint64_t dfs_guard) const;
-    void open_sink(uint32_t from, uint32_t sink) const;
-    void open_reject(uint32_t sink, const std::string& reason) const;
+    void open_step(uint32_t from, uint32_t to) const;
     void open_summary(const std::vector<uint32_t>& path, uint64_t bp) const;
 
 private:

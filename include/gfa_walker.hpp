@@ -108,42 +108,6 @@ private:
 
 
 /* ================================================================================================================
- *                                         TOPO SINK FINDER START
- * ================================================================================================================ */
-class TopoSinkFinder {
-public:
-    TopoSinkFinder(
-        const GfaGraph& graph,
-        const std::unordered_set<uint32_t>& region_set,
-        const std::unordered_set<uint32_t>& used_seg,
-        const std::unordered_set<uint32_t>& bad_sinks,
-        bool skip_comp,
-        uint32_t max_depth,
-        uint64_t dfs_guard
-    );
-
-    std::vector<uint32_t> find_path(uint32_t from, uint64_t target_bp, bool& hit_limits) const;
-
-private:
-    bool valid_vertex(uint32_t v) const;
-    std::vector<uint32_t> collect_candidates(uint32_t from, std::unordered_set<uint32_t>& seen) const;
-    void sort_candidates(uint32_t from, uint32_t from_rank, std::vector<uint32_t>& cand) const;
-
-private:
-    const GfaGraph& graph_;
-    const std::unordered_set<uint32_t>& region_set_;
-    const std::unordered_set<uint32_t>& used_seg_;
-    const std::unordered_set<uint32_t>& bad_sinks_;
-    bool skip_comp_{false};
-    uint32_t max_depth_{0};
-    uint64_t dfs_guard_{0};
-};
-/* ================================================================================================================
- *                                         TOPO SINK FINDER END
- * ================================================================================================================ */
-
-
-/* ================================================================================================================
  *                                            GFA WALKER START
  * ================================================================================================================ */
 class GfaWalker {

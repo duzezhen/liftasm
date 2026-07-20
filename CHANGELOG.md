@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.3-r13 (2026-07-17)
+
+### Improved
+
+- Reduced homologous path enumeration complexity with `open_walk()`.
+
 ## v0.1.3-r12 (2026-07-17)
 
 ### Fixed

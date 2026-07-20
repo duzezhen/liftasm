@@ -286,167 +286,6 @@ void GreedyDfsContext::sort_candidates(
  *                                        GREEDY DFS CONTEXT END
  * ================================================================================================================ */
 
-/* ================================================================================================================
- *                                         TOPO SINK FINDER START
- * ================================================================================================================ */
-TopoSinkFinder::TopoSinkFinder(
-    const GfaGraph& graph,
-    const std::unordered_set<uint32_t>& region_set,
-    const std::unordered_set<uint32_t>& used_seg,
-    const std::unordered_set<uint32_t>& bad_sinks,
-    bool skip_comp,
-    uint32_t max_depth,
-    uint64_t dfs_guard
-)
-    : graph_(graph),
-      region_set_(region_set),
-      used_seg_(used_seg),
-      bad_sinks_(bad_sinks),
-      skip_comp_(skip_comp),
-      max_depth_(max_depth),
-      dfs_guard_(dfs_guard)
-{}
-
-bool TopoSinkFinder::valid_vertex(uint32_t v) const {
-    const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
-    if (v >= V) return false;
-
-    const uint32_t sid = NodeHandle::get_segment_id(v);
-    if (graph_.getNodeDeleted(sid)) return false;
-
-    if (!region_set_.empty() && region_set_.find(v) == region_set_.end()) {
-        return false;
-    }
-
-    return true;
-}
-
-std::vector<uint32_t> TopoSinkFinder::collect_candidates(uint32_t from, std::unordered_set<uint32_t>& seen) const {
-    std::vector<uint32_t> cand;
-    const auto& arcs = graph_.getArcsFromVertex(from);
-    cand.reserve(arcs.size());
-
-    for (const GfaArc* a : arcs) {
-        if (!a || a->get_del() || (skip_comp_ && a->get_comp())) continue;
-
-        const uint32_t w = a->get_target_vertex_id();
-        if (!valid_vertex(w)) continue;
-        if (!seen.insert(w).second) continue;
-        if (bad_sinks_.find(w) != bad_sinks_.end()) continue;
-
-        const uint32_t sid = NodeHandle::get_segment_id(w);
-        if (used_seg_.find(sid) != used_seg_.end()) continue;
-
-        cand.push_back(w);
-    }
-
-    return cand;
-}
-
-void TopoSinkFinder::sort_candidates(uint32_t from, uint32_t from_rank, std::vector<uint32_t>& cand) const {
-    std::sort(cand.begin(), cand.end(),
-        [&](uint32_t a, uint32_t b) {
-            const bool sa = graph_.intersect_vertex_sample(from, a);
-            const bool sb = graph_.intersect_vertex_sample(from, b);
-            if (sa != sb) return sa > sb;
-
-            const uint32_t oa = graph_.get_edge_ow(from, a);
-            const uint32_t ob = graph_.get_edge_ow(from, b);
-            if (oa != ob) return oa > ob;
-
-            const uint32_t la = graph_.getNodeLength(NodeHandle::get_segment_id(a));
-            const uint32_t lb = graph_.getNodeLength(NodeHandle::get_segment_id(b));
-            if (la != lb) return la > lb;
-
-            return a < b;
-        }
-    );
-}
-
-std::vector<uint32_t> TopoSinkFinder::find_path(uint32_t from, uint64_t target_bp, bool& hit_limits) const {
-    hit_limits = false;
-
-    const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
-    if (from >= V || graph_.get_vertex_topological_index().size() < V) return {};
-    if (!valid_vertex(from)) return {};
-
-    const uint32_t from_rank = graph_.vertex_topo_rank(Vertex(from));
-    if (from_rank == UINT32_MAX) return {};
-
-    struct State {
-        uint32_t v{UINT32_MAX};
-        uint32_t depth{0};
-        uint64_t bp{0};
-    };
-
-    std::queue<State> q;
-    q.push(State{from, 0, 0});
-
-    std::unordered_set<uint32_t> seen;
-    seen.reserve(256);
-    seen.insert(from);
-
-    std::unordered_map<uint32_t, uint32_t> parent;
-    parent.reserve(256);
-
-    auto build_path = [&](uint32_t sink) {
-        std::vector<uint32_t> path;
-        for (uint32_t v = sink;;) {
-            path.push_back(v);
-            if (v == from) break;
-            const auto it = parent.find(v);
-            if (it == parent.end()) return std::vector<uint32_t>{};
-            v = it->second;
-        }
-        std::reverse(path.begin(), path.end());
-        return path;
-    };
-
-    uint64_t states = 0;
-    uint32_t best_sink = UINT32_MAX;
-    uint64_t best_bp = 0;
-
-    while (!q.empty()) {
-        if (++states > dfs_guard_) {
-            if (best_sink != UINT32_MAX) return build_path(best_sink);
-            hit_limits = true;
-            return {};
-        }
-
-        const State cur = q.front();
-        q.pop();
-
-        if (cur.depth >= max_depth_) continue;
-
-        std::vector<uint32_t> cand = collect_candidates(cur.v, seen);
-        sort_candidates(cur.v, from_rank, cand);
-
-        for (uint32_t w : cand) {
-            parent.emplace(w, cur.v);
-            const uint32_t sid = NodeHandle::get_segment_id(w);
-            const uint32_t len = graph_.getNodeLength(sid);
-            const uint32_t ow = graph_.get_edge_ow(cur.v, w);
-            const uint64_t next_bp = cur.bp + (len > ow ? uint64_t(len - ow) : 0);
-            const uint32_t wrank = graph_.vertex_topo_rank(Vertex(w));
-
-            if (wrank != UINT32_MAX && wrank > from_rank && !graph_.vertex_in_cycle(Vertex(w))) {
-                if (best_sink == UINT32_MAX || next_bp > best_bp) {
-                    best_sink = w;
-                    best_bp = next_bp;
-                }
-                if (next_bp >= target_bp) return build_path(w);
-            }
-
-            q.push(State{w, cur.depth + 1, next_bp});
-        }
-    }
-
-    return best_sink == UINT32_MAX ? std::vector<uint32_t>{} : build_path(best_sink);
-}
-/* ================================================================================================================
- *                                         TOPO SINK FINDER END
- * ================================================================================================================ */
-
 
 /* ================================================================================================================
  *                                            GFA WALKER START
@@ -670,102 +509,125 @@ std::vector<std::vector<uint32_t>> GfaWalker::open_walk(
 ) const {
     std::vector<std::vector<uint32_t>> out;
 
-    const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
-    const std::vector<GfaTopoIndex>& topo = graph_.get_vertex_topological_index();
-
+    const uint64_t V = graph_.getNumNodes() * 2;
     if (V == 0 || src >= V || walk_bp == 0) return out;
-    if (topo.size() < V) return out;
 
-    const uint32_t depth_limit = max_depth == 0 ? V : max_depth;
+    const uint32_t depth_limit = max_depth == 0 ? static_cast<uint32_t>(std::min<uint64_t>(V, UINT32_MAX)) : max_depth;
 
     GfaWalkerLogger log(graph_);
     log.open_header(src, walk_bp, depth_limit, DFS_guard);
 
-    auto added_bp = [&](uint32_t from, uint32_t to) -> uint64_t {
-        const uint32_t sid = NodeHandle::get_segment_id(to);
-        const uint32_t len = graph_.getNodeLength(sid);
-        const uint32_t ow = graph_.get_edge_ow(from, to);
-
-        return len > ow ? uint64_t(len - ow) : 0;
-    };
+    std::vector<uint32_t> path;
+    path.reserve(std::min<size_t>(depth_limit + uint64_t(1), 4096));
+    path.push_back(src);
 
     std::unordered_set<uint32_t> used_seg;
-    used_seg.reserve(depth_limit + 8);
-    used_seg.insert(NodeHandle::get_segment_id(src));
+    used_seg.reserve(std::min<size_t>(depth_limit + uint64_t(1), 4096) + (blocked_seg ? blocked_seg->size() : 0));
 
     if (blocked_seg) {
         used_seg.insert(blocked_seg->begin(), blocked_seg->end());
     }
-
-    std::unordered_set<uint32_t> bad_sinks;
-    bad_sinks.reserve(32);
-
-    std::vector<uint32_t> full_path;
-    full_path.reserve(depth_limit + 1);
-    full_path.push_back(src);
+    used_seg.insert(NodeHandle::get_segment_id(src));
 
     uint32_t cur = src;
+    uint32_t steps = 0;
     uint64_t total_bp = 0;
-    while (total_bp < walk_bp && full_path.size() - 1 < depth_limit) {
-        const uint32_t remaining_depth = depth_limit - static_cast<uint32_t>(full_path.size() - 1);
-        TopoSinkFinder finder(
-            graph_,
-            region_set,
-            used_seg,
-            bad_sinks,
-            skip_comp,
-            remaining_depth,
-            DFS_guard
-        );
+    uint64_t examined_arcs = 0;
 
-        bool sink_hit_limits = false;
-        std::vector<uint32_t> piece = finder.find_path(cur, walk_bp - total_bp, sink_hit_limits);
+    auto has_continuation = [&](uint32_t from, bool& guard_hit) {
+        const uint32_t from_sid = NodeHandle::get_segment_id(from);
 
-        if (sink_hit_limits || piece.size() < 2) {
-            break;
+        for (const GfaArc* arc : graph_.getArcsFromVertex(from)) {
+            if (DFS_guard > 0 && examined_arcs >= DFS_guard) {
+                guard_hit = true;
+                return false;
+            }
+            ++examined_arcs;
+
+            if (!arc || arc->get_del() || (skip_comp && arc->get_comp())) continue;
+
+            const uint32_t next = arc->get_target_vertex_id();
+            if (next == from || next >= V) continue;
+            if (!region_set.empty() && !region_set.count(next)) continue;
+
+            const uint32_t sid = NodeHandle::get_segment_id(next);
+            if (sid == from_sid || graph_.getNodeDeleted(sid) || used_seg.count(sid)) continue;
+
+            return true;
         }
 
-        const uint32_t sink = piece.back();
-        log.open_sink(cur, sink);
+        return false;
+    };
 
-        bool clean = true;
-        std::unordered_set<uint32_t> piece_seg;
-        piece_seg.reserve(piece.size() + 8);
+    while (total_bp < walk_bp && steps < depth_limit) {
+        uint32_t best = UINT32_MAX;
+        uint32_t best_len = 0;
+        uint32_t best_ow = 0;
+        bool best_same_sample = false;
+        bool best_dead_end = true;
+        bool guard_hit = false;
 
-        for (size_t k = 1; k < piece.size(); ++k) {
-            const uint32_t sid = NodeHandle::get_segment_id(piece[k]);
-
-            if (used_seg.find(sid) != used_seg.end()) {
-                clean = false;
+        for (const GfaArc* arc : graph_.getArcsFromVertex(cur)) {
+            if (DFS_guard > 0 && examined_arcs >= DFS_guard) {
+                guard_hit = true;
                 break;
             }
+            ++examined_arcs;
 
-            if (!piece_seg.insert(sid).second) {
-                clean = false;
-                break;
+            if (!arc || arc->get_del()) continue;
+            if (skip_comp && arc->get_comp()) continue;
+
+            const uint32_t next = arc->get_target_vertex_id();
+            if (next == cur || next >= V) continue;
+
+            if (!region_set.empty() && !region_set.count(next)) continue;
+
+            const uint32_t sid = NodeHandle::get_segment_id(next);
+            if (graph_.getNodeDeleted(sid) || used_seg.count(sid)) continue;
+
+            const uint32_t len = graph_.getNodeLength(sid);
+            const bool dead_end = !has_continuation(next, guard_hit);
+            if (guard_hit) break;
+
+            if (best != UINT32_MAX) {
+                if (dead_end && !best_dead_end) continue;
+                if (dead_end == best_dead_end && len < best_len) continue;
+            }
+
+            const uint32_t ow = arc->ow > 0 && arc->ow != INT32_MAX ? static_cast<uint32_t>(arc->ow) : 0u;
+            const bool same_sample = graph_.intersect_vertex_sample(cur, next);
+
+            const bool better =
+                best == UINT32_MAX ||
+                (best_dead_end && !dead_end) ||
+                (dead_end == best_dead_end && len > best_len) ||
+                (dead_end == best_dead_end && len == best_len && same_sample > best_same_sample) ||
+                (dead_end == best_dead_end && len == best_len && same_sample == best_same_sample && ow > best_ow) ||
+                (dead_end == best_dead_end && len == best_len && same_sample == best_same_sample && ow == best_ow && next < best);
+
+            if (better) {
+                best = next;
+                best_len = len;
+                best_ow = ow;
+                best_same_sample = same_sample;
+                best_dead_end = dead_end;
             }
         }
 
-        if (!clean) {
-            bad_sinks.insert(sink);
-            log.open_reject(sink, "cycle or used segment");
-            continue;
-        }
+        if (guard_hit || best == UINT32_MAX) break;
 
-        for (size_t k = 1; k < piece.size(); ++k) {
-            total_bp += added_bp(full_path.back(), piece[k]);
-            full_path.push_back(piece[k]);
-            used_seg.insert(NodeHandle::get_segment_id(piece[k]));
-        }
+        log.open_step(cur, best);
 
-        cur = full_path.back();
+        total_bp += best_len > best_ow ? uint64_t(best_len - best_ow) : 0;
+
+        cur = best;
+        path.push_back(best);
+        used_seg.insert(NodeHandle::get_segment_id(best));
+        ++steps;
     }
 
-    log.open_summary(full_path, total_bp);
-
-    if (!full_path.empty()) {
-        out.push_back(std::move(full_path));
-    }
+    log.open_summary(path, total_bp);
+    out.push_back(std::move(path));
 
     return out;
 }

@@ -167,21 +167,16 @@ void GfaWalkerLogger::open_header(uint32_t src, uint64_t walk_bp, uint32_t max_d
     if (!enabled_) return;
 
     debug_stream() << "=========================================\n";
-    debug_stream() << "Open walk by topo sinks\n";
+    debug_stream() << "Open greedy walk\n";
     debug_stream() << indent(1) << "src       : " << node_name(src) << "\n";
     debug_stream() << indent(1) << "walk_bp   : " << walk_bp << "\n";
     debug_stream() << indent(1) << "max_depth : " << max_depth << "\n";
-    debug_stream() << indent(1) << "DFS_guard : " << dfs_guard << "\n";
+    debug_stream() << indent(1) << "arc_guard : " << dfs_guard << "\n";
 }
 
-void GfaWalkerLogger::open_sink(uint32_t from, uint32_t sink) const {
+void GfaWalkerLogger::open_step(uint32_t from, uint32_t to) const {
     if (!enabled_) return;
-    debug_stream() << indent(1) << "sink: " << node_name(from) << " -> " << node_name(sink) << "\n";
-}
-
-void GfaWalkerLogger::open_reject(uint32_t sink, const std::string& reason) const {
-    if (!enabled_) return;
-    debug_stream() << indent(1) << "reject " << node_name(sink) << "  reason=" << reason << "\n";
+    debug_stream() << indent(1) << "step: " << node_name(from) << " -> " << node_name(to) << "\n";
 }
 
 void GfaWalkerLogger::open_summary(const std::vector<uint32_t>& p, uint64_t bp) const {

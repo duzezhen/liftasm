@@ -117,6 +117,7 @@ private:
 private:
     std::vector<Vertex> sources_, tips_;
     std::vector<Bubble> bubbles_;
+    GfaBubble::BubbleBranchPairs_ bubble_branch_pairs_;
     std::vector<ForkGroup> forks_;
     std::vector<HomologousPath> homologous_paths_;
 };

@@ -168,6 +168,7 @@ void GfaBubbleFinder::find_bubbles()
 {
     log_stream() << "Detecting bubbles ...\n";
     bubbles_.clear();
+    bubble_branch_pairs_ = {};
 
     // Identify sources and tips
     if (sources_.empty() || tips_.empty()) {
@@ -231,6 +232,7 @@ void GfaBubbleFinder::find_bubbles()
     log_stream() << "  - Total bubbles detected: " << bubbles_.size() << "\n" << "\n";
 
     // Post-processing
+    bubble_branch_pairs_ = build_bubble_branch_pairs_();
     if (!keep_nested_) filter_nonlocal_bubbles_();
 
     std::sort(bubbles_.begin(), bubbles_.end(),
@@ -1426,8 +1428,6 @@ void GfaBubbleFinder::find_homologous_paths()
         tasks = build_homo_tasks_(std::move(groups));
     }
 
-    const GfaBubble::BubbleBranchPairs_ bubble_pairs = build_bubble_branch_pairs_();
-
     // ------------------------------------------------ Detect homologous paths ------------------------------------------------
     log_stream() << "Detecting homologous paths ...\n";
 
@@ -1451,7 +1451,7 @@ void GfaBubbleFinder::find_homologous_paths()
                     return detect_homologous_paths_from_sources_(
                         task.srcs,
                         params,
-                        bubble_pairs
+                        bubble_branch_pairs_
                     );
                 }
             )
@@ -1864,7 +1864,7 @@ bool HomologousPathEnumerator::extend_path_(size_t i, bool include_current)
     if (include_current && finder_.homo_extend_bp_ > 0 && current_len >= finder_.homo_extend_bp_) {
         add_to_sketch(current_seq);
         ends_[i] = cur_[i];
-        // log_.sequence(current_seq);
+        log_.sequence(std::to_string(current_seq.size()));
         return true;
     }
 
@@ -1891,7 +1891,7 @@ bool HomologousPathEnumerator::extend_path_(size_t i, bool include_current)
     if (paths.empty() || paths.front().size() < 2) {
         if (include_current) {
             add_to_sketch(current_seq);
-            // log_.sequence(current_seq);
+            log_.sequence(std::to_string(current_seq.size()));
         }
 
         freeze();
@@ -1927,7 +1927,7 @@ bool HomologousPathEnumerator::extend_path_(size_t i, bool include_current)
         walks_[i].push_back(v.vertex_id());
     }
 
-    // log_.sequence(std::string(added_seq));
+    log_.sequence(std::to_string(added_seq.size()));
 
     return true;
 }
