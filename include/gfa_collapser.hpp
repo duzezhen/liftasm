@@ -15,23 +15,45 @@
 
 #include "bindings/cpp/WFAligner.hpp"
 
+class LongNodeSplitter {
+public:
+    static uint64_t split(GfaGraph& graph, uint32_t min_length, uint32_t chunk_length);
+};
+
 class GfaCollapser : public GfaDeoverlapper {
 
 public:
     GfaCollapser(
         double min_jaccard, 
-        int min_eq, double 
-        min_match_ratio, 
+        int min_eq,
+        double min_match_ratio,
+        double min_ali_ratio,
+        uint8_t min_mapq,
         int max_prop_iters, 
         uint32_t homo_k, 
         uint32_t homo_w,
+        uint32_t all_pair_len,
         uint32_t repeat_mask_min_len,
         uint32_t repeat_mask_max_period,
         uint32_t repeat_mask_max_mismatch, 
         uint32_t max_abnormal_cut_len,
-        uint32_t min_abnormal_cut_count
+        uint32_t min_abnormal_cut_count, 
+        uint32_t min_trans_len,
+        std::string mm2_preset
     )
-    : GfaDeoverlapper(min_eq, min_match_ratio, max_prop_iters, max_abnormal_cut_len, min_abnormal_cut_count), mm_opt_{/*k=*/homo_k, /*w=*/homo_w, /*seek_reverse=*/false, /*seed=*/0x8a5cd789635d2dffULL}
+        : GfaDeoverlapper(
+            min_eq,
+            min_match_ratio,
+            min_ali_ratio,
+            min_mapq,
+            max_prop_iters,
+            max_abnormal_cut_len,
+            min_abnormal_cut_count,
+            min_trans_len,
+            mm2_preset
+        ),
+        mm_opt_{/*k=*/homo_k, /*w=*/homo_w, /*seek_reverse=*/false, /*seed=*/0x8a5cd789635d2dffULL},
+        ALL_PAIR_LEN_(all_pair_len)
     {
         MIN_JACCARD_FOR_ALIGN_ = min_jaccard;
         REPEAT_MASK_MIN_LEN_ = repeat_mask_min_len;
@@ -52,20 +74,29 @@ public:
     */
     void merge_linear_chains();
 
+    void normalize_homopolymer_bubbles(
+        const std::vector<GfaBubble::Bubble>& bubbles,
+        uint32_t max_path_len
+    );
+
+    void disable_repeat_mask() {
+        REPEAT_MASK_MIN_LEN_ = 0;
+        REPEAT_MASK_MAX_PERIOD_ = 0;
+        REPEAT_MASK_MAX_MISMATCH_ = 0;
+    }
+
     /**
      * @brief Collapse homologous sequences within bubbles/paths into a single node.
      * @date 2026-04-03
      * @version 0.1.3
      * 
      * @param bubbles          list of bubbles detected in the graph
-     * @param forks            list of fork groups detected in the graph
      * @param homologous_paths list of homologous paths detected in the graph
      * @param prefix           prefix for output files
      * @param bubble_finder    reference to the bubble finder object
      */
     void collapse_homologous_seq(
         const std::vector<GfaBubble::Bubble>& bubbles, 
-        const std::vector<GfaBubble::ForkGroup>& forks, 
         const std::vector<GfaBubble::HomologousPath>& homologous_paths, 
         const std::string& prefix, 
         const GfaBubble::GfaBubbleFinder& bubble_finder
@@ -78,6 +109,7 @@ protected:
     uint32_t REPEAT_MASK_MAX_PERIOD_ = 12;   // maximum tandem-repeat period to test
     uint32_t REPEAT_MASK_MAX_MISMATCH_ = 2;  // maximum mismatches allowed in a repeat window
     const minimizerdna::Options mm_opt_;     // Used to calculate Jaccard similarity between two homologous paths
+    const uint32_t ALL_PAIR_LEN_;
 
 private:
     /* -------------------------------------------- merge_linear_chains -------------------------------------------- */
@@ -109,6 +141,8 @@ private:
 
     std::vector<BubbleAlignment> align_paths_(
         const std::vector<std::vector<uint32_t>>& paths, 
+        const std::vector<uint32_t>& clusters,
+        GfaBubble::Type path_type,
         const bool skip_same_start,
         std::shared_ptr<path_pair_split::ComparedIndex> shared_cmp,
         std::shared_ptr<std::shared_mutex> shared_cmp_mutex, 
@@ -121,13 +155,11 @@ private:
      * @version 0.1.3
      * 
      * @param bubbles          list of bubbles detected in the graph
-     * @param forks            list of fork groups detected in the graph
      * @param homologous_paths list of homologous paths detected in the graph
      * @param bubble_finder    reference to the bubble finder object
      */
     void homologous_align_(
         const std::vector<GfaBubble::Bubble>& bubbles, 
-        const std::vector<GfaBubble::ForkGroup>& forks, 
         const std::vector<GfaBubble::HomologousPath>& homologous_paths, 
         const GfaBubble::GfaBubbleFinder& bubble_finder
     );

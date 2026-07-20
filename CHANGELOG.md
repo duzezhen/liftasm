@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.1.3-r12 (2026-07-17)
+
+### Fixed
+
+- Fixed several cycle-inducing issues in `collapse`.
+
+## v0.1.3-r11 (2026-06-14)
+
+### Added
+
+- Fallback to `align_short_mm2_()` when `align_mm2_()` returns no hits.
+
+### Improved
+
+- Reduced the time complexity of `build_bubble_branch_pairs_()`.
+
+## v0.1.3-r10 (2026-06-12)
+
+### Added
+
+- Added `--min_ali_ratio` and `--min_mapq` parameters to the `deoverlap` and `collapse` subcommands to filter low-confidence alignments that may introduce cycles.
+- Added the `liftasm split` subcommand to separate GFA file(s) by connected component.
+
+### Changed
+
+- Prevented merging of uniquely connected nodes when their `SN:Z:` sample origins differ.
+- Simplified homologous path/bubble comparison by using the longest path as the reference and aligning all other paths against it.
+
+## v0.1.3-r9 (2026-06-04)
+
+### Added
+
+- Added `-n, --name` to the `bubble`, `deoverlap`, and `collapse` subcommands.
+- Merged segments now record sample origins using the `SN:Z:` tag.
+- `--min_eq` in `collapse` now accepts multiple values for iterative collapse.
+-  Added `-x, --preset` to the `deoverlap` and `collapse` subcommands to specify the alignment mode.
+
+### Improved
+
+- Faster path traversal using sample-origin information.
+- VCF output from `bubble` now includes per-sample genotypes.
+
 ## v0.1.3-r8 (2026-05-29)
 
 ### Changed

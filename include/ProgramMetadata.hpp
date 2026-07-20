@@ -7,9 +7,9 @@
 namespace program {
 
 inline constexpr const char* name        = "liftasm";
-inline constexpr const char* description = "Alignment-based coordinate liftover for assemblies and GFA graphs.";
-inline constexpr const char* version     = "0.1.3-r8";
-inline constexpr const char* build_date  = "2026/05/29";
+inline constexpr const char* description = "Merge, de-overlap, and collapse hifiasm GFA assembly graphs.";
+inline constexpr const char* version     = "0.1.3-r12";
+inline constexpr const char* build_date  = "2026/07/16";
 inline constexpr const char* author      = "Zezhen Du";
 inline constexpr const char* email       = "dzz0539@gmail.com or dzz0539@163.com";
 

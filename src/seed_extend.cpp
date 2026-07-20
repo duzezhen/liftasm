@@ -78,11 +78,30 @@ void run_wfa_fragment(
     int& score_out, 
     const opt::ExtendOpts& ExtendOpts
 ) {
-    WFAlignerGapAffine aligner(ExtendOpts.match, ExtendOpts.gap_open, ExtendOpts.gap_extend, ExtendOpts.mismatch, WFAligner::Alignment, WFAligner::MemoryHigh);
-    aligner.alignEnd2End(rseq.data(), int(rseq.size()), qseq.data(), int(qseq.size()));
-    int sc = aligner.getAlignmentScore();
+    cigar_out.clear();
+    score_out = 0;
+
+    if (rseq.empty() || qseq.empty() || rseq.size() > static_cast<size_t>(INT_MAX) || qseq.size() > static_cast<size_t>(INT_MAX)) {
+        return;
+    }
+
+    WFAlignerGapAffine aligner(
+        ExtendOpts.match,
+        ExtendOpts.mismatch,
+        ExtendOpts.gap_open,
+        ExtendOpts.gap_extend,
+        WFAligner::Alignment,
+        WFAligner::MemoryHigh
+    );
+
+    const auto status = aligner.alignEnd2End(
+        rseq.data(), static_cast<int>(rseq.size()),
+        qseq.data(), static_cast<int>(qseq.size())
+    );
+    if (status != WFAligner::StatusAlgCompleted) return;
+
     cigar_out = aligner.getCIGAR(true);
-    score_out = sc;
+    score_out = aligner.getAlignmentScore();
 }
 
 /* ================================================================== */

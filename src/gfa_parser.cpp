@@ -2,6 +2,7 @@
 #include "../include/gfa_walker.hpp"
 #include "../include/gfa_name.hpp"
 #include "../include/gfa_name_check.hpp"
+#include "../include/progress_tracker.hpp"
 
 #include <iomanip>
 #include <cstring>
@@ -9,25 +10,86 @@
 #include <iterator>
 #include <stack>
 #include <queue>
+#include <sstream>
 #include <unordered_set>
 #include <algorithm>
 
 using namespace wfa; // WFAlignerGapAffine
 
+
+// ------------------------------------------------ Helper functions ------------------------------------------------
+static std::string gfa_sample_name_from_path_(const std::string& path) {
+    size_t p = path.find_last_of("/\\");
+    std::string s = (p == std::string::npos) ? path : path.substr(p + 1);
+
+    auto strip = [&](const std::string& suf) {
+        if (s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0) {
+            s.resize(s.size() - suf.size());
+            return true;
+        }
+        return false;
+    };
+
+    if (!strip(".gfa.gz")) {
+        strip(".gfa");
+        strip(".gz");
+    }
+
+    // If the file is a collapse or deoverlap graph, don't add anything tag to the nodes.
+    if (s.find(".collapse") != std::string::npos ||
+        s.find(".deoverlap") != std::string::npos) {
+        return "";
+    }
+
+    static const char* hifiasm_suffixes[] = {
+        ".asm.bp.hap1.p_ctg.noseq",
+        ".asm.bp.hap2.p_ctg.noseq",
+        ".asm.bp.hap1.p_ctg",
+        ".asm.bp.hap2.p_ctg",
+
+        ".asm.bp.p_ctg.noseq",
+        ".asm.bp.p_ctg",
+
+        ".asm.bp.p_utg.noseq",
+        ".asm.bp.p_utg",
+
+        ".asm.bp.r_utg.noseq",
+        ".asm.bp.r_utg",
+
+        ".asm.bp.hap1.p_ctg.lowQ",
+        ".asm.bp.hap2.p_ctg.lowQ",
+        ".asm.bp.p_ctg.lowQ",
+        ".asm.bp.p_utg.lowQ",
+        ".asm.bp.r_utg.lowQ"
+    };
+
+    for (auto suf : hifiasm_suffixes) {
+        if (strip(suf)) break;
+    }
+
+    return s.empty() ? "gfa" : s;
+}
+
+
 GfaGraph::GfaGraph()  = default;
 GfaGraph::~GfaGraph() = default;
 
 // Load GFA file(s) into the graph structure
-void GfaGraph::load_from_GFA(const std::vector<std::string>& filenames) {
+void GfaGraph::load_from_GFA(const std::vector<std::string>& filenames, const std::vector<std::string>& sample_names) {
     if (filenames.empty()) {
         error_stream() << "No GFA input file provided.\n";
+        std::exit(1);
+    }
+
+    if (!sample_names.empty() && sample_names.size() != filenames.size()) {
+        error_stream() << "-n/--name must have the same number of values as -g/--gfa\n";
         std::exit(1);
     }
 
     std::vector<gfa_name_check::FileRenamePlan> plans;
     plans.reserve(filenames.size());
 
-    /* pass-1: register S names file by file */
+    // pass-1: register S names file by file, and check for duplicates and invalid names
     for (const auto& filename : filenames) {
         gfa_name_check::FileRenamePlan plan(/*max_log_examples=*/5);
 
@@ -56,12 +118,15 @@ void GfaGraph::load_from_GFA(const std::vector<std::string>& filenames) {
 
     nodes_.resize(total_segments_);
 
-    /* pass-2: rewrite names with the corresponding file plan, then parse */
+    // pass-2: rewrite names with the corresponding file plan, then parse lines to build the graph
     for (std::size_t i = 0; i < filenames.size(); ++i) {
         const auto& filename = filenames[i];
         const auto& plan = plans[i];
 
-        log_stream() << "Loading genome graph from '" << filename << "' ...\n";
+        const uint32_t source_id = static_cast<uint32_t>(i);
+        const std::string sample_name = sample_names.empty() ? gfa_sample_name_from_path_(filename) : sample_names[i];
+
+        log_stream() << "Loading genome graph from '" << filename << "' (SN Tag: " << (sample_name.empty() ? "N/A" : sample_name) << ") ...\n";
 
         GzChunkReader zr(filename);
         std::string line;
@@ -78,7 +143,7 @@ void GfaGraph::load_from_GFA(const std::vector<std::string>& filenames) {
             ss.str(line);
 
             switch (type) {
-                case 'S': parseSLine(ss); break;
+                case 'S': parseSLine(ss, sample_name); break;
                 case 'L': parseLLine(ss); break;
                 case 'P': parsePLine(ss); break;
                 case 'A': parseALine(ss); break;
@@ -344,18 +409,37 @@ GfaArc* GfaGraph::add_arc(
 /*------------------------------------------------------------*/
 /*                      S-line parser                         */
 /*------------------------------------------------------------*/
-bool GfaGraph::parseSLine(std::stringstream& ss) {
+bool GfaGraph::parseSLine(std::stringstream& ss, const std::string& sample_name) {
+    // ------------------------------------------------ S  Name  seq ------------------------------------------------
     char c; std::string name, seq;
     ss >> c >> name >> seq;
     uint32_t len = 0; bool ln_tag_found = false;
     std::string rest; std::getline(ss, rest);
 
+    // ------------------------------------------------ AUX ------------------------------------------------
     auto aux_vec = GfaAuxParser::parse_aux_string(rest);
 
-    // check for LN tag
+    // ------------------------------------------------ SN tag ------------------------------------------------
+    std::vector<uint32_t> sample_ids;
+    const uint8_t* pSN = GfaAuxParser::get_aux_data(aux_vec, "SN");
+    if (pSN && *pSN == 'Z') {
+        sample_ids = parse_sample_csv_(reinterpret_cast<const char*>(pSN + 1));
+        has_node_source_tag_ = true;
+        GfaAuxParser::delete_aux_tag(aux_vec, pSN);
+    }
+
+    uint32_t file_sample_id = intern_sample_(sample_name);
+    if (file_sample_id != UINT32_MAX) {
+        sample_ids.push_back(file_sample_id);
+        has_node_source_tag_ = true;
+    }
+
+    std::sort(sample_ids.begin(), sample_ids.end());
+    sample_ids.erase(std::unique(sample_ids.begin(), sample_ids.end()), sample_ids.end());
+
+    // ------------------------------------------------ LN tag ------------------------------------------------
     const uint8_t* pLN = GfaAuxParser::get_aux_data(aux_vec, "LN");
     if (pLN && *pLN == 'i') {
-        // len = *reinterpret_cast<const int32_t*>(pLN + 1);
         int32_t tmp = 0;
         std::memcpy(&tmp, pLN + 1, sizeof(tmp));
         if (tmp < 0) tmp = 0;
@@ -367,24 +451,42 @@ bool GfaGraph::parseSLine(std::stringstream& ss) {
         len = (seq == "*") ? 0u : static_cast<uint32_t>(seq.length());
     }
 
-    // check for SR tag
+    // ------------------------------------------------ SR tag ------------------------------------------------
     const uint8_t* pSR = GfaAuxParser::get_aux_data(aux_vec, "SR");
     if (pSR && *pSR == 'i') {
-        int32_t rank = *reinterpret_cast<const int32_t*>(pSR + 1);
-        if (static_cast<uint32_t>(rank) > max_rank_) {
+        int32_t rank = 0;
+        std::memcpy(&rank, pSR + 1, sizeof(rank));
+        if (rank > 0 && static_cast<uint32_t>(rank) > max_rank_) {
             max_rank_ = static_cast<uint32_t>(rank);
         }
         GfaAuxParser::delete_aux_tag(aux_vec, pSR);
     }
 
+    // ------------------------------------------------ CX tag (complex) ------------------------------------------------
+    bool is_complex = false;
+    const uint8_t* pCX = GfaAuxParser::get_aux_data(aux_vec, "CX");
+    if (pCX && *pCX == 'i') {
+        int32_t x = 0;
+        std::memcpy(&x, pCX + 1, sizeof(x));
+        is_complex = (x != 0);
+        GfaAuxParser::delete_aux_tag(aux_vec, pCX);
+    }
+
+    // ------------------------------------------------ Node index ------------------------------------------------
     uint32_t id = get_or_add_segment(name);
     GfaNode& n = nodes_[id];
     n.name = name;
     std::transform(seq.begin(), seq.end(), seq.begin(), [](unsigned char c) { return std::toupper(c); });  // 2026-04-16
     n.sequence = seq;
     n.length = len;
-    n.aux.aux_data = std::move(aux_vec);
+    merge_sample_ids_into(n.sample_ids, sample_ids);
+    n.is_complex = n.is_complex || is_complex;
+    GfaAux incoming_aux;
+    incoming_aux.aux_data = std::move(aux_vec);
+    merge_variant_tags_into(incoming_aux, n.aux);
+    n.aux = std::move(incoming_aux);
     total_segment_length_ += len;
+
     return true;
 }
 
@@ -576,10 +678,21 @@ void GfaGraph::finalize_() {
 
 /*------------------  step1: mark empty seg ------------------*/
 void GfaGraph::fixNoSeg() {
+    bool found = false;
     for (auto& n : nodes_) {
-        if (n.length == 0) {
+        if (!n.deleted && n.length == 0) {
             n.deleted = true;
+            found = true;
             warning_stream() << "  ! Delete zero-length segment '" << n.name << "'\n";
+        }
+    }
+
+    if (!found) return;
+    for (GfaArc& a : arcs_) {
+        const uint32_t v = a.get_source_segment_id();
+        const uint32_t w = a.get_target_segment_id();
+        if ((v < nodes_.size() && nodes_[v].deleted) || (w < nodes_.size() && nodes_[w].deleted)) {
+            a.set_del(true);
         }
     }
 }
@@ -753,6 +866,8 @@ void GfaGraph::countLinks() {
 
 /*------------------  step9: calculate degree -----------------*/
 void GfaGraph::calculateDeg() {
+    total_deg_ = 0;
+    max_deg_ = 0;
     for (size_t i = 0; i < arc_indexs_.size(); ++i) {
         uint32_t count = static_cast<uint32_t>(arc_indexs_[i]);  // low 32 bits are the count
         total_deg_ += count;
@@ -845,43 +960,6 @@ std::vector<const GfaArc*> GfaGraph::getArcsToVertex(uint32_t v, bool skip_self)
     return in;
 }
 
-// ---- GfaGraph::walk_dfs ----
-std::vector<PathSequence>
-GfaGraph::walk_dfs(
-    uint32_t start_v,
-    bool to_direction,
-    uint32_t max_paths,
-    uint32_t max_steps,
-    uint32_t /*max_bases*/
-) const {
-    GfaWalker walker(*this);
-    WalkDir dir = to_direction ? WalkDir::To : WalkDir::From;
-    return walker.dfs(start_v, dir, max_paths, max_steps);
-}
-
-// ---- GfaGraph::walk_bfs ----
-std::vector<PathSequence>
-GfaGraph::walk_bfs(
-    uint32_t start_v,
-    bool to_direction,
-    uint32_t max_paths,
-    uint32_t max_steps,
-    uint32_t /*max_bases*/
-) const {
-    GfaWalker walker(*this);
-    WalkDir dir = to_direction ? WalkDir::To : WalkDir::From;
-    return walker.bfs(start_v, dir, max_paths, max_steps);
-}
-
-std::vector<std::vector<uint32_t>> GfaGraph::enumerate_paths_DFS(
-    const uint32_t src, const uint32_t sink, const std::unordered_set<uint32_t>& region_set,
-    const uint32_t max_depth, const uint32_t max_paths,
-    const bool skip_comp, bool& hit_limits, const uint64_t DFS_guard, const uint32_t stall_round_limit
-) const {
-    GfaWalker walker(*this);
-    return walker.enumerate_paths_DFS(src, sink, region_set, max_depth, max_paths, skip_comp, hit_limits, DFS_guard, stall_round_limit);
-};
-
 std::vector<std::vector<uint32_t>> GfaGraph::enumerate_paths_greedy_DFS(
     const uint32_t src, const uint32_t sink, const std::unordered_set<uint32_t>& region_set,
     const uint32_t max_depth, const uint32_t max_paths,
@@ -891,12 +969,26 @@ std::vector<std::vector<uint32_t>> GfaGraph::enumerate_paths_greedy_DFS(
     return walker.enumerate_paths_greedy_DFS(src, sink, region_set, max_depth, max_paths, skip_comp, hit_limits, DFS_guard, stall_round_limit);
 };
 
+std::vector<std::vector<uint32_t>> GfaGraph::open_walk(
+    const uint32_t src,
+    const std::unordered_set<uint32_t>& region_set,
+    const uint32_t max_depth,
+    const bool skip_comp,
+    const uint64_t DFS_guard,
+    const uint64_t walk_bp,
+    const std::unordered_set<uint32_t>* blocked_seg
+) const {
+    GfaWalker walker(*this);
+    return walker.open_walk(src, region_set, max_depth, skip_comp, DFS_guard, walk_bp, blocked_seg);
+}
+
 
 bool GfaGraph::build_nodes_connectivity_index(bool skip_comp)
 {
     log_stream() << "Building nodes connectivity index ...\n";
 
     std::vector<uint32_t>().swap(connectivity_index_);  // clear and free memory
+    std::vector<uint32_t>().swap(connectivity_sizes_);
 
     const uint32_t nseg = static_cast<uint32_t>(getNumNodes());
     connectivity_index_.assign(nseg, UINT32_MAX);
@@ -944,6 +1036,11 @@ bool GfaGraph::build_nodes_connectivity_index(bool skip_comp)
         connectivity_index_[s] = root_to_comp[r];
     }
 
+    connectivity_sizes_.assign(ncomp, 0);
+    for (uint32_t cid : connectivity_index_) {
+        if (cid != UINT32_MAX) ++connectivity_sizes_[cid];
+    }
+
     log_stream() << "  - Nodes connectivity components indexed: " << ncomp << "\n" << "\n";
 
     return true;
@@ -958,6 +1055,12 @@ uint32_t GfaGraph::node_connectivity_id(Vertex v) const
     const uint32_t sid = v.segment_id();
     if (sid >= connectivity_index_.size()) return UINT32_MAX;
     return connectivity_index_[sid];
+}
+
+uint32_t GfaGraph::node_connectivity_size(Vertex v) const
+{
+    const uint32_t cid = node_connectivity_id(v);
+    return cid < connectivity_sizes_.size() ? connectivity_sizes_[cid] : 0;
 }
 
 bool GfaGraph::nodes_connected(Vertex a, Vertex b) const
@@ -982,6 +1085,7 @@ bool GfaGraph::build_vertex_topological_index(bool skip_comp)
         return sid < nseg && !getNodeDeleted(sid);
     };
 
+    std::vector<uint8_t> self_loop(V, 0);
     std::vector<uint32_t> disc(V, UINT32_MAX);
     std::vector<uint32_t> low(V, UINT32_MAX);
     std::vector<uint8_t> on_stack(V, 0);
@@ -1003,7 +1107,12 @@ bool GfaGraph::build_vertex_topological_index(bool skip_comp)
             if (!a || a->get_del() || (skip_comp && a->get_comp())) continue;
 
             const uint32_t w = a->get_target_vertex_id();
-            if (w == u || !valid_vertex(w)) continue;
+            if (!valid_vertex(w)) continue;
+
+            if (w == u) {
+                self_loop[u] = 1;
+                continue;
+            }
 
             if (disc[w] == UINT32_MAX) {
                 dfs(w);
@@ -1105,7 +1214,7 @@ bool GfaGraph::build_vertex_topological_index(bool skip_comp)
         topo_index_[v].scc_id = c;
         topo_index_[v].topo_rank = comp_rank[c];
         topo_index_[v].scc_size = comp_size[c];
-        topo_index_[v].in_cycle = (comp_size[c] > 1);
+        topo_index_[v].in_cycle = (comp_size[c] > 1) || self_loop[v];
     }
 
     log_stream() << "  - SCCs: " << C << "\n";
@@ -1156,6 +1265,17 @@ uint32_t GfaGraph::vertex_topo_rank(Vertex v) const
     return topo_index_[vid].topo_rank;
 }
 
+ bool GfaGraph::vertex_in_cycle(Vertex v) const
+{
+    if (topo_index_.empty()) {
+        warning_stream() << "  ! Topological index not built yet\n";
+        return false;
+    }
+    const uint32_t vid = v.vertex_id();
+    if (vid >= topo_index_.size()) return false;
+    return topo_index_[vid].in_cycle;
+}
+
 const GfaTopoIndex& GfaGraph::vertex_topo_info(Vertex v) const
 {
     static const GfaTopoIndex empty;
@@ -1168,7 +1288,314 @@ const GfaTopoIndex& GfaGraph::vertex_topo_info(Vertex v) const
     return topo_index_[vid];
 }
 
+void GfaGraph::detect_complex_regions(
+    uint16_t branch_degree,
+    uint16_t hub_degree,
+    uint32_t min_nodes,
+    uint32_t min_branches,
+    bool skip_comp
+) {
+    log_stream() << "Detecting complex graph regions ...\n";
 
+    if (nodes_.empty()) return;
+
+    const uint32_t segment_count = static_cast<uint32_t>(nodes_.size());
+    std::vector<std::vector<uint32_t>> adjacent(segment_count);
+    std::vector<uint8_t> self_loop(segment_count, 0);
+
+    for (const GfaArc& arc : arcs_) {
+        if (arc.get_del() || (skip_comp && arc.get_comp())) continue;
+
+        const uint32_t v = arc.get_source_vertex_id();
+        const uint32_t w = arc.get_target_vertex_id();
+        const uint32_t from = Vertex::get_segment_id(v);
+        const uint32_t to = Vertex::get_segment_id(w);
+        if (from >= segment_count || to >= segment_count) continue;
+        if (nodes_[from].deleted || nodes_[to].deleted) continue;
+
+        if (from == to) {
+            self_loop[from] = 1;
+        } else {
+            adjacent[from].push_back(to);
+            adjacent[to].push_back(from);
+        }
+    }
+
+    for (std::vector<uint32_t>& xs : adjacent) {
+        std::sort(xs.begin(), xs.end());
+        xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
+    }
+
+    auto mark = [&](uint32_t sid, uint64_t& count) {
+        if (sid >= segment_count || nodes_[sid].deleted || nodes_[sid].is_complex) return;
+        nodes_[sid].is_complex = true;
+        ++count;
+    };
+
+    uint64_t cycle_nodes = 0;
+    uint64_t tangle_blocks = 0;
+    uint64_t tangle_nodes = 0;
+
+    for (uint32_t sid = 0; sid < segment_count; ++sid) {
+        if (self_loop[sid]) mark(sid, cycle_nodes);
+    }
+
+    {
+        struct DfsFrame { uint32_t node; size_t next; };
+
+        std::vector<uint32_t> discover(segment_count, UINT32_MAX);
+        std::vector<uint32_t> low(segment_count, UINT32_MAX);
+        std::vector<uint32_t> parent(segment_count, UINT32_MAX);
+        std::vector<uint64_t> edge_stack;
+        std::vector<DfsFrame> dfs;
+
+        std::vector<uint32_t> block_degree(segment_count, 0);
+        std::vector<uint32_t> block_stamp(segment_count, 0);
+        std::vector<uint32_t> block_index(segment_count, 0);
+        std::vector<uint32_t> block_nodes;
+        uint32_t time = 0;
+        uint32_t stamp = 0;
+
+        auto emit_block = [&](uint32_t stop_from, uint32_t stop_to) {
+            if (++stamp == 0) {
+                std::fill(block_stamp.begin(), block_stamp.end(), 0);
+                stamp = 1;
+            }
+
+            block_nodes.clear();
+            uint32_t block_edges = 0;
+            while (!edge_stack.empty()) {
+                const uint64_t packed = edge_stack.back();
+                edge_stack.pop_back();
+                const uint32_t a = static_cast<uint32_t>(packed >> 32);
+                const uint32_t b = static_cast<uint32_t>(packed);
+
+                if (block_stamp[a] != stamp) {
+                    block_stamp[a] = stamp;
+                    block_degree[a] = 0;
+                    block_nodes.push_back(a);
+                }
+                if (block_stamp[b] != stamp) {
+                    block_stamp[b] = stamp;
+                    block_degree[b] = 0;
+                    block_nodes.push_back(b);
+                }
+                ++block_degree[a];
+                ++block_degree[b];
+                ++block_edges;
+                if (a == stop_from && b == stop_to) break;
+            }
+
+            for (uint32_t i = 0; i < block_nodes.size(); ++i) {
+                const uint32_t v = block_nodes[i];
+                block_index[v] = i;
+            }
+
+            const uint32_t n = static_cast<uint32_t>(block_nodes.size());
+            std::vector<uint8_t> visited(n, 0);
+            std::vector<uint8_t> local_seen(n, 0);
+            std::vector<uint32_t> work;
+            std::vector<uint32_t> group;
+            std::vector<uint32_t> local_nodes;
+            std::vector<uint32_t> complex_nodes;
+            std::vector<uint8_t> selected(n, 0);
+            uint32_t complex_groups = 0;
+
+            for (uint32_t seed = 0; seed < n; ++seed) {
+                if (visited[seed] || block_degree[block_nodes[seed]] < branch_degree) continue;
+
+                visited[seed] = 1;
+                work.assign(1, seed);
+                group.clear();
+                bool group_has_hub = false;
+
+                while (!work.empty()) {
+                    const uint32_t i = work.back();
+                    work.pop_back();
+                    group.push_back(i);
+                    group_has_hub = group_has_hub || block_degree[block_nodes[i]] >= hub_degree;
+
+                    for (uint32_t w : adjacent[block_nodes[i]]) {
+                        if (block_stamp[w] != stamp) continue;
+                        const uint32_t j = block_index[w];
+                        if (!visited[j] && block_degree[w] >= branch_degree) {
+                            visited[j] = 1;
+                            work.push_back(j);
+                        }
+                    }
+                }
+
+                local_nodes.clear();
+                for (uint32_t i : group) {
+                    if (!local_seen[i]) {
+                        local_seen[i] = 1;
+                        local_nodes.push_back(i);
+                    }
+                    for (uint32_t w : adjacent[block_nodes[i]]) {
+                        if (block_stamp[w] != stamp) continue;
+                        const uint32_t j = block_index[w];
+                        if (!local_seen[j]) {
+                            local_seen[j] = 1;
+                            local_nodes.push_back(j);
+                        }
+                    }
+                }
+
+                const bool complex_group = group.size() >= min_branches &&
+                    (group_has_hub || local_nodes.size() >= min_nodes);
+                if (complex_group) {
+                    ++complex_groups;
+                    for (uint32_t i : group) {
+                        selected[i] = 1;
+                        complex_nodes.push_back(block_nodes[i]);
+                    }
+                }
+                for (uint32_t i : local_nodes) local_seen[i] = 0;
+            }
+
+            // Recover simple paths internal to the tangle, but do not extend along arms
+            // that touch the complex core at only one end.
+            std::vector<uint8_t> simple_seen(n, 0);
+            std::vector<uint8_t> touch_seen(n, 0);
+            std::vector<uint32_t> touches;
+            for (uint32_t seed = 0; seed < n; ++seed) {
+                if (simple_seen[seed] || block_degree[block_nodes[seed]] >= branch_degree) continue;
+
+                simple_seen[seed] = 1;
+                work.assign(1, seed);
+                group.clear();
+                touches.clear();
+
+                while (!work.empty()) {
+                    const uint32_t i = work.back();
+                    work.pop_back();
+                    group.push_back(i);
+
+                    for (uint32_t w : adjacent[block_nodes[i]]) {
+                        if (block_stamp[w] != stamp) continue;
+                        const uint32_t j = block_index[w];
+                        if (block_degree[w] < branch_degree) {
+                            if (!simple_seen[j]) {
+                                simple_seen[j] = 1;
+                                work.push_back(j);
+                            }
+                        } else if (selected[j] && !touch_seen[j]) {
+                            touch_seen[j] = 1;
+                            touches.push_back(j);
+                        }
+                    }
+                }
+
+                if (touches.size() >= 2) {
+                    for (uint32_t i : group) {
+                        selected[i] = 1;
+                        complex_nodes.push_back(block_nodes[i]);
+                    }
+                }
+                for (uint32_t i : touches) touch_seen[i] = 0;
+            }
+
+            const bool complex = !complex_nodes.empty();
+
+            if (DEBUG_ENABLED) {
+                std::vector<uint32_t> boundaries;
+                for (uint32_t v : block_nodes) {
+                    for (uint32_t w : adjacent[v]) {
+                        if (block_stamp[w] != stamp) {
+                            boundaries.push_back(v);
+                            break;
+                        }
+                    }
+                }
+                std::sort(boundaries.begin(), boundaries.end());
+
+                std::ostringstream line;
+                line << "  - Block boundary=";
+                if (boundaries.empty()) {
+                    line << '-';
+                } else {
+                    for (size_t i = 0; i < boundaries.size(); ++i) {
+                        if (i) line << ',';
+                        line << nodes_[boundaries[i]].name;
+                    }
+                }
+                const double average_degree = block_nodes.empty() ? 0.0 : 2.0 * static_cast<double>(block_edges) / block_nodes.size();
+                line << " complex=" << (complex ? "yes" : "no")
+                     << " complex_nodes=" << complex_nodes.size()
+                     << " avg_degree=" << std::fixed << std::setprecision(2) << average_degree << '\n';
+                debug_stream() << line.str();
+            }
+
+            if (complex) {
+                tangle_blocks += complex_groups;
+                for (uint32_t sid : complex_nodes) mark(sid, tangle_nodes);
+            }
+        };
+
+        for (uint32_t root = 0; root < segment_count; ++root) {
+            if (nodes_[root].deleted || discover[root] != UINT32_MAX) continue;
+            discover[root] = low[root] = time++;
+            dfs.push_back({root, 0});
+
+            while (!dfs.empty()) {
+                DfsFrame& frame = dfs.back();
+                const uint32_t u = frame.node;
+                if (frame.next < adjacent[u].size()) {
+                    const uint32_t v = adjacent[u][frame.next++];
+                    if (discover[v] == UINT32_MAX) {
+                        parent[v] = u;
+                        edge_stack.push_back((static_cast<uint64_t>(u) << 32) | v);
+                        discover[v] = low[v] = time++;
+                        dfs.push_back({v, 0});
+                    } else if (v != parent[u] && discover[v] < discover[u]) {
+                        low[u] = std::min(low[u], discover[v]);
+                        edge_stack.push_back((static_cast<uint64_t>(u) << 32) | v);
+                    }
+                    continue;
+                }
+
+                dfs.pop_back();
+                const uint32_t p = parent[u];
+                if (p == UINT32_MAX) continue;
+                low[p] = std::min(low[p], low[u]);
+                if (low[u] >= discover[p]) emit_block(p, u);
+            }
+        }
+    }
+
+    uint64_t total = 0;
+    for (const GfaNode& n : nodes_) {
+        if (!n.deleted && n.is_complex) {
+            ++total;
+            log_stream() << "  - Complex node: " << n.name << " (length=" << n.length << ")\n";
+        }
+    }
+
+    log_stream() << "  - Self-loop nodes: " << cycle_nodes << "\n";
+    log_stream() << "  - Tangle blocks: " << tangle_blocks << "\n";
+    log_stream() << "  - Tangle nodes: " << tangle_nodes << "\n";
+    log_stream() << "  - Total complex nodes: " << total << "\n\n";
+}
+
+void GfaGraph::mark_segments_complex(const std::vector<uint32_t>& seg_ids)
+{
+    log_stream() << "Marking segments as complex ...\n";
+
+    size_t marked = 0;
+
+    for (uint32_t seg_id : seg_ids) {
+        if (seg_id >= nodes_.size()) continue;
+        if (nodes_[seg_id].deleted) continue;
+        if (nodes_[seg_id].is_complex) continue;
+
+        nodes_[seg_id].is_complex = true;
+        ++marked;
+    }
+
+    log_stream() << "  - Segments marked as complex: " << marked << "\n\n";
+
+    return;
+}
 
 namespace { inline uint64_t clamp0_i64(int64_t x){ return x>0 ? (uint64_t)x : 0ULL; } }
 bool GfaGraph::shortest_distance_between_offsets(
@@ -1252,44 +1679,51 @@ bool GfaGraph::shortest_distance_between_offsets(
 }
 
 
-uint32_t GfaGraph::add_segment(const std::string& name, const std::string& sequence, bool name_check) {
+uint32_t GfaGraph::add_segment(
+    const std::string& name,
+    const std::string& sequence,
+    bool name_check,
+    const std::vector<uint32_t>& sample_ids
+) {
     auto it = name_to_id_map_.find(name);
     if (it != name_to_id_map_.end()) {
         uint32_t existing_id = it->second;
-        auto& node = nodes_[existing_id];
-        const std::string& existing_seq = node.sequence;
+        GfaNode& node = nodes_[existing_id];
+        merge_sample_ids_into(node.sample_ids, sample_ids);
 
+        const std::string& existing_seq = node.sequence;
         if (name_check) {
-            if (existing_seq == sequence) {  // 2025-10-10: allow identical seq
-                return existing_id;
-            } else if (node.deleted) {  // 2025-10-10: previously deleted, now re-adding
+            if (existing_seq == sequence) return existing_id;
+
+            if (node.deleted) {
                 node.deleted = false;
                 node.sequence = sequence;
                 node.length = (sequence == "*") ? 0u : static_cast<uint32_t>(sequence.size());
                 total_segment_length_ += node.length;
                 return existing_id;
-            } else {
-                error_stream() << "Duplicated segment name with different sequence: " << name << "\n";
-                error_stream() << "  - Existing: " << existing_seq << "\n";
-                error_stream() << "  - New: " << sequence << "\n";
-                std::exit(1);
             }
-        } else {
-            return existing_id;
+
+            error_stream() << "Duplicated segment name with different sequence: " << name << "\n";
+            std::exit(1);
         }
+
+        return existing_id;
     }
+
     uint32_t id = static_cast<uint32_t>(total_segments_);
     name_to_id_map_[name] = id;
     nodes_.resize(id + 1);
+
     nodes_[id].name = name;
     nodes_[id].sequence = sequence;
-    nodes_[id].length = (sequence=="*") ? 0u : (uint32_t)sequence.size();
+    nodes_[id].length = (sequence == "*") ? 0u : static_cast<uint32_t>(sequence.size());
     nodes_[id].deleted = false;
+    nodes_[id].sample_ids = sample_ids;
+
     total_segment_length_ += nodes_[id].length;
     ++total_segments_;
 
-    // expand arc_indexs_ size: 2 vertexs per new segment
-    arc_indexs_.resize(total_segments_*2, 0);
+    arc_indexs_.resize(total_segments_ * 2, 0);
     return id;
 }
 
@@ -1623,11 +2057,34 @@ std::string GfaGraph::format_overlap_field(int32_t ov, int32_t ow) const {
 
 void GfaGraph::save_to_disk(
     const std::string& filename,
-    bool write_paths, bool write_align, bool write_seq
+    bool write_paths,
+    bool write_align,
+    bool write_seq,
+    const std::string& command_line
 ) const {
     SAVE saver(filename);
 
     std::ostringstream oss;
+
+    // 0. Header
+    oss << "H\tVN:Z:1.0\n";
+    oss << "H\tTS:Z:liftasm\n";
+    if (!command_line.empty()) {
+        std::string cl = command_line;
+        for (char& c : cl) {
+            if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+        }
+        oss << "H\tCL:Z:" << cl << "\n";
+    }
+    oss << "H\tSP:Z:" << (has_node_source_tag_ ? "present" : "absent") << "\n";
+    oss << "H\tCO:Z:  LN:i   segment length\n";
+    oss << "H\tCO:Z:  CX:i   complex node flag\n";
+    oss << "H\tCO:Z:  SN:Z   node source/sample names\n";
+    oss << "H\tCO:Z:  VT:Z   VCF-added variant category (--tag value)\n";
+    oss << "H\tCO:Z:  VI:Z   VCF variant ID\n";
+    saver.save(oss.str());
+    oss.str("");
+    oss.clear();
 
     // 1. S-lines
     for (uint32_t sid = 0; sid < nodes_.size(); ++sid) {
@@ -1637,6 +2094,9 @@ void GfaGraph::save_to_disk(
         if (n.sequence.empty() || n.sequence == "*" || !write_seq) oss << '*';
         else oss << n.sequence;
         oss << "\tLN:i:" << n.length;
+        const std::string sn = sample_ids_to_csv_(n.sample_ids);
+        if (!sn.empty()) oss << "\tSN:Z:" << sn;
+        if (n.is_complex) oss << "\tCX:i:1";
         oss << GfaAuxParser::write_aux_as_text(n.aux.aux_data);
         oss << '\n';
         saver.save(oss.str()); oss.str(""); oss.clear();
@@ -1767,4 +2227,149 @@ void GfaGraph::printArcIndex() const {
         uint64_t start = val >> 32;
         log_stream() << "idx[" << i << "]: start=" << start << ", count=" << count << '\n';
     }
+}
+
+
+// Used to identify samples from S-line tags and -n/--name, and to manage sample ID mappings. (v0.1.3-r9 2026-06-03)
+uint32_t GfaGraph::intern_sample_(const std::string& name) {
+    if (name.empty()) return UINT32_MAX;
+
+    auto it = sample_name_to_id_.find(name);
+    if (it != sample_name_to_id_.end()) return it->second;
+
+    uint32_t id = static_cast<uint32_t>(sample_id_to_name_.size());
+    sample_id_to_name_.push_back(name);
+    sample_name_to_id_.emplace(name, id);
+    return id;
+}
+
+std::vector<uint32_t> GfaGraph::parse_sample_csv_(const std::string& csv) {
+    std::vector<uint32_t> ids;
+    std::stringstream ss(csv);
+    std::string x;
+
+    while (std::getline(ss, x, ',')) {
+        if (x.empty()) continue;
+        uint32_t id = intern_sample_(x);
+        if (id != UINT32_MAX) ids.push_back(id);
+    }
+
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
+std::string GfaGraph::sample_ids_to_csv_(const std::vector<uint32_t>& ids) const {
+    std::string out;
+    for (uint32_t id : ids) {
+        if (id >= sample_id_to_name_.size()) continue;
+        if (!out.empty()) out.push_back(',');
+        out += sample_id_to_name_[id];
+    }
+    return out;
+}
+
+void GfaGraph::merge_sample_ids_into(std::vector<uint32_t>& dst, const std::vector<uint32_t>& src) const {
+    if (src.empty()) return;
+    if (dst.empty()) {
+        dst = src;
+        return;
+    }
+
+    std::vector<uint32_t> merged;
+    merged.reserve(dst.size() + src.size());
+    std::set_union(dst.begin(), dst.end(), src.begin(), src.end(), std::back_inserter(merged));
+    dst.swap(merged);
+}
+
+void GfaGraph::merge_variant_tags_into(GfaAux& dst, const GfaAux& src) const {
+    auto merge_one = [&](const char tag[2]) {
+        std::vector<std::string> values;
+        auto collect = [&](const std::vector<uint8_t>& aux) {
+            const uint8_t* ptr = GfaAuxParser::get_aux_data(aux, tag);
+            if (!ptr || *ptr != 'Z') return;
+            std::string csv(reinterpret_cast<const char*>(ptr + 1));
+            size_t beg = 0;
+            while (beg <= csv.size()) {
+                const size_t end = csv.find(',', beg);
+                std::string value = csv.substr(beg, end == std::string::npos ? std::string::npos : end - beg);
+                if (!value.empty()) values.push_back(std::move(value));
+                if (end == std::string::npos) break;
+                beg = end + 1;
+            }
+        };
+
+        collect(dst.aux_data);
+        collect(src.aux_data);
+        if (values.empty()) return;
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()), values.end());
+
+        const uint8_t* old = GfaAuxParser::get_aux_data(dst.aux_data, tag);
+        if (old) GfaAuxParser::delete_aux_tag(dst.aux_data, old);
+        std::string csv = values.front();
+        for (size_t i = 1; i < values.size(); ++i) csv += "," + values[i];
+        GfaAuxParser::append_str_tag(dst.aux_data, tag, csv);
+    };
+
+    merge_one("VT");
+    merge_one("VI");
+}
+
+bool GfaGraph::sample_ids_intersect(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) const {
+    size_t i = 0;
+    size_t j = 0;
+
+    while (i < a.size() && j < b.size()) {
+        if (a[i] == b[j]) return true;
+        if (a[i] < b[j]) ++i;
+        else ++j;
+    }
+
+    return false;
+}
+
+bool GfaGraph::sample_ids_equal_or_empty(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) const {
+    if (a.empty() || b.empty()) return true;
+    return a == b;
+}
+
+bool GfaGraph::intersect_node_sample(uint32_t a_seg, uint32_t b_seg) const {
+    if (a_seg >= nodes_.size() || b_seg >= nodes_.size()) return true;
+
+    const auto& a = getNodeSampleIds(a_seg);
+    const auto& b = getNodeSampleIds(b_seg);
+
+    if (a.empty() || b.empty()) return true;
+    return sample_ids_intersect(a, b);
+}
+
+bool GfaGraph::intersect_vertex_sample(uint32_t a_vtx, uint32_t b_vtx) const {
+    return intersect_node_sample(
+        NodeHandle::get_segment_id(a_vtx),
+        NodeHandle::get_segment_id(b_vtx)
+    );
+}
+
+bool GfaGraph::same_node_sample(uint32_t a_seg, uint32_t b_seg) const {
+    if (a_seg >= nodes_.size() || b_seg >= nodes_.size()) return true;
+
+    return sample_ids_equal_or_empty(
+        getNodeSampleIds(a_seg),
+        getNodeSampleIds(b_seg)
+    );
+}
+
+bool GfaGraph::same_vertex_sample(uint32_t a_vtx, uint32_t b_vtx) const {
+    return same_node_sample(
+        NodeHandle::get_segment_id(a_vtx),
+        NodeHandle::get_segment_id(b_vtx)
+    );
+}
+
+const std::vector<std::string>& GfaGraph::getSampleNames() const { return sample_id_to_name_; }
+
+const std::vector<uint32_t>& GfaGraph::getNodeSampleIds(uint32_t seg_id) const {
+    static const std::vector<uint32_t> empty;
+    return seg_id < nodes_.size() ? nodes_[seg_id].sample_ids : empty;
 }

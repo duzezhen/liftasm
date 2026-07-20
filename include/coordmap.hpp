@@ -124,7 +124,7 @@ public:
         tmp.reserve(1u << 20);
 
         for (const auto& path : paths) {
-            log_stream() << "Loading homology mappings from " << path << "...\n";
+            log_stream() << "Loading homology mappings from " << path << " ...\n";
 
             std::ifstream in(path);
             if (!in) {
@@ -551,6 +551,7 @@ public:
         name2id_.clear();
         id2name_.clear();
         idx_.clear();
+        warned_same_ctg_.clear();
     }
 
 private:
@@ -812,6 +813,17 @@ private:
         return s;
     }
 
+    void warn_same_ctg_once_(uint32_t ctg) const {
+        if (warned_same_ctg_.insert(ctg).second) {
+            constexpr size_t kMaxDetailedWarnings = 10;
+            if (warned_same_ctg_.size() <= kMaxDetailedWarnings) {
+                warning_stream() << "  ! Reference and query contig names must be different: " << contig_name(ctg) << "\n";
+            } else if (warned_same_ctg_.size() == kMaxDetailedWarnings + 1) {
+                warning_stream() << "  ! Reference and query contig names must be different: " << "too many cases; further warnings are suppressed.\n";
+            }
+        }
+    }
+
     // Example:
     //   A: [ [A1,100,110,+1], [A2,200,206,-1] ]   (total 10+6=16)
     //   B: [ [B1,500,508,+1], [B2,900,908,-1] ]   (total  8+8=16)
@@ -831,16 +843,8 @@ private:
             assert(pa.dir == +1 || pa.dir == -1);
             assert(pb.dir == +1 || pb.dir == -1);
 
-            if (pa.ctg == pb.ctg) {
-                if (warned_same_ctg_.insert(pa.ctg).second) {
-                    constexpr size_t kMaxDetailedWarnings = 10;
-                    if (warned_same_ctg_.size() <= kMaxDetailedWarnings) {
-                        warning_stream() << "  ! Reference and query contig names must be different: " << contig_name(pa.ctg) << "\n";
-                    } else if (warned_same_ctg_.size() == kMaxDetailedWarnings + 1) {
-                        warning_stream() << "  ! Reference and query contig names must be different: " << "too many cases; further warnings are suppressed.\n";
-                    }
-                }
-            }
+            const bool same_ctg = (pa.ctg == pb.ctg);
+            if (same_ctg) warn_same_ctg_once_(pa.ctg);
 
             uint32_t a_rem = (pa.dir > 0 ? (pa.end - a_pos) : (a_pos - pa.beg));
             uint32_t b_rem = (pb.dir > 0 ? (pb.end - b_pos) : (b_pos - pb.beg));
@@ -876,7 +880,7 @@ private:
                 b_pos -= delta;
             }
 
-            outRecs.push_back(r);
+            if (!same_ctg) outRecs.push_back(r);
 
             // Move to next piece when the current one is fully consumed
             if ((pa.dir > 0 && a_pos == pa.end) || (pa.dir < 0 && a_pos == pa.beg)) {
@@ -984,6 +988,12 @@ private:
 
         for (uint32_t i = 0; i < recs_.size(); ++i) {
             const Record& r = recs_[i];
+
+            // Same contig on both sides
+            if (r.a_ctg == r.b_ctg) {
+                warn_same_ctg_once_(r.a_ctg);
+                continue;
+            }
 
             // A -> B
             bins.clear();

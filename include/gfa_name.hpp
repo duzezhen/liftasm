@@ -131,7 +131,7 @@ public:
             spans.insert(spans.end(), v.begin(), v.end());
         }
 
-        // Merge consecutive spans if they overlap or touch on the same root.
+        // Merge consecutive spans only when they are contiguous on the same root.
         // The merged span keeps the orientation (start/end ordering) of the first span in the group.
         std::vector<Span> merged;
         for (const auto& sp : spans) {
@@ -388,15 +388,9 @@ private:
         uint64_t bH = std::max(b.start, b.end);
 
         const bool overlap = (std::max(aL, bL) < std::min(aH, bH));
-        if (overlap) {
-            error_stream()
-                << "overlapping spans on root '" << a.root
-                << "': [" << a.start << "," << a.end << ") vs ["
-                << b.start << "," << b.end << ")\n";
-            std::exit(1);
-        }
+        if (overlap) return false;
 
-        return a.end == b.start || a.start == b.end;
+        return a.end == b.start;
     }
 
     // Expand a full name into forward-path spans (respect per-token direction).

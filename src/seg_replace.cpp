@@ -102,7 +102,7 @@ void Expander::build_index() {
     for (const auto& s : all) (void)expand_(s);
 }
 
-void Expander::remove_from_index_by_key(const Seg& s) {
+void Expander::remove_from_index_by_key(const Seg& s) const {
     memo_.erase(s);
     Seg sr = Interval::toggle_strand(s);
     memo_.erase(sr);
@@ -154,49 +154,183 @@ void Expander::print_index() const {
     for (const auto& kv : items) print_expansion_direct(kv.first, kv.second);
 }
 
-// Expand a segment
 Expansion Expander::expand_(Seg s) {
     const bool is_rev = Interval::is_reverse(s);
     if (is_rev) s = Interval::toggle_strand(s);
 
-    // Memo lookup
     if (auto it = memo_.find(s); it != memo_.end()) {
         Expansion out = it->second;
         if (is_rev) reverse_and_toggle(out);
         return out;
     }
 
-    // Cycle detection
     if (in_stack_.count(s)) {
-        error_stream() << "Cycle detected at: " << Interval::format(s) << "\n";
+        std::cerr << "Cycle detected at " << Interval::format(s, names_) << "\n";
         std::exit(1);
     }
+
     in_stack_.insert(s);
 
     Expansion out;
     auto rit = rules_->find(s);
+
     if (rit == rules_->end() || rit->second.empty()) {
-        // Leaf
         out.push_back(s);
     } else {
-        // Expand children & concatenate
         for (const auto& child : rit->second) {
-            Expansion sub = expand_(child);
-            out.insert(out.end(), sub.begin(), sub.end());
+            if (min_trans_len_ != 0 && Interval::len(child) <= min_trans_len_) {
+                out.push_back(child);
+            } else {
+                Expansion sub = expand_(child);
+                out.insert(out.end(), sub.begin(), sub.end());
+            }
         }
-        // Remove consecutive duplicates
+
         out.erase(std::unique(out.begin(), out.end()), out.end());
     }
 
     in_stack_.erase(s);
-    // Cache forward-strand results (non-trivial only)
-    if (!is_rev && !out.empty() && out.front() != s)
+
+    if (!is_rev && !out.empty() && out.front() != s) {
         memo_.emplace(s, out);
+    }
 
     if (is_rev) reverse_and_toggle(out);
     return out;
 }
 
+uint64_t Expander::filter_nonmonotonic_index() {
+    struct Piece {
+        Seg key = 0;
+        uint64_t sid = 0;
+        uint64_t tid = 0;
+        uint32_t sb = 0;
+        uint32_t se = 0;
+        uint32_t tb = 0;
+        uint32_t te = 0;
+        bool tr = false;
+    };
+
+    auto pair_key = [](uint64_t a, uint64_t b) -> std::string {
+        return std::to_string(a) + '\t' + std::to_string(b);
+    };
+
+    std::vector<Piece> pieces;
+    pieces.reserve(memo_.size() * 2 + 8);
+
+    for (const auto& kv : memo_) {
+        const Seg s = kv.first;
+        const Expansion& exp = kv.second;
+
+        const uint64_t sid = Interval::seg_id(s);
+        const uint32_t sb0 = Interval::beg(s);
+        const uint32_t se0 = Interval::end(s);
+        const uint32_t sl = se0 - sb0;
+
+        if (sl == 0 || exp.empty()) continue;
+
+        uint32_t used = 0;
+
+        for (Seg t : exp) {
+            if (used >= sl) break;
+
+            const uint32_t tl = Interval::len(t);
+            if (tl == 0) continue;
+
+            const uint32_t take = std::min(sl - used, tl);
+
+            const uint32_t sb = sb0 + used;
+            const uint32_t se = sb + take;
+
+            const uint64_t tid = Interval::seg_id(t);
+            const uint32_t tb0 = Interval::beg(t);
+            const uint32_t te0 = Interval::end(t);
+            const bool tr = Interval::is_reverse(t);
+
+            uint32_t tb = tb0;
+            uint32_t te = te0;
+
+            if (take != tl) {
+                if (!tr) {
+                    tb = tb0;
+                    te = tb0 + take;
+                } else {
+                    tb = te0 - take;
+                    te = te0;
+                }
+            }
+
+            if (!(sid == tid && sb == tb && se == te)) {
+                pieces.push_back(Piece{s, sid, tid, sb, se, tb, te, tr});
+            }
+
+            used += take;
+        }
+    }
+
+    std::unordered_map<std::string, std::vector<size_t>> groups;
+    groups.reserve(pieces.size() * 2 + 8);
+
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        groups[pair_key(pieces[i].sid, pieces[i].tid)].push_back(i);
+    }
+
+    std::unordered_set<Seg, U128Hash, U128Eq> bad_keys;
+    bad_keys.reserve(128);
+
+    for (auto& kv : groups) {
+        auto& ids = kv.second;
+        if (ids.size() <= 1) continue;
+
+        std::sort(ids.begin(), ids.end(), [&](size_t x, size_t y) {
+            const Piece& a = pieces[x];
+            const Piece& b = pieces[y];
+
+            if (a.sb != b.sb) return a.sb < b.sb;
+            if (a.se != b.se) return a.se < b.se;
+            if (a.tb != b.tb) return a.tb < b.tb;
+            return a.te < b.te;
+        });
+
+        const Piece* last = nullptr;
+
+        for (size_t id : ids) {
+            const Piece& p = pieces[id];
+
+            if (p.sb >= p.se || p.tb >= p.te) {
+                bad_keys.insert(p.key);
+                continue;
+            }
+
+            if (last) {
+                bool bad = false;
+
+                if (p.sb < last->se) {
+                    bad = true;
+                } else if (p.tr != last->tr) {
+                    bad = true;
+                } else if (!p.tr) {
+                    if (p.tb < last->te) bad = true;
+                } else {
+                    if (p.te > last->tb) bad = true;
+                }
+
+                if (bad) {
+                    bad_keys.insert(p.key);
+                    continue;
+                }
+            }
+
+            last = &p;
+        }
+    }
+
+    for (Seg k : bad_keys) {
+        remove_from_index_by_key(k);
+    }
+
+    return bad_keys.size();
+}
 
 bool Expander::save_map(const std::string& path) {
     if (memo_.empty()) return false;

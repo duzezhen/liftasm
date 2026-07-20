@@ -77,9 +77,22 @@ struct GfaNode {
     std::string sequence{"*"};
     uint32_t    length{0};
     bool        deleted{false};
-    GfaAux      aux;
+    bool        is_complex{false};
 
+    std::vector<uint32_t> sample_ids;  // sorted unique ids
+
+    GfaAux aux;
     std::vector<uint8_t> coverage;  // coverage per base, only used in GfaBamLoader
+};
+
+struct GfaComponentPath {
+    uint32_t component_id{UINT32_MAX};
+    uint64_t length{0};
+
+    std::vector<uint32_t> nodes;
+
+    std::vector<Vertex> path;
+    std::vector<Vertex> reverse_path;
 };
 
 // path segment structure (P-line)

@@ -26,8 +26,7 @@ struct RenameStats {
 
 class FileRenamePlan {
 public:
-    explicit FileRenamePlan(std::size_t max_log_examples = 5)
-        : max_log_examples_(max_log_examples) {}
+    explicit FileRenamePlan(std::size_t max_log_examples = 5) : max_log_examples_(max_log_examples) {}
 
     std::string register_segment_name(
         const std::string& raw_name,

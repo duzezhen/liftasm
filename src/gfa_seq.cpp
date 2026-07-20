@@ -5,6 +5,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <cctype>
+#include <unordered_set>
 
 void GfaSeq::trim_(std::string& s) {
     size_t i = 0, j = s.size();
@@ -13,136 +14,118 @@ void GfaSeq::trim_(std::string& s) {
     s.assign(s.substr(i, j - i));
 }
 
-std::vector<std::string> GfaSeq::extract_from_paths_(const std::vector<std::string>& paths) const
-{
-    std::vector<std::string> results;
-    results.reserve(paths.size());
+bool GfaSeq::parse_open_walk_line_(const std::string& line, OpenWalkRequest& req) {
+    std::istringstream iss(line);
+    std::vector<std::string> cols;
+    std::string col;
+    while (iss >> col) cols.push_back(std::move(col));
 
-    for (const auto& path : paths) {
-        struct Item { uint32_t sid; bool rev; };
-        std::vector<Item> items; items.reserve(16);
+    if (cols.size() != 3 || (cols[1] != "+" && cols[1] != "-")) return false;
 
-        const size_t n = path.size();
-        size_t i = 0;
+    size_t used = 0;
+    uint64_t len = 0;
+    try {
+        len = std::stoull(cols[2], &used);
+    } catch (...) {
+        return false;
+    }
+    if (used != cols[2].size()) return false;
 
-        // Comma-separated parsing
-        const bool has_commas = (path.find(',') != std::string::npos);
+    req.segment = cols[0];
+    req.rev = (cols[1] == "-");
+    req.len = len;
+    return true;
+}
 
-        while (i < n) {
-            while (i < n && (std::isspace(static_cast<unsigned char>(path[i])) || (has_commas && path[i] == ','))) ++i;
-            if (i >= n) break;
+std::string GfaSeq::extract_from_path_(const std::string& path) const {
+    std::vector<uint32_t> vertices;
+    vertices.reserve(16);
 
-            bool have_prefix_sign = false;
-            bool prefix_rev = false;  // '<' -> true(reverse), '>' -> false(forward)
-            if (!has_commas && is_marker_(path[i])) {
-                have_prefix_sign = true;
-                prefix_rev = (path[i] == '<');
-                ++i;
-                while (i < n && std::isspace(static_cast<unsigned char>(path[i]))) ++i;
-            } else if (has_commas && is_marker_(path[i])) {
-                have_prefix_sign = true;
-                prefix_rev = (path[i] == '<');
-                ++i;
-                while (i < n && std::isspace(static_cast<unsigned char>(path[i]))) ++i;
-            }
+    const size_t n = path.size();
+    size_t i = 0;
+    const bool has_commas = (path.find(',') != std::string::npos);
 
-            size_t j = i;
-            if (has_commas) {
-                while (j < n && path[j] != ',') ++j;
-            } else {
-                while (j < n && !is_marker_(path[j])) ++j;
-            }
-            std::string token = path.substr(i, j - i);
-            trim_(token);
+    while (i < n) {
+        while (i < n && (std::isspace(static_cast<unsigned char>(path[i])) || (has_commas && path[i] == ','))) ++i;
+        if (i >= n) break;
 
-            if (token.empty()) {
-                i = j + (has_commas && j < n && path[j] == ',' ? 1 : 0);
-                continue;
-            }
+        bool have_prefix_sign = false;
+        bool prefix_rev = false;
+        if (is_marker_(path[i])) {
+            have_prefix_sign = true;
+            prefix_rev = (path[i] == '<');
+            ++i;
+            while (i < n && std::isspace(static_cast<unsigned char>(path[i]))) ++i;
+        }
 
+        size_t j = i;
+        if (has_commas) {
+            while (j < n && path[j] != ',') ++j;
+        } else {
+            while (j < n && !is_marker_(path[j])) ++j;
+        }
+
+        std::string token = path.substr(i, j - i);
+        trim_(token);
+
+        if (!token.empty()) {
             bool use_suffix = false;
             bool suffix_rev = false;
-            if (!token.empty() && is_suffix_sign_(token.back())) {
-                char last = token.back();
+            if (is_suffix_sign_(token.back())) {
+                suffix_rev = (token.back() == '-');
                 token.pop_back();
                 trim_(token);
                 use_suffix = true;
-                suffix_rev = (last == '-');
             }
 
-            if (!token.empty()) {
-                uint64_t sid64 = 0;
-                try {
-                    sid64 = getNodeInternalId(token);
-                } catch (...) {
-                    results.emplace_back("*");
-                    goto next_path;
-                }
-                bool rev = false;
-                if (use_suffix) {
-                    rev = suffix_rev;
-                } else if (have_prefix_sign) {
-                    rev = prefix_rev;
-                } else {
-                    rev = false;
-                }
-                items.push_back({ static_cast<uint32_t>(sid64), rev });
+            try {
+                const uint32_t sid = static_cast<uint32_t>(getNodeInternalId(token));
+                const bool rev = use_suffix ? suffix_rev : (have_prefix_sign ? prefix_rev : false);
+                vertices.push_back(Vertex(sid, rev).vertex_id());
+            } catch (...) {
+                return "*";
             }
-
-            i = j;
         }
 
-        // Concatenate sequences
-        {
-            // Pre-calculate
-            size_t total_len = 0;
-            for (const auto &it : items) {
-                const GfaNode* node = getNode(it.sid);
-                if (node && !node->sequence.empty() && node->sequence != "*")
-                    total_len += node->sequence.size();
-            }
-            std::string out;
-            out.reserve(total_len);
-
-            // Extract
-            bool unknown = false;
-            bool first = true;
-            Vertex prev_vtx(0, false);
-
-            for (const auto &it : items) {
-                Vertex vtx(it.sid, it.rev);
-                std::string s = get_oriented_sequence(vtx);  // If "*", then empty
-                if (s.empty()) { unknown = true; break; }
-
-                if (first) {
-                    out += s;
-                    first = false;
-                } else {
-                    uint32_t ovlp = 0;
-                    auto arcs = getArcsFromVertex(prev_vtx.vertex_id());
-                    for (const auto* arc : arcs) {
-                        if (arc && arc->w == vtx.vertex_id()) {
-                            ovlp = arc->ow > 0 ? static_cast<uint32_t>(arc->ow) : 0u;
-                            break;
-                        }
-                    }
-                    if (ovlp >= s.size()) out += "";
-                    else out += s.substr(ovlp);
-                }
-
-                prev_vtx = vtx;
-            }
-
-            results.emplace_back(unknown ? "*" : std::move(out));
-        }
-
-        next_path: ;
+        i = j;
     }
 
+    return get_path_sequence(vertices);
+}
+
+std::vector<std::string> GfaSeq::extract_from_paths_(const std::vector<std::string>& paths) const {
+    std::vector<std::string> results;
+    results.reserve(paths.size());
+    for (const auto& path : paths) {
+        results.push_back(extract_from_path_(path));
+    }
     return results;
 }
 
-void GfaSeq::extract_from_file(const std::string& path_file, std::vector<std::string>& paths, std::vector<std::string>& seqs) const {
+std::string GfaSeq::extract_open_walk_(const OpenWalkRequest& req) const {
+    uint32_t sid = UINT32_MAX;
+    try {
+        sid = static_cast<uint32_t>(getNodeInternalId(req.segment));
+    } catch (...) {
+        return "*";
+    }
+
+    const uint32_t src = Vertex(sid, req.rev).vertex_id();
+    const std::unordered_set<uint32_t> region_set;
+    const std::vector<std::vector<uint32_t>> walks = open_walk(
+        src,
+        region_set,
+        /*max_depth=*/0,
+        /*skip_comp=*/false,
+        /*DFS_guard=*/1000000,
+        req.len
+    );
+
+    if (walks.empty()) return "*";
+    return get_path_sequence(walks.front());
+}
+
+void GfaSeq::extract_from_file(const std::string& path_file, std::vector<std::string>& paths, std::vector<std::string>& seqs) {
     std::ifstream fin(path_file);
     if (!fin) {
         error_stream() << path_file << ": No such file or directory\n";
@@ -150,15 +133,28 @@ void GfaSeq::extract_from_file(const std::string& path_file, std::vector<std::st
     }
 
     paths.reserve(1024);
+    seqs.reserve(1024);
 
+    bool topo_ready = false;
     std::string line;
     while (std::getline(fin, line)) {
         trim_(line);
         if (line.empty()) continue;
         if (!line.empty() && line[0] == '#') continue;
+
+        OpenWalkRequest req;
+        if (parse_open_walk_line_(line, req)) {
+            if (!topo_ready) {
+                build_vertex_topological_index();
+                topo_ready = true;
+            }
+            seqs.push_back(extract_open_walk_(req));
+        } else {
+            seqs.push_back(extract_from_path_(line));
+        }
+
         paths.push_back(std::move(line));
     }
-    seqs = extract_from_paths_(paths);
     return;
 }
 

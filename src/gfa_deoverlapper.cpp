@@ -141,59 +141,145 @@ void GfaDeoverlapper::prune_overlaps_() {
 }
 
 
-std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::filter_aligns_(std::vector<MmWfaHit> a)
-{
-    if (a.size() <= 1) return a;
+std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::filter_aligns_(
+    std::vector<MmWfaHit> a,
+    uint32_t ref_len,
+    uint32_t qry_len
+) const {
+    auto rb = [](const MmWfaHit& x) { return std::min(x.r_beg, x.r_end); };
+    auto re = [](const MmWfaHit& x) { return std::max(x.r_beg, x.r_end); };
+    auto qb = [](const MmWfaHit& x) { return std::min(x.q_beg, x.q_end); };
+    auto qe = [](const MmWfaHit& x) { return std::max(x.q_beg, x.q_end); };
 
-    auto rb = [](const MmWfaHit& x){ return std::min(x.r_beg, x.r_end); };
-    auto re = [](const MmWfaHit& x){ return std::max(x.r_beg, x.r_end); };
-    auto qb = [](const MmWfaHit& x){ return std::min(x.q_beg, x.q_end); };
-    auto qe = [](const MmWfaHit& x){ return std::max(x.q_beg, x.q_end); };
-
-    auto len = [&](const MmWfaHit& x)->uint32_t {
-        uint32_t b = rb(x), e = re(x);
-        return (e > b) ? (e - b) : 0u;
+    auto rspan = [&](const MmWfaHit& x) -> uint32_t {
+        const uint32_t b = rb(x), e = re(x);
+        return e > b ? e - b : 0u;
     };
 
-    auto ovlp = [](uint32_t l1, uint32_t r1, uint32_t l2, uint32_t r2)->uint32_t {
-        uint32_t l = (l1 > l2) ? l1 : l2;
-        uint32_t r = (r1 < r2) ? r1 : r2;
-        return (r > l) ? (r - l) : 0u;
+    auto qspan = [&](const MmWfaHit& x) -> uint32_t {
+        const uint32_t b = qb(x), e = qe(x);
+        return e > b ? e - b : 0u;
     };
 
-    std::sort(a.begin(), a.end(), [&](const MmWfaHit& A, const MmWfaHit& B){
-        uint32_t la = len(A), lb = len(B);
+    auto len = [&](const MmWfaHit& x) -> uint32_t {
+        return std::min(rspan(x), qspan(x));
+    };
+
+    auto ovlp = [](uint32_t l1, uint32_t r1, uint32_t l2, uint32_t r2) -> uint32_t {
+        const uint32_t l = std::max(l1, l2);
+        const uint32_t r = std::min(r1, r2);
+        return r > l ? r - l : 0u;
+    };
+
+    const uint32_t denom = std::min(ref_len, qry_len);
+
+    std::vector<MmWfaHit> passed;
+    passed.reserve(a.size());
+
+    for (auto& x : a) {
+        if (x.cigar.empty() || x.cigar == "*") continue;
+        if (x.mapq < MIN_MAPQ_) continue;
+        if (CIGAR::match_ratio(x.cigar) < MIN_MATCH_RATIO_) continue;
+
+        const uint32_t aln_len = len(x);
+        if (aln_len == 0) continue;
+
+        if (denom > 0) {
+            const double ali_ratio = static_cast<double>(aln_len) / static_cast<double>(denom);
+            if (ali_ratio < MIN_ALI_RATIO_) continue;
+        }
+
+        passed.emplace_back(std::move(x));
+    }
+
+    if (passed.size() <= 1) return passed;
+
+    std::sort(passed.begin(), passed.end(), [&](const MmWfaHit& A, const MmWfaHit& B) {
+        const uint32_t la = len(A);
+        const uint32_t lb = len(B);
         if (la != lb) return la > lb;
+        if (A.mapq != B.mapq) return A.mapq > B.mapq;
         return rb(A) < rb(B);
     });
 
     std::vector<MmWfaHit> kept;
-    kept.reserve(a.size());
+    kept.reserve(passed.size());
 
-    for (auto& cand : a) {
-        uint32_t crb = rb(cand), cre = re(cand);
-        uint32_t cqb = qb(cand), cqe = qe(cand);
+    for (auto& cand : passed) {
+        const uint32_t crb = rb(cand), cre = re(cand);
+        const uint32_t cqb = qb(cand), cqe = qe(cand);
         if (cre <= crb || cqe <= cqb) continue;
 
-        int64_t crk = int64_t(crb);
-        int64_t cqk = int64_t(cqb);
+        const int64_t crk = int64_t(crb);
+        const int64_t cqk = int64_t(cqb);
 
         bool ok = true;
         for (const auto& k : kept) {
             if (ovlp(crb, cre, rb(k), re(k)) > 0) { ok = false; break; }
             if (ovlp(cqb, cqe, qb(k), qe(k)) > 0) { ok = false; break; }
 
-            int64_t krk = int64_t(rb(k));
-            int64_t kqk = int64_t(qb(k));
-            if ((crk > krk && cqk <= kqk) || (crk < krk && cqk >= kqk)) { ok = false; break; }
+            const int64_t krk = int64_t(rb(k));
+            const int64_t kqk = int64_t(qb(k));
+
+            if ((crk > krk && cqk <= kqk) || (crk < krk && cqk >= kqk)) {
+                ok = false;
+                break;
+            }
         }
 
-        if (ok) kept.push_back(std::move(cand));
+        if (ok) kept.emplace_back(std::move(cand));
     }
 
     return kept;
 }
 
+std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_short_wfa_(
+    const std::string& v_name,
+    const std::string& w_name,
+    const std::string& v_seq_slice,
+    const std::string& w_seq_slice
+) {
+    std::vector<MmWfaHit> hits;
+
+    if (v_seq_slice.empty() || w_seq_slice.empty()) {
+        return hits;
+    }
+
+    MmWfaHit h;
+    h.r_beg = 0;
+    h.r_end = static_cast<uint32_t>(v_seq_slice.size());
+    h.q_beg = 0;
+    h.q_end = static_cast<uint32_t>(w_seq_slice.size());
+
+    if (v_seq_slice == w_seq_slice) {
+        h.mapq = 60;
+        h.cigar = std::to_string(v_seq_slice.size()) + "=";
+        hits.emplace_back(std::move(h));
+        return hits;
+    }
+
+    std::string cigar;
+    int score = 0;
+
+    seedExtend::run_wfa_fragment(
+        std::string_view(v_seq_slice),
+        std::string_view(w_seq_slice),
+        cigar,
+        score,
+        extendOpts_
+    );
+
+    if (cigar.empty() || cigar == "*") {
+        return hits;
+    }
+
+    h.cigar = std::move(cigar);
+
+    h.mapq = 60;
+
+    hits.emplace_back(std::move(h));
+    return hits;
+}
 
 std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_wfa_(
     const std::string& v_name,
@@ -211,13 +297,10 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_wfa_(
     mmidx::MinimizerIndex idx(v_names, v_seqs, v_right_seqs, chainOpts_, anchorOpts_);
     idx.build_mm();
 
-    // ---- Single-read aligner over this local index ----
     aligner::Alignmenter aln(idx, v_names, v_seqs, extendOpts_, alignOpts_);
 
-    // ---- Run the per-read pipeline on v (ref) vs w (read) ----
     auto aligns = aln.produce_read(w_name, w_seq_slice, /*keep same strand only=*/true);
     if (aligns.empty()) {
-        log_stream() << "  - No alignment produced for " << v_name << " vs " << w_name << "\n";
         return hits;
     }
 
@@ -229,7 +312,7 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_wfa_(
         h.q_beg = (uint32_t)a.q_beg;
         h.q_end = (uint32_t)a.q_end;
 
-        if (CIGAR::match_ratio(a.cigar) < MIN_MATCH_RATIO_) continue;
+        h.mapq = a.MAPQ;
 
         h.cigar = std::move(a.cigar);
         hits.emplace_back(std::move(h));
@@ -255,6 +338,7 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_short_mm2_(
         h.r_end = (uint32_t)v_seq_slice.size();
         h.q_beg = 0;
         h.q_end = (uint32_t)w_seq_slice.size();
+        h.mapq = 60;
         h.cigar = std::to_string(v_seq_slice.size()) + "=";
         hits.emplace_back(std::move(h));
         return hits;
@@ -267,7 +351,10 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_short_mm2_(
     mm_mapopt_t opt;
 
     mm_set_opt(nullptr, &ipt, &opt);
-    mm_set_opt("asm5", &ipt, &opt);
+    if (mm_set_opt("sr", &ipt, &opt) < 0) {
+        error_stream() << "Invalid mm2 preset: sr" << "\n";
+        std::exit(1);
+    }
 
     ipt.k = (short)std::min<size_t>(std::max<size_t>(4, min_len), 11);
     ipt.w = 1;
@@ -283,7 +370,7 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_short_mm2_(
     mm_idx_t* mi = mm_idx_str(ipt.w, ipt.k, 0, ipt.bucket_bits, 1, ref_seqs, ref_names);
     if (!mi) return hits;
 
-    mm_mapopt_update(&opt, mi);
+    // mm_mapopt_update(&opt, mi);
 
     mm_tbuf_t* tbuf = mm_tbuf_init();
 
@@ -307,13 +394,15 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_short_mm2_(
 
         std::string cigar = CIGAR::to_string(ex->cigar, ex->n_cigar);
         if (cigar.empty() || cigar == "*") continue;
-        if (CIGAR::match_ratio(cigar) < MIN_MATCH_RATIO_) continue;
 
         MmWfaHit h;
         h.r_beg = (uint32_t)r.rs;
         h.r_end = (uint32_t)r.re;
         h.q_beg = (uint32_t)r.qs;
         h.q_end = (uint32_t)r.qe;
+
+        h.mapq = r.mapq;
+
         h.cigar = std::move(cigar);
         hits.emplace_back(std::move(h));
     }
@@ -350,11 +439,16 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_mm2_(
         return hits;
     }
 
+    const bool retry_short = (v_seq_slice.size() < 500 && w_seq_slice.size() < 500);
+
     mm_idxopt_t ipt;
     mm_mapopt_t opt;
 
     mm_set_opt(nullptr, &ipt, &opt);
-    mm_set_opt("asm5", &ipt, &opt);
+    if (mm_set_opt(MM2_PRESET_.c_str(), &ipt, &opt) < 0) {
+        error_stream() << "Invalid mm2 preset: " << MM2_PRESET_ << "\n";
+        std::exit(1);
+    }
 
     ipt.k = (short)chainOpts_.k;
     ipt.w = (short)chainOpts_.w;
@@ -391,13 +485,13 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_mm2_(
         std::string cigar = CIGAR::to_string(ex->cigar, ex->n_cigar);
         if (cigar.empty() || cigar == "*") continue;
 
-        if (CIGAR::match_ratio(cigar) < MIN_MATCH_RATIO_) continue;
-
         MmWfaHit h;
         h.r_beg = (uint32_t)r.rs;
         h.r_end = (uint32_t)r.re;
         h.q_beg = (uint32_t)r.qs;
         h.q_end = (uint32_t)r.qe;
+
+        h.mapq = r.mapq;
 
         h.cigar = std::move(cigar);
         hits.emplace_back(std::move(h));
@@ -409,6 +503,11 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_mm2_(
     }
 
     mm_idx_destroy(mi);
+
+    // Retry short sequences with a smaller k-mer and window.
+    if (hits.empty() && retry_short) {
+        return align_short_mm2_(v_name, w_name, v_seq_slice, w_seq_slice);
+    }
 
     return hits;
 }
@@ -445,6 +544,7 @@ std::vector<GfaDeoverlapper::BubbleAlignment> GfaDeoverlapper::align_and_pack_(
         uint32_t r_beg, uint32_t r_end,
         uint32_t q_beg, uint32_t q_end,
         std::string cigar,
+        uint8_t mapq,
         std::vector<CIGAR::COp>& ops
     ) {
         // Convert to original segment coordinates
@@ -459,6 +559,7 @@ std::vector<GfaDeoverlapper::BubbleAlignment> GfaDeoverlapper::align_and_pack_(
         debug_stream() << "    - qry: " << w_name << "(" << (w_rev ? "-" : "+") << ")\n";
         debug_stream() << "      - [r_beg, r_end, r_len) = [" << beg_a << ", " << end_a << ", " << v_seq_slice.length() << ")\n";
         debug_stream() << "      - [q_beg, q_end, q_len) = [" << beg_b << ", " << end_b << ", " << w_seq_slice.length() << ")\n";
+        debug_stream() << "      - mapq = " << (int)mapq << "\n";
         debug_stream() << "      - CIGAR = " << cigar << "\n";
     };
 
@@ -466,6 +567,7 @@ std::vector<GfaDeoverlapper::BubbleAlignment> GfaDeoverlapper::align_and_pack_(
         uint32_t r_beg, uint32_t r_end,
         uint32_t q_beg, uint32_t q_end,
         std::string cigar,
+        uint8_t mapq,
         std::vector<CIGAR::COp>&& ops
     ) {
         // Convert to original segment coordinates
@@ -481,6 +583,7 @@ std::vector<GfaDeoverlapper::BubbleAlignment> GfaDeoverlapper::align_and_pack_(
             beg_a, end_a,
             beg_b, end_b,
             v_vertex, w_vertex,
+            mapq,
             std::move(ops)
         );
     };
@@ -495,35 +598,31 @@ std::vector<GfaDeoverlapper::BubbleAlignment> GfaDeoverlapper::align_and_pack_(
         if (L == 0) return outs;
         std::string cigar = std::to_string(L) + "=";
         auto ops = CIGAR::parse(cigar);
-        if (DEBUG_ENABLED) print_alignment(0, L, 0, L, cigar, ops);
-        add_alignment(0, L, 0, L, std::move(cigar), std::move(ops));
+        if (DEBUG_ENABLED) print_alignment(0, L, 0, L, cigar, 60, ops);
+        add_alignment(0, L, 0, L, std::move(cigar), 60, std::move(ops));
         return outs;
     }
 
     std::vector<MmWfaHit> hits;
-    if (std::min(v_seq_slice.size(), w_seq_slice.size()) < std::max(chainOpts_.k, chainOpts_.w)) {
-        hits = align_short_mm2_(v_name, w_name, v_seq_slice, w_seq_slice);
-    } else {
-        hits = use_wfa_ ? align_wfa_(v_name, w_name, v_seq_slice, w_seq_slice) : align_mm2_(v_name, w_name, v_seq_slice, w_seq_slice);
-    }
+    hits = align_mm2_(v_name, w_name, v_seq_slice, w_seq_slice);
 
     if (DEBUG_ENABLED && !hits.empty()) {
         debug_stream() << "  - Total raw alignments: " << hits.size() << "\n";
         for (auto& h : hits) {
             if (h.cigar.empty()) continue;
             auto ops = CIGAR::parse(h.cigar);
-            if (DEBUG_ENABLED) print_alignment(h.r_beg, h.r_end, h.q_beg, h.q_end, h.cigar, ops);
+            if (DEBUG_ENABLED) print_alignment(h.r_beg, h.r_end, h.q_beg, h.q_end, h.cigar, h.mapq, ops);
         }
     }
 
-    hits = filter_aligns_(std::move(hits));
+    hits = filter_aligns_(std::move(hits), static_cast<uint32_t>(v_seq_slice.size()), static_cast<uint32_t>(w_seq_slice.size()));
 
     if (DEBUG_ENABLED && !hits.empty()) debug_stream() << "  - Total filtered alignments: " << hits.size() << "\n";
     for (auto& h : hits) {
         if (h.cigar.empty()) continue;
         auto ops = CIGAR::parse(h.cigar);
-        if (DEBUG_ENABLED) print_alignment(h.r_beg, h.r_end, h.q_beg, h.q_end, h.cigar, ops);
-        add_alignment(h.r_beg, h.r_end, h.q_beg, h.q_end, std::move(h.cigar), std::move(ops));
+        if (DEBUG_ENABLED) print_alignment(h.r_beg, h.r_end, h.q_beg, h.q_end, h.cigar, h.mapq, ops);
+        add_alignment(h.r_beg, h.r_end, h.q_beg, h.q_end, std::move(h.cigar), h.mapq, std::move(ops));
     }
 
     return outs;
@@ -640,148 +739,95 @@ void GfaDeoverlapper::overlaps_align_() {
     log_stream() << "  - Total alignments produced: " << bubble_aligns_.size() << "\n" << "\n";
 }
 
-
-void GfaDeoverlapper::dedup_aligns_()
+void GfaDeoverlapper::dedup_aligns_(size_t begin)
 {
-    gfaName namer;
-
-    auto seg_name = [this](uint32_t v) -> const std::string& {
-        return nodes_[NodeHandle::get_segment_id(v)].name;
-    };
-
-    auto norm_interval = [] (uint32_t a, uint32_t b) {
-        uint32_t l = std::min(a, b);
-        uint32_t r = std::max(a, b);
-        return std::pair<uint32_t,uint32_t>(l, r);
-    };
-
-    auto overlap = [] (uint32_t l1, uint32_t r1, uint32_t l2, uint32_t r2) -> uint32_t {
-        uint32_t l = std::max(l1, l2);
-        uint32_t r = std::min(r1, r2);
-        return (r > l) ? (r - l) : 0u;
-    };
-
-    struct SpanItem {
-        int32_t     idx;       // Index in bubble_aligns_
-        std::string base;      // The base segment name
-        uint32_t    beg;       // The real start position on the base
-        uint32_t    end;       // The real end position on the base
-        uint32_t    len;       // end - beg
-    };
-
     const size_t n_aln = bubble_aligns_.size();
-    std::unordered_map<std::string, std::vector<SpanItem>> groups;
-    groups.reserve(n_aln * 4);
+    if (begin >= n_aln) return;
 
-    for (size_t i = 0; i < n_aln; ++i) {
-        const auto& aln = bubble_aligns_[i];
+    auto pair_key = [](uint32_t a, uint32_t b) -> uint64_t {
+        if (a > b) std::swap(a, b);
+        return (uint64_t(a) << 32) | uint64_t(b);
+    };
 
-        auto [a_l, a_r] = norm_interval(aln.beg_a, aln.end_a);
-        auto [b_l, b_r] = norm_interval(aln.beg_b, aln.end_b);
-        if (a_r <= a_l || b_r <= b_l) continue;
+    std::unordered_map<uint64_t, int32_t> seen_idx;
+    seen_idx.reserve((n_aln - begin) * 2 + 8);
 
-        const std::string& sA = seg_name(aln.v_a);
-        const std::string& sB = seg_name(aln.v_b);
+    std::vector<BubbleAlignment> kept;
+    kept.reserve(n_aln);
 
-        // key=ref, value=qry
-        {
-            std::string fullB = namer.format_interval_name(sB, b_l, b_r, false);
-            auto piecesB = namer.parse_composite_with_dir(fullB);
-
-            for (const auto& pc : piecesB) {
-                if (pc.len == 0) continue;
-                uint32_t lo = static_cast<uint32_t>(pc.lo);
-                uint32_t hi = static_cast<uint32_t>(pc.hi);
-                if (hi <= lo) continue;
-                uint32_t len = hi - lo;
-
-                groups[sA].push_back(SpanItem{aln.idx, pc.root, lo, hi, len});
-            }
-        }
-
-        // key=qry, value=ref
-        {
-            std::string fullA = namer.format_interval_name(sA, a_l, a_r, false);
-            auto piecesA = namer.parse_composite_with_dir(fullA);
-
-            for (const auto& pc : piecesA) {
-                if (pc.len == 0) continue;
-                uint32_t lo = static_cast<uint32_t>(pc.lo);
-                uint32_t hi = static_cast<uint32_t>(pc.hi);
-                if (hi <= lo) continue;
-                uint32_t len = hi - lo;
-
-                groups[sB].push_back(SpanItem{aln.idx, pc.root, lo, hi, len});
-            }
-        }
+    for (size_t i = 0; i < begin; ++i) {
+        kept.emplace_back(std::move(bubble_aligns_[i]));
     }
 
-    // Sort and dedup within each ref group
-    std::vector<uint8_t> keep(n_aln, 1);
-    for (auto &kv : groups) {
-        const std::string& ref = kv.first;
-        auto &spans            = kv.second;
+    log_stream() << "Deduplicating alignments ..." << "\n";
+    log_stream() << "  - Number of alignments: " << n_aln << "\n";
+    log_stream() << "  - Deduplication start: " << begin << "\n";
 
-        if (spans.size() <= 1) continue;
+    for (size_t i = begin; i < n_aln; ++i) {
+        auto& aln = bubble_aligns_[i];
 
-        std::sort(spans.begin(), spans.end(),
-            [] (const SpanItem &x, const SpanItem &y) {
-                if (x.base != y.base) return x.base < y.base;
-                if (x.idx  != y.idx ) return x.idx  < y.idx;
-                if (x.len  != y.len ) return x.len  > y.len;
-                if (x.beg  != y.beg ) return x.beg  < y.beg;
-                return x.end < y.end;
+        const uint32_t seg_a = NodeHandle::get_segment_id(aln.v_a);
+        const uint32_t seg_b = NodeHandle::get_segment_id(aln.v_b);
+
+        if (seg_a >= nodes_.size() || seg_b >= nodes_.size()) {
+            if (DEBUG_ENABLED) {
+                debug_stream() << "  - INVALID_SEGMENT_ID: " << "idx=" << aln.idx << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
             }
-        );
+            continue;
+        }
 
-        std::unordered_map<std::string, std::vector<SpanItem>> chosen_by_base;
-        chosen_by_base.reserve(8);
+        std::vector<std::string> roots_a;
+        std::vector<std::string> roots_b;
 
-        for (const auto& s : spans) {
-            if (!keep[s.idx]) continue;
+        gfaName::collect_roots_from_name(nodes_[seg_a].name, roots_a);
+        gfaName::collect_roots_from_name(nodes_[seg_b].name, roots_b);
 
-            auto &chosen = chosen_by_base[s.base];
-            bool conflict = false;
+        bool same_root = false;
 
-            for (const auto& c : chosen) {
-                uint32_t ov = overlap(s.beg, s.end, c.beg, c.end);
-                if (ov > 0) {
-                    keep[s.idx] = 0;
-                    conflict = true;
+        for (const auto& a : roots_a) {
+            for (const auto& b : roots_b) {
+                if (a == b) {
+                    same_root = true;
                     break;
                 }
             }
+            if (same_root) break;
+        }
 
-            if (!conflict) {
-                chosen.push_back(s);
+        if (same_root) {
+            if (DEBUG_ENABLED) {
+                debug_stream() << "  - SHARED_ROOT: " << "idx=" << aln.idx << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
             }
+
+            continue;
         }
-    }
 
+        const uint64_t key = pair_key(seg_a, seg_b);
+        auto it = seen_idx.find(key);
 
-    // Rebuild bubble_aligns_
-    std::vector<BubbleAlignment> new_aligns;
-    new_aligns.reserve(n_aln);
+        if (it != seen_idx.end()) {
+            if (it->second != aln.idx) {
+                if (DEBUG_ENABLED) {
+                    debug_stream() << "  - DROP_SEEN: " << "idx=" << aln.idx << " prev_idx=" << it->second << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
+                }
 
-    for (size_t i = 0; i < n_aln; ++i) {
-        if (keep[i]) {
-            new_aligns.push_back(std::move(bubble_aligns_[i]));
+                continue;
+            }
+        } else {
+            seen_idx.emplace(key, aln.idx);
         }
+
+        if (DEBUG_ENABLED) {
+            debug_stream() << "  - KEEP: " << "idx=" << aln.idx << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
+        }
+
+        kept.emplace_back(std::move(aln));
     }
 
-    bubble_aligns_ = std::move(new_aligns);
+    bubble_aligns_ = std::move(kept);
 
-    // Print results
-    for (const auto& aln : bubble_aligns_) {
-        auto [b_l_raw, b_r_raw] = norm_interval(aln.beg_b, aln.end_b);
-        if (b_r_raw <= b_l_raw) continue;
-        const std::string& snameB = seg_name(aln.v_b);
-        std::string fullB = namer.format_interval_name(snameB, b_l_raw, b_r_raw, false);
-    }
-
-    log_stream() << "After base-overlap dedup, alignments kept: " << bubble_aligns_.size() << " / " << n_aln << "\n" << "\n";
+    log_stream() << "  - Number of alignments after deduplication: " << bubble_aligns_.size() << "\n\n";
 }
-
 
 std::vector<std::vector<size_t>> GfaDeoverlapper::build_align_groups_() const {
     log_stream() << "Grouping alignments by segment overlaps ...\n";
@@ -906,7 +952,7 @@ bool GfaDeoverlapper::add_cuts_from_one_alignment_(const BubbleAlignment& align)
                 step(pos_a, rev_a, op.len);
                 step(pos_b, rev_b, op.len);
 
-                if (op.len >= MIN_EQ_FOR_CUT_ || is_single_exact_match) {
+                if (op.len >= MIN_EQ_FOR_CUT_ || is_single_exact_match || align.force_cuts) {
                     add_cut(seg_a, prev_a, len_a);
                     add_cut(seg_b, prev_b, len_b);
                     add_cut(seg_a, pos_a,  len_a);
@@ -1157,6 +1203,9 @@ uint64_t GfaDeoverlapper::propagate_cuts_run_(const std::vector<size_t>& group) 
 uint64_t GfaDeoverlapper::prune_cuts_run_(const std::vector<size_t>& group) {
     if (MAX_ABNORMAL_CUT_LEN_ <= 0 || MIN_ABNORMAL_CUT_COUNT_ <= 0) {
         return 0;
+    }
+    for (const size_t aln_id : group) {
+        if (aln_id < bubble_aligns_.size() && bubble_aligns_[aln_id].force_cuts) return 0;
     }
 
     std::vector<uint32_t> segs;
@@ -2020,7 +2069,7 @@ void GfaDeoverlapper::record_rulemap(
 
             if (leaf_is_exist) {
                 // merge_and_dedup_cuts_(exist_cuts, new_cuts_exist);  // debug 2025-10-10, Update cut list
-                merge_and_dedup_cuts_with_set_(exist_cuts, exist_cut_set, extra_exist_cuts);  // 2025.04.10 update both cut list and cut set
+                merge_and_dedup_cuts_with_set_(exist_cuts, exist_cut_set, extra_exist_cuts);  // 2026.04.10 update both cut list and cut set
 
                 build_rules_from_pair_windows_(
                     rulemap,
@@ -2030,7 +2079,7 @@ void GfaDeoverlapper::record_rulemap(
                 );
             } else {
                 // merge_and_dedup_cuts_(leaf_cuts, new_cuts_leaf);  // debug 2025-10-10, Update cut list
-                merge_and_dedup_cuts_with_set_(leaf_cuts, leaf_cut_set, extra_leaf_cuts);  // 2025.04.10 update both cut list and cut set
+                merge_and_dedup_cuts_with_set_(leaf_cuts, leaf_cut_set, extra_leaf_cuts);  // 2026.04.10 update both cut list and cut set
 
                 build_rules_from_pair_windows_(
                     rulemap,
@@ -2107,7 +2156,7 @@ SegReplace::RuleMap GfaDeoverlapper::build_rulemap_run_(
                         ? std::make_pair(pos_b, prev_b)
                         : std::make_pair(prev_b, pos_b);
 
-                    if (op.len >= MIN_EQ_FOR_CUT_ || is_single_exact_match) {
+                    if (op.len >= MIN_EQ_FOR_CUT_ || is_single_exact_match || align.force_cuts) {
                         GfaDeoverlapper::record_rulemap(
                             seg_a, seg_b,
                             rev_a, rev_b,
@@ -2195,91 +2244,26 @@ void GfaDeoverlapper::build_rulemap_(const std::vector<std::vector<size_t>>& gro
     log_stream() << "  - Total rules generated: " << rulemap_.size() << "\n\n";
 }
 
-
-SegReplace::Expander GfaDeoverlapper::build_SegReplace_(bool filter_abnormal)
+SegReplace::Expander GfaDeoverlapper::build_SegReplace_()
 {
-    SegReplace::Expander ex(rulemap_, getAllSegmentNames());
+    log_stream() << "Building segment replacement rules ...\n";
+
+    SegReplace::Expander ex(rulemap_, getAllSegmentNames(), MIN_TRANS_LEN_);
     ex.build_index();
-    const SegReplace::RuleMap& idx = ex.index_view();
-    
-    if (filter_abnormal) {
-        auto seg_less = [](const SegReplace::Seg& a, const SegReplace::Seg& b) {
-            return std::tuple<uint64_t, uint32_t, uint32_t, bool>(SegReplace::Interval::seg_id(a), SegReplace::Interval::beg(a), SegReplace::Interval::end(a), SegReplace::Interval::is_reverse(a)) <
-                std::tuple<uint64_t, uint32_t, uint32_t, bool>(SegReplace::Interval::seg_id(b), SegReplace::Interval::beg(b), SegReplace::Interval::end(b), SegReplace::Interval::is_reverse(b));
-        };
 
-        bool changed = true;
-        while (changed) {
-            changed = false;
+    const size_t raw_rules = ex.index_view().size();
+    log_stream() << "  - Raw expanded rules: " << raw_rules << "\n";
 
-            // Sort keys
-            std::vector< SegReplace::Seg> keys;
-            keys.reserve(idx.size());
-            for (const auto& kv : idx) keys.push_back(kv.first);
-            std::sort(keys.begin(), keys.end(), seg_less);
+    const size_t removed_nonmonotonic = ex.filter_nonmonotonic_index();
 
-            std::vector<SegReplace::Seg> to_del;
-            to_del.reserve(keys.size() / 8 + 8);
-
-            for (size_t i = 1; i < keys.size(); ++i) {
-                const SegReplace::Seg& prev = keys[i - 1];
-                const SegReplace::Seg& cur  = keys[i];
-                const bool prev_is_rev = SegReplace::Interval::is_reverse(prev);
-                const bool cur_is_rev  = SegReplace::Interval::is_reverse(cur);
-
-                // seg_id and adjacency check
-                if (SegReplace::Interval::seg_id(prev) != SegReplace::Interval::seg_id(cur)) continue;
-                if (SegReplace::Interval::end(prev) != SegReplace::Interval::beg(cur)) continue;
-
-                auto it0 = idx.find(prev);
-                auto it1 = idx.find(cur);
-                if (it0 == idx.end() || it1 == idx.end()) continue;
-
-                auto touches = [&](const SegReplace::Expansion& prev_v, const SegReplace::Expansion& cur_v) -> bool {
-                    if (prev_v.empty() || cur_v.empty()) return false;
-                    const SegReplace::Seg& a = prev_is_rev ? SegReplace::Interval::toggle_strand(prev_v.front()) : prev_v.back();
-                    const SegReplace::Seg& b = cur_is_rev  ? SegReplace::Interval::toggle_strand(cur_v.back())   : cur_v.front();
-                    return a == b;
-                };
-
-                const SegReplace::Expansion& v0 = it0->second;
-                const SegReplace::Expansion& v1 = it1->second;
-
-                if (!touches(v0, v1)) continue;
-
-                const uint64_t L0 = v0.size();
-                const uint64_t L1 = v1.size();
-
-                bool del_prev = false;
-                if (L0 != L1) del_prev = (L0 < L1);
-                else {
-                    const uint32_t b0 = SegReplace::Interval::beg(prev), e0 = SegReplace::Interval::end(prev);
-                    const uint32_t b1 = SegReplace::Interval::beg(cur),  e1 = SegReplace::Interval::end(cur);
-                    const uint32_t K0 = (e0 > b0) ? (e0 - b0) : 0;
-                    const uint32_t K1 = (e1 > b1) ? (e1 - b1) : 0;
-                    del_prev = (K0 < K1);
-                }
-
-                to_del.push_back(del_prev ? prev : cur);
-            }
-
-            // Delete marked keys
-            if (!to_del.empty()) {
-                std::sort(to_del.begin(), to_del.end(), seg_less);
-                to_del.erase(std::unique(to_del.begin(), to_del.end()), to_del.end());
-
-                for (const auto& k : to_del) ex.remove_from_index_by_key(k);
-                changed = true;
-            }
-        }
-    }
+    log_stream() << "  - Removed non-monotonic rules: " << removed_nonmonotonic << "\n";
+    log_stream() << "  - Final rules: " << ex.index_view().size() << "\n\n";
 
     if (DEBUG_ENABLED) ex.print_index();
     if (DEBUG_ENABLED) rulemap_verify(nodes_, ex.index_view());
 
     return ex;
 }
-
 
 void GfaDeoverlapper::rulemap_verify(const std::vector<GfaNode>& nodes, const SegReplace::RuleMap& idx) {
     wfa::WFAlignerGapAffine aligner(
@@ -2552,400 +2536,572 @@ bool GfaDeoverlapper::merge_and_dedup_cuts_with_set_(
 }
 
 
-void GfaDeoverlapper::emit_node_expansion_edges_(
-    const SegReplace::Expansion& node_expansion,
-    std::unordered_set<uint64_t>& seen_edges,
-    uint64_t& new_node_count,
-    uint64_t& new_edge_count,
-    gfaName& namer,
-    const std::string& v_name,
-    const std::string& w_name,
-    bool v_is_rev,
-    bool w_is_rev,
-    std::optional<std::pair<uint32_t,uint32_t>> v_span,
-    std::optional<std::pair<uint32_t,uint32_t>> w_span
-) {
-    if (DEBUG_ENABLED) {
-        if (v_span && w_span) {
-            debug_stream() << "Add arc: " << v_name << "("
-                        << v_span->first << "-" << v_span->second << ":"
-                        << (v_is_rev ? "-" : "+") << ") and "
-                        << w_name << "("
-                        << w_span->first << "-" << w_span->second << ":"
-                        << (w_is_rev ? "-" : "+") << ")\n";
-        } else {
-            debug_stream() << "Add arc: " << v_name << "(" << (v_is_rev ? "-" : "+") << ") and " << w_name << "(" << (w_is_rev ? "-" : "+") << ")\n";
-        }
-    }
+/* ================================================================================================================
+ *                                         EXPAND REWIRER START
+ * ================================================================================================================ */
+GfaDeoverlapExpandRewirer::GfaDeoverlapExpandRewirer(
+    GfaDeoverlapper& graph,
+    const SegReplace::Expander& expander
+) : graph_(graph), expander_(expander) {}
 
-    auto pretty_name = [&](SegReplace::Seg s) -> std::string {
-        const std::string& base = getNodeName(SegReplace::Interval::seg_id(s));
-        uint32_t beg = SegReplace::Interval::beg(s);
-        uint32_t end = SegReplace::Interval::end(s);
-        return namer.format_interval_name(base, beg, end, false);
-    };
-
-    auto ensure_segment = [&](SegReplace::Seg s, const std::string& seg_name) -> uint32_t {
-        bool is_new = false;
-        uint32_t sid = get_or_add_segment(seg_name, &is_new);
-
-        if (is_new) {
-            std::string seg_seq = slice_seq_or_star_(
-                nodes_,
-                SegReplace::Interval::seg_id(s),
-                SegReplace::Interval::beg(s),
-                SegReplace::Interval::end(s),
-                false
-            );
-
-            GfaNode& n = nodes_[sid];
-            n.name = seg_name;
-            n.sequence = seg_seq;
-            n.length = seg_seq != "*" ? (uint32_t)seg_seq.length() : 0;
-            total_segment_length_ += seg_seq.length();
-            ++new_node_count;
-        }
-
-        return sid;
-    };
-
-    if (node_expansion.size() < 2) {
-        if (DEBUG_ENABLED) { debug_stream() << "\n"; }
-        return;
-    }
-
-    for (size_t i = 0; i + 1 < node_expansion.size(); ++i) {
-        const SegReplace::Seg vs = node_expansion[i];
-        const SegReplace::Seg ws = node_expansion[i + 1];
-
-        std::string v_name_tmp = pretty_name(vs);
-        std::string w_name_tmp = pretty_name(ws);
-
-        bool v_rev = SegReplace::Interval::is_reverse(vs);
-        bool w_rev = SegReplace::Interval::is_reverse(ws);
-
-        uint32_t v_sid = ensure_segment(vs, v_name_tmp);
-        uint32_t w_sid = ensure_segment(ws, w_name_tmp);
-
-        uint32_t v_vid = (v_sid << 1) | (v_rev ? 1 : 0);
-        uint32_t w_vid = (w_sid << 1) | (w_rev ? 1 : 0);
-
-        if (seen_edges.insert(encode_edge_u64_(v_vid, w_vid)).second) {
-            ++new_edge_count;
-        }
-
-        if (DEBUG_ENABLED) {
-            debug_stream() << "  - " << v_name_tmp << (v_rev ? "-" : "+") << " -> " << w_name_tmp << (w_rev ? "-" : "+") << "\n";
-        }
-    }
-
-    if (DEBUG_ENABLED) { debug_stream() << "\n"; }
-}
-
-
-void GfaDeoverlapper::expand_and_rewire_edges_(
-    const SegReplace::Expander& ex
-) {
+void GfaDeoverlapExpandRewirer::run() {
     log_stream() << "Expanding segments and rewiring edges ...\n";
 
-    // ------------------------------------------------ Initialization ------------------------------------------------
-    // make sure each edge is only added once
-    std::unordered_set<uint64_t> seen_edges;
-    seen_edges.reserve(arcs_.size() * 2);
-    seen_edges.max_load_factor(0.7f);
+    seen_edges_.reserve(graph_.arcs_.size() * 2 + 1);
+    seen_edges_.max_load_factor(0.7f);
 
-    uint64_t new_node_count = 0;
-    uint64_t new_edge_count = 0;
+    build_active_degree_();
+    build_piece_queries_();
+    sanitize_local_replacements_();
+    preserve_isolated_identity_nodes_();
+    emit_isolated_expanded_nodes_();
+    rewire_existing_edges_();
+    replace_graph_edges_();
 
-    gfaName namer;  // for generating new segment names
+    log_stream() << "  - Local replacement pieces reverted: " << reverted_piece_count_ << "\n";
+    log_stream() << "  - New nodes added: " << new_node_count_ << "\n";
+    log_stream() << "  - New edges added: " << new_edge_count_ << "\n" << "\n";
+}
 
-    /**
-     * @brief Record the node that don't have any changes.
-     * @date 2026-05-19
-     * @version 0.1.3-r3
-     */
-    std::vector<uint32_t> active_degree(nodes_.size(), 0);
-    for (const auto& e : arcs_) {
+void GfaDeoverlapExpandRewirer::build_active_degree_() {
+    active_degree_.assign(graph_.nodes_.size(), 0);
+
+    for (const auto& e : graph_.arcs_) {
         if (e.get_del() || e.get_comp()) continue;
-        ++active_degree[e.get_source_segment_id()];
-        ++active_degree[e.get_target_segment_id()];
+        const uint32_t v = e.get_source_segment_id();
+        const uint32_t w = e.get_target_segment_id();
+
+        ++active_degree_[v];
+        ++active_degree_[w];
     }
+}
 
-    // ------------------------------------------------ Helper functions ------------------------------------------------
-    auto trivial_segment = [&](uint32_t sid) -> bool {
-        if (sid >= nodes_.size() || nodes_[sid].deleted) return false;
-        const uint32_t len = nodes_[sid].length;
-        if (sid >= cuts_.size()) return true;
-        if (!(cuts_[sid].v.size() == 2 && cuts_[sid].v[0] == 0 && cuts_[sid].v[1] == len)) return false;
-        if (len == 0) return true;
+void GfaDeoverlapExpandRewirer::build_piece_queries_() {
+    pieces_.clear();
+    pieces_.reserve(graph_.nodes_.size() * 4 + 1);
+    std::vector<SegReplace::Seg> repeated_pieces;
 
-        auto f = SegReplace::Interval::pack(sid, 0, len, false);
-        auto r = SegReplace::Interval::pack(sid, 0, len, true);
-        return is_identity_(ex.query(f), f) && is_identity_(ex.query(r), r);
-    };
+    for (uint32_t sid = 0; sid < graph_.nodes_.size(); ++sid) {
+        if (graph_.nodes_[sid].deleted) continue;
 
-    // original = original window_u128 (2026-05-22 v0.1.3-r4)
-    // query    = replacement expansion from ex.query(window_u128)
-    // If query produces a repeated interval later, fallback to the affected piece range to original windows.
-    struct ExpansionPiece_ {
-        SegReplace::Seg original;
-        SegReplace::Expansion query;
-    };
-
-    // Rule (2026-05-22 v0.1.3-r4):
-    //   If the same SegReplace::Seg appears multiple times in xs[*].query, then fallback all pieces from the first appearance to the current piece.
-    //
-    // Example:
-    //   piece[2].query contains A
-    //   piece[5].query contains A again
-    //
-    // Then:
-    //   piece[2], piece[3], piece[4], piece[5]
-    // are all replaced by their original windows.
-    auto sanitize_expansions = [&](std::vector<ExpansionPiece_>& xs) -> std::vector<SegReplace::Expansion> {
-        // ************************************************** Have bug here, need to rewrite later (Start) (2026-05-22 v0.1.3-r4) **************************************************
-        // std::unordered_map<SegReplace::Seg, size_t, SegReplace::U128Hash, SegReplace::U128Eq> first_seen;
-        // first_seen.reserve(xs.size() * 2 + 1);
-
-        // std::vector<uint8_t> use_original(xs.size(), 0);
-
-        // for (size_t i = 0; i < xs.size(); ++i) {
-        //     for (const auto& seg : xs[i].query) {
-        //         auto it = first_seen.find(seg);
-
-        //         if (it == first_seen.end()) {
-        //             first_seen.emplace(seg, i);
-        //             continue;
-        //         }
-
-        //         for (size_t j = it->second; j <= i; ++j) {
-        //             use_original[j] = 1;
-        //         }
-        //     }
-        // }
-
-        // std::vector<SegReplace::Expansion> out;
-        // out.reserve(xs.size());
-
-        // for (size_t i = 0; i < xs.size(); ++i) {
-        //     if (use_original[i]) {
-        //         out.push_back(SegReplace::Expansion{xs[i].original});
-        //     } else {
-        //         out.push_back(std::move(xs[i].query));
-        //     }
-        // }
-        // ************************************************** Have bug here, need to rewrite later (End) (2026-05-22 v0.1.3-r4) **************************************************
-
-        // May introduce loop in the graph (2026-05-22 v0.1.3-r4)
-        std::vector<SegReplace::Expansion> out;
-        out.reserve(xs.size());
-        for (size_t i = 0; i < xs.size(); ++i) {
-            out.push_back(std::move(xs[i].query));
+        for (SegReplace::Seg piece : collect_all_pieces_(sid, false)) {
+            SegReplace::Expansion query = expander_.query(piece);
+            if (piece_query_has_repeat_(query)) repeated_pieces.push_back(piece);
+            pieces_.try_emplace(piece, PieceQuery_{piece, std::move(query), false});
         }
-
-        return out;
-    };
-
-    // Collect non-overlap pieces on one side of the overlap window.
-    // left_side = true: collect source-side sequence before the overlap window
-    // left_side = false: collect target-side sequence after the overlap window
-    auto collect_non_overlap = [&ex](
-        uint32_t seg_id, bool seg_rev,
-        const std::vector<uint32_t>& cuts_vec,
-        uint32_t win_beg, uint32_t win_end,
-        bool left_side  // true: Only the left side of the window, false: Only take the right side
-    ) -> std::vector<ExpansionPiece_> {
-        std::vector<ExpansionPiece_> res;
-
-        if (cuts_vec.size() > 1) res.reserve(cuts_vec.size() - 1);
-
-        for (size_t i = 0; i + 1 < cuts_vec.size(); ++i) {
-            const uint32_t beg = cuts_vec[i];
-            const uint32_t end = cuts_vec[i + 1];
-
-            const bool overlap_with_window =
-                (!seg_rev && ((left_side && end > win_beg) || (!left_side && beg < win_end))) ||
-                ( seg_rev && ((left_side && beg < win_end) || (!left_side && end > win_beg)));
-
-            if (overlap_with_window) continue;
-
-            SegReplace::Seg window_u128 = SegReplace::Interval::pack(seg_id, beg, end, seg_rev);
-            res.push_back(ExpansionPiece_{window_u128, ex.query(window_u128)});
-        }
-
-        return res;
-    };
-
-    // Collect pieces inside an overlap window.
-    auto collect_overlap = [&ex](
-        uint32_t seg_id, bool seg_rev, const std::vector<uint32_t>& vec
-    ) -> std::vector<ExpansionPiece_> {
-        std::vector<ExpansionPiece_> res;
-        if (vec.size() > 1) res.reserve(vec.size() - 1);
-
-        for (size_t i = 0; i + 1 < vec.size(); ++i) {
-            const uint32_t beg = vec[i];
-            const uint32_t end = vec[i + 1];
-
-            SegReplace::Seg window_u128 = SegReplace::Interval::pack(seg_id, beg, end, seg_rev);
-            res.push_back(ExpansionPiece_{window_u128, ex.query(window_u128)});
-        }
-
-        return res;
-    };
-
-    // ------------------------------------------------ Preserve isolated unchanged nodes ------------------------------------------------
-    keep_unused_nodes_.assign(nodes_.size(), 0);
-    for (uint32_t sid = 0; sid < nodes_.size(); ++sid) {
-        if (active_degree[sid] == 0 && trivial_segment(sid)) {
-            keep_unused_nodes_[sid] = 1;
+        for (SegReplace::Seg piece : collect_all_pieces_(sid, true)) {
+            SegReplace::Expansion query = expander_.query(piece);
+            if (piece_query_has_repeat_(query)) repeated_pieces.push_back(piece);
+            pieces_.try_emplace(piece, PieceQuery_{piece, std::move(query), false});
         }
     }
 
-    // ------------------------------------------------ Expand and collect new edge chains ------------------------------------------------
-    const uint64_t arc_num = arcs_.size();
+    for (SegReplace::Seg piece : repeated_pieces) {
+        revert_piece_(piece);
+    }
+}
 
-    ProgressTracker prog(arc_num);  // Progress tracker for merging unitigs
+void GfaDeoverlapExpandRewirer::sanitize_local_replacements_() {
+    for (const GfaArc& arc : graph_.arcs_) {
+        if (arc.get_del() || arc.get_comp()) continue;
+        sanitize_arc_repeats_(arc);
+    }
+}
 
-    for (size_t ai = 0; ai < arc_num; ++ai) {
+void GfaDeoverlapExpandRewirer::sanitize_arc_repeats_(const GfaArc& arc) {
+    if (arc.ov != arc.ow) return;
+
+    const uint32_t v_seg_id = arc.get_source_segment_id();
+    const uint32_t w_seg_id = arc.get_target_segment_id();
+    const bool v_is_rev = arc.get_source_is_reverse();
+    const bool w_is_rev = arc.get_target_is_reverse();
+
+    const uint32_t v_length = graph_.nodes_[v_seg_id].length;
+    const uint32_t w_length = graph_.nodes_[w_seg_id].length;
+
+    auto [vb, ve] = v_overlap_pos_(v_length, arc.ov, v_is_rev);
+    auto [wb, we] = w_overlap_pos_(w_length, arc.ow, w_is_rev);
+
+    std::vector<SegReplace::Seg> source = collect_non_overlap_pieces_(v_seg_id, v_is_rev, vb, ve, true);
+    std::vector<SegReplace::Seg> target = collect_non_overlap_pieces_(w_seg_id, w_is_rev, wb, we, false);
+    std::vector<SegReplace::Seg> source_overlap = collect_overlap_pieces_(v_seg_id, v_is_rev, collect_overlap_cuts_(v_seg_id, vb, ve));
+    std::vector<SegReplace::Seg> target_overlap = collect_overlap_pieces_(w_seg_id, w_is_rev, collect_overlap_cuts_(w_seg_id, wb, we));
+
+    std::vector<SegReplace::Seg> local;
+    local.reserve(source.size() + std::max(source_overlap.size(), target_overlap.size()) + target.size());
+
+    local.insert(local.end(), source.begin(), source.end());
+    local.insert(local.end(), source_overlap.begin(), source_overlap.end());
+    local.insert(local.end(), target.begin(), target.end());
+    sanitize_piece_repeats_(local);
+
+    local.clear();
+    local.insert(local.end(), source.begin(), source.end());
+    local.insert(local.end(), target_overlap.begin(), target_overlap.end());
+    local.insert(local.end(), target.begin(), target.end());
+    sanitize_piece_repeats_(local);
+}
+
+void GfaDeoverlapExpandRewirer::sanitize_piece_repeats_(
+    const std::vector<SegReplace::Seg>& local_pieces
+) {
+    if (local_pieces.empty()) return;
+
+    std::unordered_map<SegReplace::Seg, SegReplace::Seg, SegReplace::U128Hash, SegReplace::U128Eq> first_owner;
+    first_owner.reserve(local_pieces.size() * 4 + 1);
+
+    for (SegReplace::Seg owner : local_pieces) {
+        auto pit = pieces_.find(owner);
+        if (pit == pieces_.end() || pit->second.use_original) continue;
+
+        const SegReplace::Expansion& query = pit->second.query;
+        if (is_identity_(query, owner)) continue;
+
+        for (SegReplace::Seg s : query) {
+            if (s == owner) {
+                revert_piece_(owner);
+                break;
+            }
+
+            auto it = first_owner.find(s);
+            if (it == first_owner.end()) {
+                first_owner.emplace(s, owner);
+                continue;
+            }
+
+            revert_piece_(it->second);
+            revert_piece_(owner);
+            break;
+        }
+    }
+}
+
+void GfaDeoverlapExpandRewirer::preserve_isolated_identity_nodes_() {
+    graph_.keep_unused_nodes_.assign(graph_.nodes_.size(), 0);
+
+    for (uint32_t sid = 0; sid < graph_.nodes_.size(); ++sid) {
+        if (sid < active_degree_.size() && active_degree_[sid] == 0 && trivial_segment_(sid)) {
+            graph_.keep_unused_nodes_[sid] = 1;
+        }
+    }
+}
+
+void GfaDeoverlapExpandRewirer::emit_isolated_expanded_nodes_() {
+    for (uint32_t sid = 0; sid < graph_.nodes_.size(); ++sid) {
+        if (graph_.nodes_[sid].deleted) continue;
+        if (sid >= active_degree_.size() || active_degree_[sid] != 0) continue;
+        if (trivial_segment_(sid)) continue;
+
+        std::vector<uint32_t> sample_ids;
+        graph_.merge_sample_ids_into(sample_ids, graph_.nodes_[sid].sample_ids);
+
+        Chain_ chain = build_chain_(
+            collect_all_pieces_(sid, false),
+            sample_ids,
+            graph_.nodes_[sid].aux,
+            {},
+            {},
+            {},
+            {},
+            {},
+            {}
+        );
+
+        std::vector<uint32_t> vids = materialize_chain_(chain);
+        for (uint32_t vid : vids) {
+            const uint32_t keep_sid = vid >> 1;
+            if (keep_sid >= graph_.keep_unused_nodes_.size()) {
+                graph_.keep_unused_nodes_.resize(keep_sid + 1, 0);
+            }
+            graph_.keep_unused_nodes_[keep_sid] = 1;
+        }
+
+        for (size_t i = 0; i + 1 < vids.size(); ++i) {
+            emit_bridge_edge_(vids[i], vids[i + 1]);
+        }
+    }
+}
+
+void GfaDeoverlapExpandRewirer::rewire_existing_edges_() {
+    ProgressTracker prog(graph_.arcs_.size());
+
+    for (const GfaArc& arc : graph_.arcs_) {
         prog.hit();
 
-        const GfaArc& arc = arcs_[ai];
         if (arc.get_del() || arc.get_comp()) continue;
 
         const uint32_t v_seg_id = arc.get_source_segment_id();
         const uint32_t w_seg_id = arc.get_target_segment_id();
-        const bool     v_is_rev = arc.get_source_is_reverse();
-        const bool     w_is_rev = arc.get_target_is_reverse();
+        const bool v_is_rev = arc.get_source_is_reverse();
+        const bool w_is_rev = arc.get_target_is_reverse();
 
-        const std::string& v_name = nodes_[v_seg_id].name;
-        const std::string& w_name = nodes_[w_seg_id].name;
-
-        const uint32_t v_length = nodes_[v_seg_id].length;
-        const uint32_t w_length = nodes_[w_seg_id].length;
+        const std::string& v_name = graph_.nodes_[v_seg_id].name;
+        const std::string& w_name = graph_.nodes_[w_seg_id].name;
 
         if (arc.ov != arc.ow) {
             error_stream() << "Overlap values are not equal for " << v_name << " and " << w_name << "\n";
             std::exit(1);
         }
 
-        /**
-         * @brief Record the node that don't have any changes.
-         * @date 2026-05-19
-         * @version 0.1.3-r3
-         */
-        if ((arc.ov == 0 || arc.ov == INT32_MAX) && (arc.ow == 0 || arc.ow == INT32_MAX) && trivial_segment(v_seg_id) && trivial_segment(w_seg_id)) {
-            seen_edges.insert(encode_edge_u64_(arc.get_source_vertex_id(), arc.get_target_vertex_id()));
+        if ((arc.ov == 0 || arc.ov == INT32_MAX) && (arc.ow == 0 || arc.ow == INT32_MAX) && trivial_segment_(v_seg_id) && trivial_segment_(w_seg_id)) {
+            emit_bridge_edge_(arc.get_source_vertex_id(), arc.get_target_vertex_id());
             continue;
         }
 
-        // ------------------------------------------------ Compute overlap windows ------------------------------------------------
-        // Compute overlap windows on source and target
+        const uint32_t v_length = graph_.nodes_[v_seg_id].length;
+        const uint32_t w_length = graph_.nodes_[w_seg_id].length;
+
         auto [vb, ve] = v_overlap_pos_(v_length, arc.ov, v_is_rev);
         auto [wb, we] = w_overlap_pos_(w_length, arc.ow, w_is_rev);
 
-        // Cuts positions
-        const auto& v_cuts = cuts_[v_seg_id].v;
-        const auto& w_cuts = cuts_[w_seg_id].v;
+        std::vector<uint32_t> cut_in_overlap_v = collect_overlap_cuts_(v_seg_id, vb, ve);
+        std::vector<uint32_t> cut_in_overlap_w = collect_overlap_cuts_(w_seg_id, wb, we);
 
-        // Extract cuts within overlap windows
-        auto it_v_1 = std::lower_bound(v_cuts.begin(), v_cuts.end(), vb);
-        auto it_v_2 = std::upper_bound(v_cuts.begin(), v_cuts.end(), ve);
-        auto it_w_1 = std::lower_bound(w_cuts.begin(), w_cuts.end(), wb);
-        auto it_w_2 = std::upper_bound(w_cuts.begin(), w_cuts.end(), we);
+        std::vector<uint32_t> source_sample_ids;
+        std::vector<uint32_t> target_sample_ids;
+        std::vector<uint32_t> overlap_sample_ids;
 
-        std::vector<uint32_t> cut_in_overlap_v(it_v_1, it_v_2);
-        std::vector<uint32_t> cut_in_overlap_w(it_w_1, it_w_2);
+        graph_.merge_sample_ids_into(source_sample_ids, graph_.nodes_[v_seg_id].sample_ids);
+        graph_.merge_sample_ids_into(overlap_sample_ids, graph_.nodes_[v_seg_id].sample_ids);
+        graph_.merge_sample_ids_into(target_sample_ids, graph_.nodes_[w_seg_id].sample_ids);
+        graph_.merge_sample_ids_into(overlap_sample_ids, graph_.nodes_[w_seg_id].sample_ids);
+        GfaAux overlap_tags = graph_.nodes_[v_seg_id].aux;
+        graph_.merge_variant_tags_into(overlap_tags, graph_.nodes_[w_seg_id].aux);
 
-        // ------------------------------------------------ Collect source/target pieces ------------------------------------------------
-        // no-overlap
-        std::vector<ExpansionPiece_> source_pieces = collect_non_overlap(v_seg_id, v_is_rev, v_cuts, vb, ve, /*left_side=*/true);
-        std::vector<ExpansionPiece_> target_pieces = collect_non_overlap(w_seg_id, w_is_rev, w_cuts, wb, we, /*left_side=*/false);
+        std::vector<SegReplace::Seg> source = collect_non_overlap_pieces_(v_seg_id, v_is_rev, vb, ve, true);
+        std::vector<SegReplace::Seg> target = collect_non_overlap_pieces_(w_seg_id, w_is_rev, wb, we, false);
 
-        // overlap
-        std::vector<ExpansionPiece_> source_overlap_pieces = collect_overlap(v_seg_id, v_is_rev, cut_in_overlap_v);
-        // std::vector<ExpansionPiece_> target_overlap_pieces = collect_overlap(w_seg_id, w_is_rev, cut_in_overlap_w);
-
-        // Merge source expansions with overlap
-        if (v_is_rev) {
-            source_pieces.insert(
-                source_pieces.begin(),
-                source_overlap_pieces.begin(),
-                source_overlap_pieces.end()
-            );
-            std::reverse(source_pieces.begin(), source_pieces.end());
-        } else {
-            source_pieces.insert(
-                source_pieces.end(),
-                source_overlap_pieces.begin(),
-                source_overlap_pieces.end()
-            );
-        }
-
-        if (w_is_rev) {
-            std::reverse(target_pieces.begin(), target_pieces.end());
-        }
-
-        // ------------------------------------------------ Sanitize repeated replacement pieces (2026-05-22 v0.1.3-r4) ------------------------------------------------
-        // If one replacement interval appears more than once inside the same source/target side,
-        // fallback the whole affected piece range to original windows instead of query results.
-        std::vector<SegReplace::Expansion> source_expansions = sanitize_expansions(source_pieces);
-        std::vector<SegReplace::Expansion> target_expansions = sanitize_expansions(target_pieces);
-
-        // ------------------------------------------------ Build expansion chain ------------------------------------------------
-        // Build expansion chain
-        SegReplace::Expansion node_expansion;
-        {
-            size_t total_sz = 0;
-            for (const auto& seq : source_expansions) total_sz += seq.size();
-            for (const auto& seq : target_expansions) total_sz += seq.size();
-            node_expansion.reserve(total_sz);
-        }
-
-        for (const auto& seq : source_expansions) {
-            node_expansion.insert(node_expansion.end(), seq.begin(), seq.end());
-        }
-        for (const auto& seq : target_expansions) {
-            node_expansion.insert(node_expansion.end(), seq.begin(), seq.end());
-        }
-
-        // Disabled due to high time complexity (O(N^2)). But it may improve results slightly, it will be rewrited later. (2026-04-07)
-        // refine_chain_(node_expansion, ex);
-
-        // ------------------------------------------------ Emit edges from sanitized chain ------------------------------------------------
-        // Add edges
-        emit_node_expansion_edges_(
-            node_expansion,
-            seen_edges,
-            new_node_count,
-            new_edge_count,
-            namer,
-            v_name, w_name,
-            v_is_rev, w_is_rev,
-            std::make_optional(std::pair<uint32_t,uint32_t>{vb, ve}),
-            std::make_optional(std::pair<uint32_t,uint32_t>{wb, we})
+        Chain_ chain = build_chain_(
+            source,
+            source_sample_ids,
+            graph_.nodes_[v_seg_id].aux,
+            collect_overlap_pieces_(v_seg_id, v_is_rev, cut_in_overlap_v),
+            overlap_sample_ids,
+            overlap_tags,
+            target,
+            target_sample_ids,
+            graph_.nodes_[w_seg_id].aux
         );
-    }
 
-    // ------------------------------------------------ Replace graph edges ------------------------------------------------
-    // Mark all non-complementary arcs for deletion
-    for (auto& e : arcs_) {
-        if (!e.get_comp()) e.set_del(true);
-    }
-    rebuild_after_edits();
+        if (DEBUG_ENABLED) {
+            debug_stream() << "Add arc: " << v_name << "(" << vb << "-" << ve << ":" << (v_is_rev ? "-" : "+") << ") and " << w_name << "(" << wb << "-" << we << ":" << (w_is_rev ? "-" : "+") << ")\n";
+        }
 
-    // Add edges
-    for (const auto& k : seen_edges) {
-        auto [v, w] = decode_edge_u64_(k);
-        add_arc(v, w, 0, 0, -1, false);
-    }
-    rebuild_after_edits();
+        emit_chain_edges_(chain);
 
-    // ------------------------------------------------ Summary ------------------------------------------------
-    log_stream() << "  - New nodes added: " << new_node_count << "\n";
-    log_stream() << "  - New edges added: " << new_edge_count << "\n" << "\n";
+        Chain_ target_overlap_chain = build_chain_(
+            source,
+            source_sample_ids,
+            graph_.nodes_[v_seg_id].aux,
+            collect_overlap_pieces_(w_seg_id, w_is_rev, cut_in_overlap_w),
+            overlap_sample_ids,
+            overlap_tags,
+            target,
+            target_sample_ids,
+            graph_.nodes_[w_seg_id].aux
+        );
+
+        emit_chain_edges_(target_overlap_chain);
+
+        if (DEBUG_ENABLED) debug_stream() << "\n";
+    }
 }
 
+void GfaDeoverlapExpandRewirer::replace_graph_edges_() {
+    for (auto& e : graph_.arcs_) {
+        if (!e.get_comp()) e.set_del(true);
+    }
+    graph_.rebuild_after_edits();
+
+    for (const auto& k : seen_edges_) {
+        auto [v, w] = decode_edge_u64_(k);
+        graph_.add_arc(v, w, 0, 0, -1, false);
+    }
+    graph_.rebuild_after_edits();
+}
+
+bool GfaDeoverlapExpandRewirer::trivial_segment_(uint32_t sid) const {
+    if (sid >= graph_.nodes_.size() || graph_.nodes_[sid].deleted) return false;
+
+    const uint32_t len = graph_.nodes_[sid].length;
+    if (sid >= graph_.cuts_.size()) return true;
+    if (!(graph_.cuts_[sid].v.size() == 2 && graph_.cuts_[sid].v[0] == 0 && graph_.cuts_[sid].v[1] == len)) return false;
+
+    SegReplace::Seg f = SegReplace::Interval::pack(sid, 0, len, false);
+    SegReplace::Seg r = SegReplace::Interval::pack(sid, 0, len, true);
+
+    return is_identity_(safe_expansion_(f), f) && is_identity_(safe_expansion_(r), r);
+}
+
+bool GfaDeoverlapExpandRewirer::piece_query_has_repeat_(const SegReplace::Expansion& query) const {
+    std::unordered_set<SegReplace::Seg, SegReplace::U128Hash, SegReplace::U128Eq> seen;
+    seen.reserve(query.size() * 2 + 1);
+
+    for (SegReplace::Seg s : query) {
+        if (!seen.insert(s).second) return true;
+    }
+    return false;
+}
+
+SegReplace::Expansion GfaDeoverlapExpandRewirer::safe_expansion_(SegReplace::Seg piece) const {
+    auto it = pieces_.find(piece);
+    if (it == pieces_.end() || it->second.use_original) {
+        return SegReplace::Expansion{piece};
+    }
+    return it->second.query;
+}
+
+std::vector<SegReplace::Seg> GfaDeoverlapExpandRewirer::collect_all_pieces_(uint32_t sid, bool rev) const {
+    std::vector<SegReplace::Seg> out;
+
+    if (sid >= graph_.nodes_.size() || graph_.nodes_[sid].deleted) return out;
+
+    const std::vector<uint32_t>* cuts = nullptr;
+    std::vector<uint32_t> fallback;
+
+    if (sid < graph_.cuts_.size() && graph_.cuts_[sid].v.size() >= 2) {
+        cuts = &graph_.cuts_[sid].v;
+    } else {
+        fallback = {0, graph_.nodes_[sid].length};
+        cuts = &fallback;
+    }
+
+    out.reserve(cuts->size() - 1);
+
+    for (size_t i = 0; i + 1 < cuts->size(); ++i) {
+        out.push_back(SegReplace::Interval::pack(sid, (*cuts)[i], (*cuts)[i + 1], rev));
+    }
+
+    if (rev) std::reverse(out.begin(), out.end());
+    return out;
+}
+
+std::vector<SegReplace::Seg> GfaDeoverlapExpandRewirer::collect_non_overlap_pieces_(
+    uint32_t sid,
+    bool rev,
+    uint32_t win_beg,
+    uint32_t win_end,
+    bool left_side
+) const {
+    std::vector<SegReplace::Seg> out;
+    if (sid >= graph_.cuts_.size()) return collect_all_pieces_(sid, rev);
+
+    const auto& cuts = graph_.cuts_[sid].v;
+    if (cuts.size() > 1) out.reserve(cuts.size() - 1);
+
+    for (size_t i = 0; i + 1 < cuts.size(); ++i) {
+        const uint32_t beg = cuts[i];
+        const uint32_t end = cuts[i + 1];
+
+        bool keep = false;
+        if (left_side) {
+            keep = !rev ? (end <= win_beg) : (beg >= win_end);
+        } else {
+            keep = !rev ? (beg >= win_end) : (end <= win_beg);
+        }
+
+        if (keep) {
+            out.push_back(SegReplace::Interval::pack(sid, beg, end, rev));
+        }
+    }
+
+    if (rev) std::reverse(out.begin(), out.end());
+    return out;
+}
+
+std::vector<SegReplace::Seg> GfaDeoverlapExpandRewirer::collect_overlap_pieces_(
+    uint32_t sid,
+    bool rev,
+    const std::vector<uint32_t>& cuts
+) const {
+    std::vector<SegReplace::Seg> out;
+    if (cuts.size() > 1) out.reserve(cuts.size() - 1);
+
+    for (size_t i = 0; i + 1 < cuts.size(); ++i) {
+        out.push_back(SegReplace::Interval::pack(sid, cuts[i], cuts[i + 1], rev));
+    }
+
+    if (rev) std::reverse(out.begin(), out.end());
+    return out;
+}
+
+std::vector<uint32_t> GfaDeoverlapExpandRewirer::collect_overlap_cuts_(
+    uint32_t sid,
+    uint32_t beg,
+    uint32_t end
+) const {
+    std::vector<uint32_t> cuts;
+    cuts.reserve(8);
+    cuts.push_back(beg);
+
+    if (sid < graph_.cuts_.size()) {
+        const auto& src = graph_.cuts_[sid].v;
+        auto first = std::lower_bound(src.begin(), src.end(), beg);
+        auto last = std::upper_bound(src.begin(), src.end(), end);
+        cuts.insert(cuts.end(), first, last);
+    }
+
+    cuts.push_back(end);
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+    return cuts;
+}
+
+GfaDeoverlapExpandRewirer::Chain_ GfaDeoverlapExpandRewirer::build_chain_(
+    const std::vector<SegReplace::Seg>& source,
+    const std::vector<uint32_t>& source_sample_ids,
+    const GfaAux& source_tags,
+    const std::vector<SegReplace::Seg>& overlap,
+    const std::vector<uint32_t>& overlap_sample_ids,
+    const GfaAux& overlap_tags,
+    const std::vector<SegReplace::Seg>& target,
+    const std::vector<uint32_t>& target_sample_ids,
+    const GfaAux& target_tags
+) const {
+    Chain_ chain;
+
+    append_piece_group_(source, source_sample_ids, source_tags, chain);
+    append_piece_group_(overlap, overlap_sample_ids, overlap_tags, chain);
+    append_piece_group_(target, target_sample_ids, target_tags, chain);
+
+    return chain;
+}
+
+void GfaDeoverlapExpandRewirer::append_piece_group_(
+    const std::vector<SegReplace::Seg>& pieces,
+    const std::vector<uint32_t>& sample_ids,
+    const GfaAux& variant_tags,
+    Chain_& chain
+) const {
+    for (SegReplace::Seg piece : pieces) {
+        SegReplace::Expansion safe = safe_expansion_(piece);
+        for (SegReplace::Seg s : safe) {
+            chain.expansion.push_back(s);
+            chain.sample_ids.push_back(sample_ids);
+            chain.variant_tags.push_back(variant_tags);
+        }
+    }
+}
+
+bool GfaDeoverlapExpandRewirer::revert_piece_(SegReplace::Seg piece) {
+    bool changed = mark_piece_original_(piece);
+    changed = mark_piece_original_(SegReplace::Interval::toggle_strand(piece)) || changed;
+
+    if (changed) {
+        expander_.remove_from_index_by_key(piece);
+    }
+
+    return changed;
+}
+
+bool GfaDeoverlapExpandRewirer::mark_piece_original_(SegReplace::Seg piece) {
+    auto it = pieces_.find(piece);
+    if (it == pieces_.end()) return false;
+    if (it->second.use_original) return false;
+    if (is_identity_(it->second.query, it->second.original)) return false;
+
+    it->second.use_original = true;
+    ++reverted_piece_count_;
+    return true;
+}
+
+std::vector<uint32_t> GfaDeoverlapExpandRewirer::materialize_chain_(const Chain_& chain) {
+    if (chain.expansion.size() != chain.sample_ids.size() || chain.expansion.size() != chain.variant_tags.size()) {
+        error_stream() << "metadata size mismatch with node expansion\n";
+        std::exit(1);
+    }
+
+    std::vector<uint32_t> vids;
+    vids.reserve(chain.expansion.size());
+
+    for (size_t i = 0; i < chain.expansion.size(); ++i) {
+        SegReplace::Seg s = chain.expansion[i];
+        uint32_t sid = materialize_segment_(s, chain.sample_ids[i], chain.variant_tags[i]);
+        bool rev = SegReplace::Interval::is_reverse(s);
+        vids.push_back((sid << 1) | (rev ? 1u : 0u));
+    }
+
+    return vids;
+}
+
+uint32_t GfaDeoverlapExpandRewirer::materialize_segment_(
+    SegReplace::Seg s,
+    const std::vector<uint32_t>& sample_ids,
+    const GfaAux& variant_tags
+) {
+    const uint32_t original_sid = static_cast<uint32_t>(SegReplace::Interval::seg_id(s));
+
+    if (original_sid >= graph_.nodes_.size()) {
+        error_stream() << "Invalid replacement segment id: " << original_sid << "\n";
+        std::exit(1);
+    }
+
+    const bool full_interval = SegReplace::Interval::beg(s) == 0 && SegReplace::Interval::end(s) == graph_.nodes_[original_sid].length;
+
+    if (full_interval) {
+        graph_.merge_sample_ids_into(graph_.nodes_[original_sid].sample_ids, sample_ids);
+        graph_.merge_variant_tags_into(graph_.nodes_[original_sid].aux, variant_tags);
+        return original_sid;
+    }
+
+    const std::string& base = graph_.getNodeName(original_sid);
+    const uint32_t beg = SegReplace::Interval::beg(s);
+    const uint32_t end = SegReplace::Interval::end(s);
+    const std::string seg_name = namer_.format_interval_name(base, beg, end, false);
+    const bool inherited_complex = graph_.nodes_[original_sid].is_complex;
+
+    bool is_new = false;
+    uint32_t sid = graph_.get_or_add_segment(seg_name, &is_new);
+
+    graph_.merge_sample_ids_into(graph_.nodes_[sid].sample_ids, sample_ids);
+    graph_.nodes_[sid].is_complex = graph_.nodes_[sid].is_complex || inherited_complex;
+    graph_.merge_variant_tags_into(graph_.nodes_[sid].aux, variant_tags);
+
+    if (is_new) {
+        std::string seg_seq = GfaGraph::slice_seq_or_star_(graph_.nodes_, original_sid, beg, end, false);
+
+        GfaNode& n = graph_.nodes_[sid];
+        n.name = seg_name;
+        n.sequence = seg_seq;
+        n.length = seg_seq != "*" ? static_cast<uint32_t>(seg_seq.length()) : 0;
+        n.deleted = false;
+        graph_.total_segment_length_ += n.length;
+        ++new_node_count_;
+    }
+
+    return sid;
+}
+
+void GfaDeoverlapExpandRewirer::emit_chain_edges_(const Chain_& chain) {
+    std::vector<uint32_t> vids = materialize_chain_(chain);
+
+    for (size_t i = 0; i + 1 < vids.size(); ++i) {
+        emit_bridge_edge_(vids[i], vids[i + 1]);
+
+        if (DEBUG_ENABLED) {
+            const uint32_t v_sid = vids[i] >> 1;
+            const uint32_t w_sid = vids[i + 1] >> 1;
+            debug_stream() << "  - " << graph_.getNodeName(v_sid) << ((vids[i] & 1u) ? "-" : "+") << " -> " << graph_.getNodeName(w_sid) << ((vids[i + 1] & 1u) ? "-" : "+") << "\n";
+        }
+    }
+}
+
+void GfaDeoverlapExpandRewirer::emit_bridge_edge_(uint32_t from, uint32_t to) {
+    if (seen_edges_.insert(encode_edge_u64_(from, to)).second) {
+        ++new_edge_count_;
+    }
+}
+/* ================================================================================================================
+ *                                         EXPAND REWIRER END
+ * ================================================================================================================ */
+
+
+void GfaDeoverlapper::expand_and_rewire_edges_(
+    const SegReplace::Expander& ex
+) {
+    GfaDeoverlapExpandRewirer rewirer(*this, ex);
+    rewirer.run();
+}
 
 void GfaDeoverlapper::remove_unused_nodes_() {
     log_stream() << "Removing unused nodes ...\n";
@@ -2960,6 +3116,7 @@ void GfaDeoverlapper::remove_unused_nodes_() {
 
     uint64_t removed_num = 0;
     for (size_t i = 0; i < nodes_.size(); i++) {
+        if (nodes_[i].deleted) continue;
         if (!used[i]) {
             /**
              * @brief Retain the node that don't have any changes.
@@ -2980,38 +3137,22 @@ void GfaDeoverlapper::remove_unused_nodes_() {
 
 // Main process
 void GfaDeoverlapper::deoverlap(const std::string& prefix) {
-    log_stream() << "Normalizing overlapping GFA to non-overlapping GFA ...\n" << "\n";
-    // 0. Basic finishing
+    log_stream() << "Normalizing overlapping GFA to non-overlapping GFA ...\n\n";
+    
     finalize_();
-
-    // 1. Handle inconsistencies in forward and reverse overlap and filter corresponding edges
     prune_overlaps_();
-
-    // 2. Initialize cuts_: boundaries + window endpoints
     initialize_cuts_();
-
-    // 3.1. Align overlaps
     overlaps_align_();
+    dedup_aligns_(bubble_aligns_.size());
 
-    // 3.2. Deduplicate alignments
-    dedup_aligns_();
-
-    // 4. group alignments by connected segments
     const auto align_groups = build_align_groups_();
-
-    // 5. build cuts, propagate cuts, and prune abnormal cuts
     build_propagate_prune_cuts_(align_groups);
     if (DEBUG_ENABLED) print_cuts(cuts_);
-
-    // 6. build rulemap from final cuts
     build_rulemap_(align_groups);
-    SegReplace::Expander ex = build_SegReplace_(true);
-    ex.save_map(prefix + ".deoverlap.map");  // save rulemap
 
-    // 7. Apply rules: expand and rewire 0M edges
+    SegReplace::Expander ex = build_SegReplace_();
+    ex.save_map(prefix + ".deoverlap.map");
     expand_and_rewire_edges_(ex);
-
-    // 8. Remove unused nodes
     remove_unused_nodes_();
 
     log_stream() << "Finished normalizing to non-overlapping GFA.\n" << "\n";

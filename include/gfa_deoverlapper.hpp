@@ -33,8 +33,11 @@
 //   deoverlapper.deoverlap();
 //   deoverlapper.write_to_GFA(FILE);
 
+class GfaDeoverlapExpandRewirer;
+
 class GfaDeoverlapper : public GfaGraph {
 public:
+    friend class GfaDeoverlapExpandRewirer;
 
     struct Cuts {
         std::vector<uint32_t> v;
@@ -43,13 +46,27 @@ public:
 
 public:
 
-    GfaDeoverlapper(int min_eq, double min_match_ratio, int max_prop_iters, uint32_t max_abnormal_cut_len_, uint32_t min_abnormal_cut_count_) {
+    GfaDeoverlapper(
+        int min_eq, 
+        double min_match_ratio,
+        double min_ali_ratio,
+        uint8_t min_mapq,
+        uint16_t max_prop_iters, 
+        uint32_t max_abnormal_cut_len, 
+        uint32_t min_abnormal_cut_count, 
+        uint32_t min_trans_len,
+        std::string mm2_preset
+    ) {
         set_forbid_overlap(false);
         MIN_EQ_FOR_CUT_ = min_eq;
         MIN_MATCH_RATIO_ = min_match_ratio;
+        MIN_ALI_RATIO_ = min_ali_ratio;
+        MIN_MAPQ_ = min_mapq;
         MAX_PROPAGATION_ITERS_ = max_prop_iters;
-        MAX_ABNORMAL_CUT_LEN_ = max_abnormal_cut_len_;
-        MIN_ABNORMAL_CUT_COUNT_ = min_abnormal_cut_count_;
+        MAX_ABNORMAL_CUT_LEN_ = max_abnormal_cut_len;
+        MIN_ABNORMAL_CUT_COUNT_ = min_abnormal_cut_count;
+        MIN_TRANS_LEN_ = min_trans_len;
+        if (!mm2_preset.empty()) MM2_PRESET_ = mm2_preset;
     }
 
     void set_opts(
@@ -67,6 +84,7 @@ protected:  // data will be used in rulemap building
     struct MmWfaHit {
         uint32_t r_beg = 0, r_end = 0;     // alignment start/end on reference (0-based, end-exclusive)
         uint32_t q_beg = 0, q_end = 0;     // alignment start/end on query (0-based, end-exclusive, excluded soft-clip)
+        uint8_t mapq = 0;
         std::string cigar;
     };
     struct BubbleAlignment {
@@ -80,12 +98,14 @@ protected:  // data will be used in rulemap building
         uint32_t                v_a;      // [31:1]=segment id, [0]=rev, A vertex id
         uint32_t                v_b;      // [31:1]=segment id, [0]=rev, B vertex id
         std::vector<CIGAR::COp> ops;      // alignment cigar (sega vs segb)
-        int32_t                 idx = INT32_MAX;  // Index of this alignment in bubbles, homologous and forks. Used for deduplication.
+        uint8_t                 mapq;     // mapping quality
+        int32_t                 idx = INT32_MAX;    // Index of this alignment in bubbles, homologous and forks. Used for deduplication.
+        bool                    force_cuts = false; // preserve exact boundaries for externally supplied alignments (augment)
 
         BubbleAlignment() = default;
 
-        BubbleAlignment(std::string na, std::string nb, std::uint32_t ba, std::uint32_t ea, std::uint32_t bb, std::uint32_t eb, uint32_t va, uint32_t vb, std::vector<CIGAR::COp>&& o, int32_t i = UINT32_MAX)
-            : name_a(std::move(na)), name_b(std::move(nb)), beg_a(ba), end_a(ea), beg_b(bb), end_b(eb), v_a(va), v_b(vb), ops(std::move(o)), idx(i) {}
+        BubbleAlignment(std::string na, std::string nb, std::uint32_t ba, std::uint32_t ea, std::uint32_t bb, std::uint32_t eb, uint32_t va, uint32_t vb, uint8_t mq, std::vector<CIGAR::COp>&& o, int32_t i = UINT32_MAX)
+            : name_a(std::move(na)), name_b(std::move(nb)), beg_a(ba), end_a(ea), beg_b(bb), end_b(eb), v_a(va), v_b(vb), mapq(mq), ops(std::move(o)), idx(i) {}
     };
 
     std::vector<BubbleAlignment> bubble_aligns_;  // Pairwise alignments between bubble branches
@@ -94,12 +114,18 @@ protected:  // data will be used in rulemap building
     SegReplace::RuleMap rulemap_;  // Replacement rules for segments
     std::vector<uint8_t> keep_unused_nodes_;  // Whether to keep segments that are not involved in any alignment-based replacement rule.
 
-    int MIN_EQ_FOR_CUT_;  // Only when the length of '=' in CIGAR >= threshold, a cut point is made / rulemap is established
-    double MIN_MATCH_RATIO_;  // Only when the ratio of '=/M' in CIGAR >= threshold, the alignment will be saved for rulemap building
-    int MAX_PROPAGATION_ITERS_;  // Maximum number of propagation iterations
+    int MIN_EQ_FOR_CUT_;              // Only when the length of '=' in CIGAR >= threshold, a cut point is made / rulemap is established
+    double MIN_MATCH_RATIO_;          // Only when the ratio of '=/M' in CIGAR >= threshold, the alignment will be saved for rulemap building
+    double MIN_ALI_RATIO_;            // minimum aligned length ratio against shorter sequence
+    uint8_t MIN_MAPQ_;                // Minimum mapping quality to be considered
+    uint16_t MAX_PROPAGATION_ITERS_;  // Maximum number of propagation iterations
 
     uint32_t MAX_ABNORMAL_CUT_LEN_ = 4;     // Maximum short segment length (bp) considered abnormal
     uint32_t MIN_ABNORMAL_CUT_COUNT_ = 5;   // Minimum consecutive abnormal short segments required for pruning
+
+    uint32_t MIN_TRANS_LEN_ = 3;  // Minimum interval length to allow transitive replacement expansion (i.e. if A->B and B->C, then A->C is allowed only if the replacement interval is >= this length)
+
+    std::string MM2_PRESET_ = "asm5";
 
     opt::ChainOpts  chainOpts_;
     opt::AnchorOpts anchorOpts_;
@@ -183,38 +209,6 @@ protected:
         const std::vector<uint32_t>& candidate_cuts
     );
 
-    /**
-     * @brief Emit internal edges for an expanded replacement path and create missing split segments if needed.
-     *
-     * Each consecutive pair in @p node_expansion forms one directed edge. Newly referenced interval
-     * segments are materialized into the graph on demand, and duplicate edges are skipped using
-     * @p seen_edges.
-     *
-     * @param node_expansion  Expanded segment path to connect.
-     * @param seen_edges      Set used to deduplicate emitted edges.
-     * @param new_node_count  Output counter for newly created segments.
-     * @param new_edge_count  Output counter for newly emitted edges.
-     * @param namer           Helper for formatting interval-based segment names.
-     * @param v_name          Original name of endpoint v (for debug/logging).
-     * @param w_name          Original name of endpoint w (for debug/logging).
-     * @param v_is_rev        Orientation of endpoint v (for debug/logging).
-     * @param w_is_rev        Orientation of endpoint w (for debug/logging).
-     * @param v_span          Optional span of endpoint v in forward coordinates (for debug/logging).
-     * @param w_span          Optional span of endpoint w in forward coordinates (for debug/logging).
-     */
-    void emit_node_expansion_edges_(
-        const SegReplace::Expansion& node_expansion,
-        std::unordered_set<uint64_t>& seen_edges, 
-        uint64_t& new_node_count,
-        uint64_t& new_edge_count,
-        gfaName& namer,
-        const std::string& v_name, const std::string& w_name,
-        bool v_is_rev, bool w_is_rev,
-        std::optional<std::pair<uint32_t,uint32_t>> v_span = std::nullopt,
-        std::optional<std::pair<uint32_t,uint32_t>> w_span = std::nullopt
-    );
-
-
 protected:
     // Generate and filter the "forward and reverse inconsistent overlap" mapping, and mark the edges that need to be removed in arcs_
     void prune_overlaps_();
@@ -223,7 +217,15 @@ protected:
     void initialize_cuts_();
 
     // Align v-slice (reference) against w-slice (query) and pack as BubbleAlignment.
-    std::vector<MmWfaHit> filter_aligns_(std::vector<MmWfaHit> a);
+    std::vector<MmWfaHit> filter_aligns_(std::vector<MmWfaHit> a, uint32_t ref_len, uint32_t qry_len) const;
+
+    std::vector<MmWfaHit> align_short_wfa_(
+        const std::string& v_name,
+        const std::string& w_name,
+        const std::string& v_seq_slice,
+        const std::string& w_seq_slice
+    );
+
     std::vector<MmWfaHit> align_wfa_(
         const std::string& v_name,
         const std::string& w_name,
@@ -257,7 +259,7 @@ protected:
     void overlaps_align_();
 
     // Deduplicate alignments (keep the longest among identical segment pairs)
-    void dedup_aligns_();
+    void dedup_aligns_(size_t begin = 0);
 
     // Build alignment groups by connected segments. (2026-05-25, v0.1.3-r7)
     std::vector<std::vector<size_t>> build_align_groups_() const;
@@ -277,7 +279,7 @@ protected:
         const std::vector<size_t>& align_ids,
         std::vector<std::unordered_set<uint32_t>>& cut_sets
     );
-    SegReplace::Expander build_SegReplace_(bool filter_abnormal = true);
+    SegReplace::Expander build_SegReplace_();
 
     // Print/verify expansion index
     static void rulemap_verify(const std::vector<GfaNode>& nodes, const SegReplace::RuleMap& idx);
@@ -396,3 +398,97 @@ protected:
         const std::vector<SegReplace::Seg>& leaf_segs
     ) const;
 };
+
+
+/* ================================================================================================================
+ *                                         EXPAND REWIRER START
+ * ================================================================================================================ */
+class GfaDeoverlapExpandRewirer {
+public:
+    GfaDeoverlapExpandRewirer(GfaDeoverlapper& graph, const SegReplace::Expander& expander);
+
+    void run();
+
+private:
+    struct PieceQuery_ {
+        SegReplace::Seg original{};
+        SegReplace::Expansion query;
+        bool use_original{false};
+    };
+
+    struct Chain_ {
+        SegReplace::Expansion expansion;
+        std::vector<std::vector<uint32_t>> sample_ids;
+        std::vector<GfaAux> variant_tags;
+    };
+
+    GfaDeoverlapper& graph_;
+    const SegReplace::Expander& expander_;
+
+    std::vector<uint32_t> active_degree_;
+    std::unordered_map<SegReplace::Seg, PieceQuery_, SegReplace::U128Hash, SegReplace::U128Eq> pieces_;
+    std::unordered_set<uint64_t> seen_edges_;
+
+    uint64_t new_node_count_{0};
+    uint64_t new_edge_count_{0};
+    uint64_t reverted_piece_count_{0};
+    gfaName namer_;
+
+private:
+    void build_active_degree_();
+    void build_piece_queries_();
+    void sanitize_local_replacements_();
+    void preserve_isolated_identity_nodes_();
+    void emit_isolated_expanded_nodes_();
+    void rewire_existing_edges_();
+    void replace_graph_edges_();
+
+    bool trivial_segment_(uint32_t sid) const;
+    bool piece_query_has_repeat_(const SegReplace::Expansion& query) const;
+    SegReplace::Expansion safe_expansion_(SegReplace::Seg piece) const;
+    void sanitize_arc_repeats_(const GfaArc& arc);
+    void sanitize_piece_repeats_(const std::vector<SegReplace::Seg>& local_pieces);
+
+    std::vector<SegReplace::Seg> collect_all_pieces_(uint32_t sid, bool rev) const;
+    std::vector<SegReplace::Seg> collect_non_overlap_pieces_(
+        uint32_t sid,
+        bool rev,
+        uint32_t win_beg,
+        uint32_t win_end,
+        bool left_side
+    ) const;
+    std::vector<SegReplace::Seg> collect_overlap_pieces_(
+        uint32_t sid,
+        bool rev,
+        const std::vector<uint32_t>& cuts
+    ) const;
+    std::vector<uint32_t> collect_overlap_cuts_(uint32_t sid, uint32_t beg, uint32_t end) const;
+
+    Chain_ build_chain_(
+        const std::vector<SegReplace::Seg>& source,
+        const std::vector<uint32_t>& source_sample_ids,
+        const GfaAux& source_tags,
+        const std::vector<SegReplace::Seg>& overlap,
+        const std::vector<uint32_t>& overlap_sample_ids,
+        const GfaAux& overlap_tags,
+        const std::vector<SegReplace::Seg>& target,
+        const std::vector<uint32_t>& target_sample_ids,
+        const GfaAux& target_tags
+    ) const;
+    void append_piece_group_(
+        const std::vector<SegReplace::Seg>& pieces,
+        const std::vector<uint32_t>& sample_ids,
+        const GfaAux& variant_tags,
+        Chain_& chain
+    ) const;
+    bool revert_piece_(SegReplace::Seg piece);
+    bool mark_piece_original_(SegReplace::Seg piece);
+
+    std::vector<uint32_t> materialize_chain_(const Chain_& chain);
+    uint32_t materialize_segment_(SegReplace::Seg s, const std::vector<uint32_t>& sample_ids, const GfaAux& variant_tags);
+    void emit_chain_edges_(const Chain_& chain);
+    void emit_bridge_edge_(uint32_t from, uint32_t to);
+};
+/* ================================================================================================================
+ *                                         EXPAND REWIRER END
+ * ================================================================================================================ */

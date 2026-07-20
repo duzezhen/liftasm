@@ -52,6 +52,7 @@ struct DepthOpts {
 
 struct BubbleOpts {
     std::vector<std::string> gfaFiles;  // input
+    std::vector<std::string> gfaNames;  // will be added to S-line as "SN:Z:" tag in output stats file
     std::string out_prefix = "out";     // output prefix
 
     // VCF output
@@ -61,63 +62,82 @@ struct BubbleOpts {
     uint32_t ali_min_len  = 50000;      // minimum alignment length to keep in PAF (liftover)
     uint32_t ali_min_mapq = 5;          // minimum mapping quality to keep in PAF (liftover)
 
-    int max_depth     = 1e4; // maximum depth for bubble detection
-    int max_paths     = 20;  // maximum number of paths to enumerate per bubble
-    uint32_t min_len  = 0;   // minimum sequence length for bubble detection
-    uint32_t min_num  = 0;   // minimum number of nodes in a bubble
+    uint32_t max_depth = 1e5; // maximum depth for bubble detection
+    uint16_t max_paths = 20;  // maximum number of paths to enumerate per bubble
+    uint32_t min_len   = 0;   // minimum sequence length for bubble detection
+    uint32_t min_num   = 0;   // minimum number of nodes in a bubble
 
-    uint64_t DFS_guard = 1e5;  // DFS state guard
+    uint64_t DFS_guard = 1e6;  // DFS state guard
 
     // complex-source detection (is_complex_source_)
-    uint16_t cx_depth       = 0;    // local BFS depth
-    uint32_t cx_nodes       = 200;   // visited nodes limit
-    uint32_t cx_branches    = 24;   // branching nodes limit
-    int      cx_deg_branch  = 6;    // degree >= this counts as branching
-    int      cx_deg_hub     = 100;    // degree >= this => hub => complex
+    uint16_t cx_branch_degree = 3;    // minimum degree counted as a branch
+    uint16_t cx_hub_degree    = 100;  // minimum degree counted as a hub
+    uint32_t cx_min_nodes     = 200;  // minimum nodes in a large complex block
+    uint32_t cx_min_branches  = 24;   // minimum irreducible branches in a complex block
 
-    // path clustering (pick_representative_paths)
-    double path_diff = 0.05;         // small than this is same cluster; larger than this is different haplotype
+    double path_diff = 0.05;        // sequence difference threshold for path clustering
 
     uint32_t stall_round_limit = 2; // stop DFS path search after this many rounds without a new unique path
 
-    bool keep_nested = false;        // whether to keep bubbles contained within larger bubbles
+    bool keep_nested = false;       // whether to keep bubbles contained within larger bubbles
+    bool check_complex = true;      // detect and exclude complex graph regions
 
     // homologous path options
     double   same_sim        = 0.8;   // minimum similarity for homologous paths from the same source
-    uint32_t same_min_num    = 1;     // minimum number of nodes in each same-source homologous path
-    uint64_t same_min_len    = 1e5;   // minimum total length of each same-source homologous path
+    uint64_t same_min_len    = 1e6;   // minimum total length of each same-source homologous path (default: 1Mb)
 
-    uint32_t diff_min_src    = 5e5;   // minimum source length for searching homologous paths between different sources (500 kb)
-    double   diff_sim        = 0.90;  // minimum similarity for homologous paths between different sources
-    uint32_t diff_min_num    = 1;     // minimum total length of each different-source homologous path
-    uint64_t diff_min_len    = 3e6;   // minimum total sequence length in "different source" homologous paths
+    uint32_t diff_min_src    = 5e5;   // minimum source length for searching homologous paths between different sources (default: 500 kb)
+    double   diff_sim        = 0.9;   // minimum similarity for homologous paths between different sources
+    uint64_t diff_min_len    = 3e6;   // minimum total sequence length in "different source" homologous paths (default: 3Mb)
 
-    uint32_t homo_num        = 10;    // max paths per source branch
+    uint32_t homo_num        = 1;     // max paths per source branch
     uint32_t homo_k          = 17;    // k-mer size for minimizer used in homologous path search
     uint32_t homo_w          = 100;   // window size for minimizer used in homologous path search
 
-    uint32_t homo_boot_bp    = 1000;        // bootstrap bp before first homologous-path similarity check
-    uint32_t homo_cnt_len    = 1000;        // minimum node length counted as one homologous-path extension step
+    uint32_t homo_extend_bp  = 1e6;         // bp extended per homologous-path extension round (default: 1Mb)
     uint64_t homo_bloom_bits = 1ULL << 27;  // Bloom filter size in bits for homologous-path sketches
     uint32_t homo_bloom_hash = 4;           // number of Bloom filter hash functions
 };
 
 struct CollapseOpts {
     std::vector<std::string> gfaFiles;  // input GFA
-    std::string prefix    = "out";      // output file prefix
-    double min_jaccard    = 0.8;        // Jaccard threshold to align branches
-    int    min_eq         = 3;          // minimal '=' length to make cuts / rules
-    int    max_iters      = 100;        // max iterations for cut propagation
+    std::vector<std::string> gfaNames;  // will be added to S-line as "SN:Z:" tag in output stats file
+    std::string prefix = "out";         // output file prefix
+    // uint32_t iterations = 5;            // number of collapse rounds
+    uint32_t iterations = 3;            // number of collapse rounds
+    uint32_t long_node_len = 1e7;       // split nodes longer than this; 0 disables (default: 10Mb)
+
+    std::vector<double>   min_jaccards     = {0.8};  // collapse
+    std::vector<double>   same_sims        = {0.9};
+    std::vector<uint32_t> same_min_lens    = {1000000};
+    std::vector<uint32_t> diff_min_srcs    = {500000};
+    std::vector<double>   diff_sims        = {0.9};
+    std::vector<uint32_t> diff_min_lens    = {3000000};  // (default: 3Mb)
+    // std::vector<int>      min_eqs          = {1000, 100, 50, 3, 3};  // collapse defaults
+    std::vector<int>      min_eqs          = {1000, 3, 3};  // collapse defaults
+    int                   min_eq           = 3;  // deoverlap default
+
+    uint16_t max_iters = 100;  // max iterations for cut propagation
 
     uint32_t repeat_mask_min_len      = 24;  // minimum tandem-repeat span to mask
-    uint32_t repeat_mask_max_period   = 12;  // maximum tandem-repeat period to test
+    uint32_t repeat_mask_max_period   = 6;   // maximum tandem-repeat period to test
     uint32_t repeat_mask_max_mismatch = 2;   // maximum mismatches allowed in a repeat window
+    uint32_t repeat_norm_len          = 1000;
 
     // Used to prune abnormal cut points
     uint32_t max_abnormal_cut_len   = 4;
     uint32_t min_abnormal_cut_count = 5;
 
-    double min_match_ratio = 0.85; // minimum CIGAR match ratio, alignment score large than this value will be saved
+    uint32_t min_trans_len = 3;  // Minimum interval length to allow transitive replacement expansion (i.e. if A->B and B->C, then A->C is allowed only if the replacement interval is >= this length)
+
+    double min_match_ratio = 0.8;   // minimum CIGAR match ratio, alignment score large than this value will be saved
+    double min_ali_ratio = 0.001;   // minimum aligned length ratio to keep (deoverlap default)
+    // std::vector<double> min_ali_ratios = {0.05, 0.01, 0.005, 0.001};   // minimum aligned length ratio to keep (collapse default)
+    std::vector<double> min_ali_ratios = {0.05, 0.01, 0.001};   // minimum aligned length ratio to keep (collapse default)
+    uint8_t min_mapq = 20;          // minimum mapping quality to keep
+    uint32_t all_pair_len = 1000;   // align all pairs when every path is shorter than this
+
+    std::string mm2_preset = "asm5";
 };
 
 struct File2mapOpts {
@@ -215,6 +235,29 @@ struct ResSitOpts {
     int threads = 4;
 };
 
+struct SplitOpts {
+    std::vector<std::string> gfaFiles;
+    std::vector<std::string> gfaNames;
+    std::string prefix = "out";
+};
+
+struct AugmentOpts {
+    std::vector<std::string> gfa_files;
+    std::vector<std::string> gfa_names;
+    std::vector<std::string> vcf_files;
+    std::string prefix = "out";
+    std::string tag = "VCF";
+};
+
+struct CleanOpts {
+    std::string utg_file;
+    std::vector<std::string> ctg_files;
+    std::string prefix = "out";
+    uint32_t min_reads = 5;
+    double min_purity = 0.8;
+    double min_comp_overlap = 0.05;
+};
+
 enum class ToolMode {
     stat,       // print graph statistics
     bubble,     // identify bubble in graph
@@ -227,7 +270,10 @@ enum class ToolMode {
     file2map,   // convert GFA/PAF to map format
     liftover,   // Liftover coordinates using a mapping file
     mapq_boost, // adjust mapping quality
-    ressit      // restrict cuts in genome
+    ressit,     // restrict cuts in genome
+    split,      // split graph by connected components
+    augment,    // augment a GFA with VCF alleles
+    clean,      // remove weak UTG links using contig read components
 };
 
 struct AppConfig {
@@ -245,6 +291,9 @@ struct AppConfig {
     MapqBoostOpts    homq;
     MapOpts          map;
     ResSitOpts       ressit;
+    SplitOpts        split;
+    AugmentOpts      augment;
+    CleanOpts        clean;
 };
 
 void help(char** argv, bool advanced=false);
@@ -296,5 +345,17 @@ void help_align(char** argv);
 // restrict cuts
 AppConfig main_res_cut(int argc, char** argv);
 void help_res_cut(char** argv);
+
+// split graph by connected components
+AppConfig main_split(int argc, char** argv);
+void help_split(char** argv);
+
+// augment a GFA with VCF alleles
+AppConfig main_augment(int argc, char** argv);
+void help_augment(char** argv, bool advanced=false);
+
+// remove weak UTG links using contig read components
+AppConfig main_clean(int argc, char** argv);
+void help_clean(char** argv);
 
 void finalize_opt_cfg(AppConfig& cfg);

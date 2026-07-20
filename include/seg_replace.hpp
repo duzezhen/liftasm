@@ -74,27 +74,32 @@ using RuleMap   = std::unordered_map<Seg, Expansion, U128Hash, U128Eq>;
 // ────────────────────────────────────────────────────────────────
 class Expander {
 public:
-    Expander(const RuleMap& r, std::vector<std::string> names = {}) : rules_(&r), names_(std::move(names)) {}
+    Expander(const RuleMap& r, std::vector<std::string> names = {}, uint32_t min_trans_len = 3) : rules_(&r), names_(std::move(names)), min_trans_len_(min_trans_len) {}
 
     static void reverse_and_toggle(Expansion& v);  // Reverse order & flip strand for reverse-requested expansions.
     void build_index();  // Pre-compute expansion for all segments in rules (forward-strand)
-    void remove_from_index_by_key(const Seg& s);  // Remove s and its reverse from memo
+    void remove_from_index_by_key(const Seg& s) const;  // Remove s and its reverse from memo
 
-    const RuleMap& index_view() const { return memo_; }  // Read-only view of current memo
-    void invalidate_all() { memo_.clear(); in_stack_.clear(); }  // Invalidate entire cache (call after rules mutate).
+    const RuleMap& index_view() const { return memo_; }
+    uint64_t index_size() const { return memo_.size(); }
+    void invalidate_all() { memo_.clear(); in_stack_.clear(); }
 
-    Expansion query(Seg s) const;  // query
+    Expansion query(Seg s) const;
 
-    void print_expansion_direct(const Seg& seg, const Expansion& v) const;  // Print “seg => seg1 seg2 …” (already expanded)
-    void print_expansion(const Seg& seg);  // print expansion
-    void print_index() const;  // sort index and print
+    void print_expansion_direct(const Seg& seg, const Expansion& v) const;
+    void print_expansion(const Seg& seg);
+    void print_index() const;
+
+    uint64_t filter_nonmonotonic_index();
 
     bool save_map(const std::string& path);
 
 private:
-    const std::vector<std::string> names_;
     const RuleMap* rules_;
-    RuleMap memo_;
+    const std::vector<std::string> names_;
+    const uint32_t min_trans_len_;
+
+    mutable RuleMap memo_;
     std::unordered_set<Seg, U128Hash, U128Eq> in_stack_;
 
     // Expand a segment
