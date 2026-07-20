@@ -136,6 +136,8 @@ struct CollapseOpts {
     std::vector<double> min_ali_ratios = {0.05, 0.01, 0.001};   // minimum aligned length ratio to keep (collapse default)
     uint8_t min_mapq = 20;          // minimum mapping quality to keep
     uint32_t all_pair_len = 1000;   // align all pairs when every path is shorter than this
+    uint32_t trim_min_len = 5'000'000;
+    double trim_max_overlap = 0.05;
 
     std::string mm2_preset = "asm5";
 };

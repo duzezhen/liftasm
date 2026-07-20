@@ -2013,7 +2013,7 @@ bool HomologousPathEnumerator::compute_pair_stats_(
             if (hi < min_hi) min_hi = hi;
             if (hi > max_hi) max_hi = hi;
 
-            if (pair_supported_(i, j, c)) {
+            if (hi >= params_.min_similarity) {
                 keep_[i] = 1;
                 keep_[j] = 1;
                 any_pair_good = true;

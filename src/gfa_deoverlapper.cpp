@@ -141,6 +141,72 @@ void GfaDeoverlapper::prune_overlaps_() {
 }
 
 
+bool GfaDeoverlapper::trim_small_overlap_(MmWfaHit& hit, const MmWfaHit& kept) const {
+    const uint32_t hrb = std::min(hit.r_beg, hit.r_end);
+    const uint32_t hre = std::max(hit.r_beg, hit.r_end);
+    const uint32_t hqb = std::min(hit.q_beg, hit.q_end);
+    const uint32_t hqe = std::max(hit.q_beg, hit.q_end);
+    const uint32_t krb = std::min(kept.r_beg, kept.r_end);
+    const uint32_t kre = std::max(kept.r_beg, kept.r_end);
+    const uint32_t kqb = std::min(kept.q_beg, kept.q_end);
+    const uint32_t kqe = std::max(kept.q_beg, kept.q_end);
+
+    const uint32_t hit_len = std::min(hre - hrb, hqe - hqb);
+    const uint32_t kept_len = std::min(kre - krb, kqe - kqb);
+    const uint32_t r_overlap = std::min(hre, kre) > std::max(hrb, krb) ? std::min(hre, kre) - std::max(hrb, krb) : 0;
+    const uint32_t q_overlap = std::min(hqe, kqe) > std::max(hqb, kqb) ? std::min(hqe, kqe) - std::max(hqb, kqb) : 0;
+    const uint32_t overlap = std::max(r_overlap, q_overlap);
+
+    if (overlap == 0 || hit_len < TRIM_MIN_ALIGN_LEN_ || kept_len < TRIM_MIN_ALIGN_LEN_) return false;
+    if (static_cast<double>(overlap) / hit_len > TRIM_MAX_OVERLAP_) return false;
+
+    const bool trim_front = hrb >= krb && hqb >= kqb;
+    const bool trim_back = hre <= kre && hqe <= kqe;
+    if (trim_front == trim_back) return false;
+
+    std::vector<CIGAR::COp> ops = CIGAR::parse(hit.cigar);
+    if (ops.empty()) return false;
+
+    if (trim_back) std::reverse(ops.begin(), ops.end());
+
+    const uint32_t need_r = r_overlap ? (trim_front ? kre - hrb : hre - krb) : 0;
+    const uint32_t need_q = q_overlap ? (trim_front ? kqe - hqb : hqe - kqb) : 0;
+    uint32_t used_r = 0, used_q = 0;
+    size_t i = 0;
+
+    while (i < ops.size() && (used_r < need_r || used_q < need_q)) {
+        CIGAR::COp& op = ops[i];
+        const bool rc = op.op == 'M' || op.op == 'D' || op.op == 'N' || op.op == '=' || op.op == 'X';
+        const bool qc = op.op == 'M' || op.op == 'I' || op.op == '=' || op.op == 'X';
+        const uint32_t left_r = used_r < need_r ? need_r - used_r : 0;
+        const uint32_t left_q = used_q < need_q ? need_q - used_q : 0;
+        const bool can_finish = (left_r == 0 || (rc && left_r <= op.len)) && (left_q == 0 || (qc && left_q <= op.len));
+        const uint32_t take = can_finish ? std::max(left_r, left_q) : op.len;
+        used_r += rc ? take : 0;
+        used_q += qc ? take : 0;
+        op.len -= take;
+        if (op.len == 0) ++i;
+    }
+    if (used_r < need_r || used_q < need_q) return false;
+
+    ops.erase(ops.begin(), ops.begin() + std::min(i, ops.size()));
+    if (trim_back) std::reverse(ops.begin(), ops.end());
+
+    if (trim_front) {
+        hit.r_beg += used_r;
+        hit.q_beg += used_q;
+    } else {
+        hit.r_end -= used_r;
+        hit.q_end -= used_q;
+    }
+
+    if (ops.empty() || hit.r_end <= hit.r_beg || hit.q_end <= hit.q_beg) return false;
+    if (std::min(hit.r_end, kre) > std::max(hit.r_beg, krb)) return false;
+    if (std::min(hit.q_end, kqe) > std::max(hit.q_beg, kqb)) return false;
+    hit.cigar = CIGAR::pack(ops);
+    return hit.cigar != "*";
+}
+
 std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::filter_aligns_(
     std::vector<MmWfaHit> a,
     uint32_t ref_len,
@@ -206,18 +272,19 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::filter_aligns_(
     kept.reserve(passed.size());
 
     for (auto& cand : passed) {
-        const uint32_t crb = rb(cand), cre = re(cand);
-        const uint32_t cqb = qb(cand), cqe = qe(cand);
-        if (cre <= crb || cqe <= cqb) continue;
-
-        const int64_t crk = int64_t(crb);
-        const int64_t cqk = int64_t(cqb);
+        if (re(cand) <= rb(cand) || qe(cand) <= qb(cand)) continue;
 
         bool ok = true;
         for (const auto& k : kept) {
-            if (ovlp(crb, cre, rb(k), re(k)) > 0) { ok = false; break; }
-            if (ovlp(cqb, cqe, qb(k), qe(k)) > 0) { ok = false; break; }
+            const uint32_t r_overlap = ovlp(rb(cand), re(cand), rb(k), re(k));
+            const uint32_t q_overlap = ovlp(qb(cand), qe(cand), qb(k), qe(k));
+            if (r_overlap > 0 || q_overlap > 0) {
+                if (!trim_small_overlap_(cand, k)) { ok = false; break; }
+                continue;
+            }
 
+            const int64_t crk = int64_t(rb(cand));
+            const int64_t cqk = int64_t(qb(cand));
             const int64_t krk = int64_t(rb(k));
             const int64_t kqk = int64_t(qb(k));
 
@@ -227,7 +294,12 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::filter_aligns_(
             }
         }
 
-        if (ok) kept.emplace_back(std::move(cand));
+        if (!ok || cand.cigar.empty() || cand.cigar == "*") continue;
+        if (CIGAR::match_ratio(cand.cigar) < MIN_MATCH_RATIO_) continue;
+        const uint32_t aln_len = len(cand);
+        if (aln_len == 0) continue;
+        if (denom > 0 && static_cast<double>(aln_len) / static_cast<double>(denom) < MIN_ALI_RATIO_) continue;
+        kept.emplace_back(std::move(cand));
     }
 
     return kept;

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.3-r14 (2026-07-19)
+
+### Added
+
+- Added `--trim_len` and `--trim_ovlp` to trim small alignment overlaps.
+
+### Changed
+
+- Used `hi >= params_.min_similarity` to evaluate homologous path support in the first step to include the dead end path.
+
 ## v0.1.3-r13 (2026-07-17)
 
 ### Improved

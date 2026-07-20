@@ -272,6 +272,14 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--min_mapq must be <= 60"
             );
             ensure(
+                cfg.collapse.trim_min_len > 0,
+                "--trim_len must be > 0"
+            );
+            ensure(
+                cfg.collapse.trim_max_overlap >= 0.0 && cfg.collapse.trim_max_overlap <= 1.0,
+                "--trim_ovlp must be in [0,1]"
+            );
+            ensure(
                 cfg.collapse.mm2_preset == "asm5" || cfg.collapse.mm2_preset == "asm10" || cfg.collapse.mm2_preset == "asm20" || cfg.collapse.mm2_preset == "sr" || cfg.collapse.mm2_preset == "lr:hq",
                 "-x/--preset must be one of: asm5, asm10, asm20, sr, lr:hq"
             );
@@ -459,6 +467,14 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
             ensure(
                 cfg.collapse.min_mapq <= 60,
                 "--min_mapq must be <= 60"
+            );
+            ensure(
+                cfg.collapse.trim_min_len > 0,
+                "--trim_len must be > 0"
+            );
+            ensure(
+                cfg.collapse.trim_max_overlap >= 0.0 && cfg.collapse.trim_max_overlap <= 1.0,
+                "--trim_ovlp must be in [0,1]"
             );
             ensure(
                 cfg.collapse.mm2_preset == "asm5" || cfg.collapse.mm2_preset == "asm10" || cfg.collapse.mm2_preset == "asm20" || cfg.collapse.mm2_preset == "sr" || cfg.collapse.mm2_preset == "lr:hq",
@@ -1401,6 +1417,10 @@ void help_deoverlap(char** argv, bool advanced) {
     hp.line("--min_ali_ratio", "FLOAT", "minimum aligned-length fraction relative to the sequence length [" + format_double_(CollapseOpts().min_ali_ratio) + "]");
     hp.line("--min_mapq", "INT", "minimum mapping quality (MAPQ) to keep (no larger than 60) [" + std::to_string(int(CollapseOpts().min_mapq)) + "]");
     hp.line("-x, --preset", "STR", "mapping preset: asm5/asm10/asm20/sr/lr:hq [" + CollapseOpts().mm2_preset + "]");
+    if (advanced) {
+        hp.line("--trim_len", "INT", "minimum length of both alignments to trim a small overlap [" + format_size_arg_(CollapseOpts().trim_min_len) + "]");
+        hp.line("--trim_ovlp", "FLOAT", "maximum overlap fraction of the shorter alignment to trim [" + format_double_(CollapseOpts().trim_max_overlap) + "]");
+    }
     hp.blank();
     hp.section("Collapse options");
     hp.line("--min_eq", "INT", "minimum match length to add cut points at segment [" + std::to_string(CollapseOpts().min_eq) + "]");
@@ -1440,6 +1460,8 @@ AppConfig main_deoverlap(int argc, char** argv) {
         {"min_ali_ratio",required_argument, nullptr, 2003},
         {"min_mapq",     required_argument, nullptr, 2004},
         {"preset",       required_argument, nullptr, 'x'},
+        {"trim_len",     required_argument, nullptr, 2005},
+        {"trim_ovlp",    required_argument, nullptr, 2006},
 
         {"min_eq",       required_argument, nullptr, 3001},
         {"max_iters",    required_argument, nullptr, 3002},
@@ -1515,6 +1537,14 @@ AppConfig main_deoverlap(int argc, char** argv) {
             }
             case 'x': {
                 cfg.collapse.mm2_preset = optarg;
+                break;
+            }
+            case 2005: {
+                cfg.collapse.trim_min_len = parse_size_arg_u32_(optarg, argc, argv, optind, "--trim_len");
+                break;
+            }
+            case 2006: {
+                cfg.collapse.trim_max_overlap = std::stod(optarg);
                 break;
             }
 
@@ -1594,6 +1624,8 @@ void help_collapse(char** argv, bool advanced) {
     hp.line("-x, --preset", "STR", "mapping preset: asm5/asm10/asm20/sr/lr:hq [" + CollapseOpts().mm2_preset + "]");
     if (advanced) {
         hp.line("--all_pair_len", "INT", "align all path pairs when every path is shorter than this [" + format_size_arg_(CollapseOpts().all_pair_len) + "]");
+        hp.line("--trim_len", "INT", "minimum length of both alignments to trim a small overlap [" + format_size_arg_(CollapseOpts().trim_min_len) + "]");
+        hp.line("--trim_ovlp", "FLOAT", "maximum overlap fraction of the shorter alignment to trim [" + format_double_(CollapseOpts().trim_max_overlap) + "]");
     }
 
     hp.blank();
@@ -1676,6 +1708,8 @@ AppConfig main_collapse(int argc, char** argv) {
         {"min_mapq",        required_argument, nullptr, 2004},
         {"preset",          required_argument, nullptr, 'x'},
         {"all_pair_len",    required_argument, nullptr, 2005},
+        {"trim_len",        required_argument, nullptr, 2006},
+        {"trim_ovlp",       required_argument, nullptr, 2007},
 
         {"iterations",      required_argument, nullptr, 3001},
         {"min_jaccard",     required_argument, nullptr, 3002},
@@ -1783,6 +1817,14 @@ AppConfig main_collapse(int argc, char** argv) {
             }
             case 2005: {
                 cfg.collapse.all_pair_len = parse_size_arg_u32_(optarg, argc, argv, optind, "--all_pair_len");
+                break;
+            }
+            case 2006: {
+                cfg.collapse.trim_min_len = parse_size_arg_u32_(optarg, argc, argv, optind, "--trim_len");
+                break;
+            }
+            case 2007: {
+                cfg.collapse.trim_max_overlap = std::stod(optarg);
                 break;
             }
 

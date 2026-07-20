@@ -51,6 +51,8 @@ public:
         double min_match_ratio,
         double min_ali_ratio,
         uint8_t min_mapq,
+        uint32_t trim_min_len,
+        double trim_max_overlap,
         uint16_t max_prop_iters, 
         uint32_t max_abnormal_cut_len, 
         uint32_t min_abnormal_cut_count, 
@@ -62,6 +64,8 @@ public:
         MIN_MATCH_RATIO_ = min_match_ratio;
         MIN_ALI_RATIO_ = min_ali_ratio;
         MIN_MAPQ_ = min_mapq;
+        TRIM_MIN_ALIGN_LEN_ = trim_min_len;
+        TRIM_MAX_OVERLAP_ = trim_max_overlap;
         MAX_PROPAGATION_ITERS_ = max_prop_iters;
         MAX_ABNORMAL_CUT_LEN_ = max_abnormal_cut_len;
         MIN_ABNORMAL_CUT_COUNT_ = min_abnormal_cut_count;
@@ -118,6 +122,8 @@ protected:  // data will be used in rulemap building
     double MIN_MATCH_RATIO_;          // Only when the ratio of '=/M' in CIGAR >= threshold, the alignment will be saved for rulemap building
     double MIN_ALI_RATIO_;            // minimum aligned length ratio against shorter sequence
     uint8_t MIN_MAPQ_;                // Minimum mapping quality to be considered
+    uint32_t TRIM_MIN_ALIGN_LEN_ = 5'000'000;
+    double TRIM_MAX_OVERLAP_ = 0.05;
     uint16_t MAX_PROPAGATION_ITERS_;  // Maximum number of propagation iterations
 
     uint32_t MAX_ABNORMAL_CUT_LEN_ = 4;     // Maximum short segment length (bp) considered abnormal
@@ -217,6 +223,7 @@ protected:
     void initialize_cuts_();
 
     // Align v-slice (reference) against w-slice (query) and pack as BubbleAlignment.
+    bool trim_small_overlap_(MmWfaHit& hit, const MmWfaHit& kept) const;
     std::vector<MmWfaHit> filter_aligns_(std::vector<MmWfaHit> a, uint32_t ref_len, uint32_t qry_len) const;
 
     std::vector<MmWfaHit> align_short_wfa_(

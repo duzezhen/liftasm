@@ -153,7 +153,7 @@ uint64_t LongNodeSplitter::split(GfaGraph& graph, uint32_t min_length, uint32_t 
 }
 
 
-// ------------------------------------------------ GFA deoverlapper ------------------------------------------------
+// ------------------------------------------------ GFA collapser ------------------------------------------------
 static inline void append_cop_(std::vector<CIGAR::COp>& out, uint32_t len, char op) {
     if (len == 0) return;
     if (!out.empty() && out.back().op == op) out.back().len += len;
@@ -598,8 +598,8 @@ void GfaCollapser::normalize_homopolymer_bubbles(
         std::string& new_query_seq,
         std::string& cigar_out
     ) {
-        const auto hits = align_short_mm2_(
-        // const auto hits = align_short_wfa_(
+        // const auto hits = align_short_mm2_(
+        const auto hits = align_short_wfa_(
             getNodeName(ref.segment),
             getNodeName(query.segment),
             ref.seq,

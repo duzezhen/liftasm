@@ -156,6 +156,8 @@ int main(int argc, char** argv) {
             cfg.collapse.min_match_ratio, 
             cfg.collapse.min_ali_ratio,
             cfg.collapse.min_mapq,
+            cfg.collapse.trim_min_len,
+            cfg.collapse.trim_max_overlap,
             cfg.collapse.max_iters, 
             cfg.collapse.max_abnormal_cut_len, 
             cfg.collapse.min_abnormal_cut_count, 
@@ -170,7 +172,6 @@ int main(int argc, char** argv) {
             cfg.map.alignOpts, 
             cfg.map.use_wfa
         );
-
         G.load_from_GFA(cfg.collapse.gfaFiles, cfg.collapse.gfaNames);
         G.print_graph_stats();
 
@@ -214,6 +215,8 @@ int main(int argc, char** argv) {
                 cfg.collapse.min_match_ratio,
                 min_ali_ratio,
                 cfg.collapse.min_mapq,
+                cfg.collapse.trim_min_len,
+                cfg.collapse.trim_max_overlap,
                 cfg.collapse.max_iters,
                 cfg.bubble.homo_k,
                 cfg.bubble.homo_w,
@@ -234,7 +237,6 @@ int main(int argc, char** argv) {
                 cfg.map.alignOpts,
                 cfg.map.use_wfa
             );
-
             G.load_from_GFA(cur_gfa_files, cur_gfa_names);
             if (iter == 0 && cfg.collapse.long_node_len > 0) {
                 const uint32_t chunk_len = diff_min_src;
@@ -304,9 +306,11 @@ int main(int argc, char** argv) {
 
             const std::string iter_gfa = iter_prefix + ".collapse.gfa";
             const std::string iter_noseq = iter_prefix + ".collapse.noseq.gfa";
+            const std::string iter_bubble_noseq = iter_prefix + ".bubbles.noseq.gfa";
 
             G.save_to_disk(iter_gfa, /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/true, command_line);
             G.save_to_disk(iter_noseq, /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/false, command_line);
+            finder.save_bubble_as_gfa(iter_bubble_noseq, cfg.bubble.min_len, cfg.bubble.min_num, /*write_seq=*/false, command_line);
 
             cur_gfa_files.assign(1, iter_gfa);
 
@@ -450,6 +454,8 @@ int main(int argc, char** argv) {
             cfg.collapse.min_match_ratio,
             cfg.collapse.min_ali_ratio,
             cfg.collapse.min_mapq,
+            cfg.collapse.trim_min_len,
+            cfg.collapse.trim_max_overlap,
             cfg.collapse.max_iters,
             cfg.collapse.max_abnormal_cut_len,
             cfg.collapse.min_abnormal_cut_count,
