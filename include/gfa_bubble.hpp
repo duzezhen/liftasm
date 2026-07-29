@@ -46,6 +46,7 @@ public:
     );
     
     void find_bubbles();
+    void filter_nested_bubbles();
     const std::vector<Bubble>& get_bubbles() const noexcept { return bubbles_; }
     void save_bubble_as_gfa(const std::string& output_file, const uint32_t min_len, const uint32_t min_num, bool write_seq = true, const std::string& command_line = "") const;
     void save_bubble_as_vcf(const std::string& output_prefix, const std::string& paf_file, const std::string& ref_file, uint32_t min_mapq, uint32_t min_aln_len) const;
@@ -74,7 +75,6 @@ private:
     bool find_common_nearest_sink_(Vertex source, const std::vector<Vertex>& seeds, uint64_t bfs_limit, uint32_t& best_sink, std::unordered_set<uint32_t>& local_nodes);
 
     Bubble detect_closed_bubble_from_source_(Vertex src, uint64_t bfs_limit);
-    void filter_nonlocal_bubbles_();
     GfaBubble::BubbleBranchPairs_ build_bubble_branch_pairs_() const;
 
     std::vector<Vertex> collect_sources_for_homo_() const;

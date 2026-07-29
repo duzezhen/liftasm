@@ -58,7 +58,8 @@ GfaAugmenter::Stats GfaAugmenter::read_vcfs_(const std::vector<std::string>& fil
 
             const uint32_t sid = static_cast<uint32_t>(name_it->second);
             const GfaNode& node = nodes_[sid];
-            if (node.deleted || node.sequence.empty() || node.sequence == "*") {
+            if (node.deleted) continue;
+            if (node.sequence.empty() || node.sequence == "*") {
                 error_stream() << file + ":" + std::to_string(rec.line_no) + ": segment '" + rec.chrom + "' has no sequence" << std::endl;
                 std::exit(1);
             }

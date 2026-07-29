@@ -162,9 +162,9 @@ struct HomologousPath {
 
     const std::vector<std::vector<Vertex>>& get_paths() const noexcept { return paths; }
     const std::vector<uint32_t>& get_path_clusters() const noexcept { return path_clusters; }
-    const std::vector<std::vector<uint32_t>>& get_paths_u32() const noexcept {
-        static std::vector<std::vector<uint32_t>> paths_u32;
-        paths_u32.clear();
+    std::vector<std::vector<uint32_t>> get_paths_u32() const {
+        std::vector<std::vector<uint32_t>> paths_u32;
+        paths_u32.reserve(paths.size());
         for (const auto& p : paths) {
             std::vector<uint32_t> pu32;
             pu32.reserve(p.size());

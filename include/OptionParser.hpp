@@ -83,7 +83,7 @@ struct BubbleOpts {
     bool check_complex = true;      // detect and exclude complex graph regions
 
     // homologous path options
-    double   same_sim        = 0.8;   // minimum similarity for homologous paths from the same source
+    double   same_sim        = 0.9;   // minimum similarity for homologous paths from the same source
     uint64_t same_min_len    = 1e6;   // minimum total length of each same-source homologous path (default: 1Mb)
 
     uint32_t diff_min_src    = 5e5;   // minimum source length for searching homologous paths between different sources (default: 500 kb)
@@ -101,19 +101,25 @@ struct BubbleOpts {
 
 struct CollapseOpts {
     std::vector<std::string> gfaFiles;  // input GFA
+    std::vector<std::string> hap1Files; // haplotype-1 contig GFA
+    std::vector<std::string> hap2Files; // haplotype-2 contig GFA
+    std::vector<std::string> vcfFiles;  // variants added during contig collapse
     std::vector<std::string> gfaNames;  // will be added to S-line as "SN:Z:" tag in output stats file
     std::string prefix = "out";         // output file prefix
-    // uint32_t iterations = 5;            // number of collapse rounds
+    uint32_t ctg_min_reads = 10;        // minimum unique shared reads in a final contig anchor block
+    uint32_t ctg_short_len = 5'000'000; // short contigs can participate in only one selected contig pair
+    uint32_t ctg_min_len = 2'000'000;   // ignore shorter input contigs in contig mode
+    double ctg_min_coverage = 0.5;      // minimum contig span coverage for within- or cross-sample support
+    double ctg_end_fraction = 0.01;     // terminal overhang fraction allowed for end-to-end component support
+    bool ctg_anchor_only = false;       // align only shared-read anchor blocks in contig collapse
+    bool paf = false;                   // write cross-sample component alignments in PAF
     uint32_t iterations = 3;            // number of collapse rounds
-    uint32_t long_node_len = 1e7;       // split nodes longer than this; 0 disables (default: 10Mb)
-
-    std::vector<double>   min_jaccards     = {0.8};  // collapse
+    std::vector<double>   min_jaccards     = {0.9, 0.95, 0.95};  // collapse
     std::vector<double>   same_sims        = {0.9};
     std::vector<uint32_t> same_min_lens    = {1000000};
     std::vector<uint32_t> diff_min_srcs    = {500000};
     std::vector<double>   diff_sims        = {0.9};
-    std::vector<uint32_t> diff_min_lens    = {3000000};  // (default: 3Mb)
-    // std::vector<int>      min_eqs          = {1000, 100, 50, 3, 3};  // collapse defaults
+    std::vector<uint32_t> diff_min_lens    = {10000000};  // (default: 10Mb)
     std::vector<int>      min_eqs          = {1000, 3, 3};  // collapse defaults
     int                   min_eq           = 3;  // deoverlap default
 
@@ -130,12 +136,12 @@ struct CollapseOpts {
 
     uint32_t min_trans_len = 3;  // Minimum interval length to allow transitive replacement expansion (i.e. if A->B and B->C, then A->C is allowed only if the replacement interval is >= this length)
 
-    double min_match_ratio = 0.8;   // minimum CIGAR match ratio, alignment score large than this value will be saved
-    double min_ali_ratio = 0.001;   // minimum aligned length ratio to keep (deoverlap default)
-    // std::vector<double> min_ali_ratios = {0.05, 0.01, 0.005, 0.001};   // minimum aligned length ratio to keep (collapse default)
-    std::vector<double> min_ali_ratios = {0.05, 0.01, 0.001};   // minimum aligned length ratio to keep (collapse default)
-    uint8_t min_mapq = 20;          // minimum mapping quality to keep
-    uint32_t all_pair_len = 1000;   // align all pairs when every path is shorter than this
+    double min_match_ratio = 0.9;  // minimum CIGAR match ratio for non-iterative commands
+    std::vector<double> min_match_ratios = {0.9, 0.95, 0.95};  // collapse defaults by iteration
+    double min_ali_ratio = 0.001;  // minimum aligned length ratio to keep (deoverlap default)
+    std::vector<double> min_ali_ratios = {0.05, 0.01, 0.001};  // minimum aligned length ratio to keep (collapse default)
+    uint8_t min_mapq = 30;  // minimum mapping quality to keep
+    uint32_t all_pair_len = 1000;  // align all pairs when every path is shorter than this
     uint32_t trim_min_len = 5'000'000;
     double trim_max_overlap = 0.05;
 

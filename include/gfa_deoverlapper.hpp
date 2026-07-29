@@ -265,7 +265,7 @@ protected:
     // Align overlaps between edges
     void overlaps_align_();
 
-    // Deduplicate alignments (keep the longest among identical segment pairs)
+    // Reject overlapping duplicate candidates while retaining disjoint intervals.
     void dedup_aligns_(size_t begin = 0);
 
     // Build alignment groups by connected segments. (2026-05-25, v0.1.3-r7)
@@ -287,6 +287,9 @@ protected:
         std::vector<std::unordered_set<uint32_t>>& cut_sets
     );
     SegReplace::Expander build_SegReplace_();
+
+    uint32_t materialized_segment_(SegReplace::Seg interval) const;
+    void rewrite_paths_(const SegReplace::Expander& expander);
 
     // Print/verify expansion index
     static void rulemap_verify(const std::vector<GfaNode>& nodes, const SegReplace::RuleMap& idx);

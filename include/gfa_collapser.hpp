@@ -2,11 +2,12 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <unordered_set>
 
 #include "gfa_parser.hpp"
 #include "logger.hpp"
 #include "CIGAR.hpp"
-#include "gfa_deoverlapper.hpp"
+#include "gfa_augment.hpp"
 #include "gfa_bubble.hpp"
 #include "path_pair_split.hpp"
 #include "seg_replace.hpp"
@@ -15,12 +16,9 @@
 
 #include "bindings/cpp/WFAligner.hpp"
 
-class LongNodeSplitter {
-public:
-    static uint64_t split(GfaGraph& graph, uint32_t min_length, uint32_t chunk_length);
-};
+class LocalGraphComplexity;
 
-class GfaCollapser : public GfaDeoverlapper {
+class GfaCollapser : public GfaAugmenter {
 
 public:
     GfaCollapser(
@@ -43,7 +41,7 @@ public:
         uint32_t min_trans_len,
         std::string mm2_preset
     )
-        : GfaDeoverlapper(
+        : GfaAugmenter(
             min_eq,
             min_match_ratio,
             min_ali_ratio,
@@ -97,13 +95,11 @@ public:
      * @param bubbles          list of bubbles detected in the graph
      * @param homologous_paths list of homologous paths detected in the graph
      * @param prefix           prefix for output files
-     * @param bubble_finder    reference to the bubble finder object
      */
     void collapse_homologous_seq(
         const std::vector<GfaBubble::Bubble>& bubbles, 
         const std::vector<GfaBubble::HomologousPath>& homologous_paths, 
-        const std::string& prefix, 
-        const GfaBubble::GfaBubbleFinder& bubble_finder
+        const std::string& prefix
     );
 
 protected:
@@ -116,6 +112,8 @@ protected:
     const uint32_t ALL_PAIR_LEN_;
 
 private:
+    friend class LocalGraphComplexity;
+
     /* -------------------------------------------- merge_linear_chains -------------------------------------------- */
     /**
      * @brief Extend from a starting vertex to build a linear chain (unitig).
@@ -148,10 +146,53 @@ private:
         const std::vector<uint32_t>& clusters,
         GfaBubble::Type path_type,
         const bool skip_same_start,
-        std::shared_ptr<path_pair_split::ComparedIndex> shared_cmp,
-        std::shared_ptr<std::shared_mutex> shared_cmp_mutex, 
+        path_pair_split::ComparedIndex& compared,
         uint32_t idx = UINT32_MAX
     );
+
+    struct CandidateTopoSpan_ {
+        uint32_t component{UINT32_MAX};
+        uint32_t begin{UINT32_MAX};
+        uint32_t end{0};
+    };
+
+    struct AlignmentCandidate_ {
+        bool homologous{false};
+        size_t source_index{0};
+        GfaBubble::Type type{GfaBubble::Type::Normal};
+        bool skip_same_start{false};
+        uint32_t idx{UINT32_MAX};
+        uint32_t input_paths{0};
+        uint64_t priority{0};
+        std::vector<CandidateTopoSpan_> spans;
+        std::vector<uint32_t> region_vertices;
+    };
+
+    std::vector<AlignmentCandidate_> alignment_candidates_;
+
+    std::vector<AlignmentCandidate_> build_alignment_candidates_(
+        const std::vector<GfaBubble::Bubble>& bubbles,
+        const std::vector<GfaBubble::HomologousPath>& homologous_paths
+    ) const;
+
+    std::vector<std::vector<size_t>> group_alignment_candidates_(
+        const std::vector<AlignmentCandidate_>& candidates
+    ) const;
+
+    std::vector<uint32_t> collect_candidate_region_(
+        const std::vector<std::vector<uint32_t>>& paths
+    ) const;
+
+    std::vector<BubbleAlignment> align_candidate_group_(
+        const std::vector<size_t>& group,
+        const std::vector<AlignmentCandidate_>& candidates,
+        const std::vector<GfaBubble::Bubble>& bubbles,
+        const std::vector<GfaBubble::HomologousPath>& homologous_paths
+    );
+
+    void reset_collapse_cuts_();
+
+    SegReplace::Expander build_safe_expander_(size_t alignment_begin);
 
     /**
      * @brief Align forks, bubble and homologous paths to find homologous regions for cutting.
@@ -164,7 +205,63 @@ private:
      */
     void homologous_align_(
         const std::vector<GfaBubble::Bubble>& bubbles, 
-        const std::vector<GfaBubble::HomologousPath>& homologous_paths, 
-        const GfaBubble::GfaBubbleFinder& bubble_finder
+        const std::vector<GfaBubble::HomologousPath>& homologous_paths
     );
 };
+
+/* ================================================================================================================
+ *                                          LOCAL GRAPH COMPLEXITY START
+ * ================================================================================================================ */
+class LocalGraphComplexity {
+public:
+    LocalGraphComplexity(GfaCollapser& collapser, size_t alignment_begin);
+
+    std::unordered_set<int32_t> find_increasing_candidates() const;
+    size_t reject_candidates(const std::unordered_set<int32_t>& candidates);
+
+private:
+    struct LocalGraph {
+        uint32_t node_count{0};
+        std::unordered_set<uint64_t> directed_edges;
+    };
+
+    struct Metrics {
+        uint64_t max_block_cycle_excess{0};
+        uint64_t max_block_branch_excess{0};
+    };
+
+    // Ignore small cut-induced bubbles; reject only order-of-magnitude growth in one inseparable block.
+    static constexpr uint64_t MAX_COMPLEXITY_GROWTH_ = 8;
+    GfaCollapser& collapser_;
+    const size_t alignment_begin_;
+
+    LocalGraph build_local_graph_(
+        const std::vector<uint32_t>& vertices,
+        const SegReplace::Expander* expander
+    ) const;
+
+    bool candidate_increases_(
+        size_t candidate_id,
+        const SegReplace::Expander& expander
+    ) const;
+
+    bool increases_(
+        uint32_t input_paths,
+        const LocalGraph& before,
+        const LocalGraph& after
+    ) const;
+
+    Metrics measure_(
+        uint32_t node_count,
+        const std::unordered_set<uint64_t>& directed_edges
+    ) const;
+
+    static void measure_block_(
+        const std::vector<std::pair<uint32_t, uint32_t>>& edges,
+        const std::vector<uint32_t>& block_edges,
+        Metrics& metrics
+    );
+};
+/* ================================================================================================================
+ *                                          LOCAL GRAPH COMPLEXITY END
+ * ================================================================================================================ */

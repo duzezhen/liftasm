@@ -232,8 +232,8 @@ void GfaBubbleFinder::find_bubbles()
     log_stream() << "  - Total bubbles detected: " << bubbles_.size() << "\n" << "\n";
 
     // Post-processing
-    bubble_branch_pairs_ = build_bubble_branch_pairs_();
-    if (!keep_nested_) filter_nonlocal_bubbles_();
+    if (!keep_nested_) filter_nested_bubbles();
+    else bubble_branch_pairs_ = build_bubble_branch_pairs_();
 
     std::sort(bubbles_.begin(), bubbles_.end(),
         [](const Bubble& a, const Bubble& b) {
@@ -590,64 +590,89 @@ Bubble GfaBubbleFinder::detect_closed_bubble_from_source_(Vertex v, uint64_t bfs
     return bb;
 }
 
-void GfaBubbleFinder::filter_nonlocal_bubbles_()
+void GfaBubbleFinder::filter_nested_bubbles()
 {
-    log_stream() << "Filtering non-local bubbles ...\n";
-
-    if (bubbles_.empty()) return;
-
-    std::vector<Bubble> kept; 
-    kept.reserve(bubbles_.size());
-
-    for (const Bubble& bb : bubbles_) {
-        // 1) Collect the set of vertices covered by this bubble, and the set of all sinks (the last vertex of each path)
-        std::unordered_set<uint32_t> segids; segids.reserve(128);
-        std::unordered_set<uint32_t> nodes; nodes.reserve(128);
-        std::unordered_set<uint32_t> all_sinks; all_sinks.reserve(8);
-        for (const auto& p : bb.get_paths()) {
-            for (uint32_t v : p) {
-                nodes.insert(v);
-                segids.insert(NodeHandle::get_segment_id(v));
-            }
-            if (!p.empty()) { all_sinks.insert(p.back()); }
-        }
-        const uint32_t src  = bb.get_source();
-
-        // 2) Check if any internal node has outgoing/incoming edges to outside the bubble
-        bool leaky = false;
-        for (uint32_t u : nodes) {
-            if (u == src) continue;
-            if (all_sinks.count(u)) continue;
-            // 2a) outgoing edges: internal -> external
-            for (const GfaArc* a : graph_.getArcsFromVertex(u)) {
-                if (!a || a->get_del() || (skip_comp_ && a->get_comp())) continue;
-                uint32_t w = a->get_target_vertex_id();
-                if (graph_.getNodeDeleted(NodeHandle::get_segment_id(w))) continue;
-                if (w == u) continue;
-                if (!segids.count(NodeHandle::get_segment_id(w))) { leaky = true; break; }
-            }
-            if (leaky) break;
-
-            // 2b) incoming edges: external -> internal
-            for (const GfaArc* a : graph_.getArcsToVertex(u)) {
-                if (!a || a->get_del() || (skip_comp_ && a->get_comp())) continue;
-                uint32_t w = a->get_source_vertex_id();
-                if (graph_.getNodeDeleted(NodeHandle::get_segment_id(w))) continue;
-                if (w == u) continue;
-                if (!segids.count(NodeHandle::get_segment_id(w))) { leaky = true; break; }
-            }
-
-            if (leaky) break;
-        }
-
-        if (leaky) { continue; }
-        kept.emplace_back(bb);  // 'Locally independent' bubble
+    log_stream() << "Filtering fully nested bubbles ...\n";
+    if (bubbles_.size() < 2) {
+        bubble_branch_pairs_ = build_bubble_branch_pairs_();
+        return;
     }
 
-    // Replace with the kept bubbles
-    bubbles_.swap(kept);
+    struct BubbleNodes {
+        size_t bubble{0};
+        std::vector<uint32_t> nodes;
+    };
 
-    log_stream() << "  - Kept " << bubbles_.size() << " local bubbles" << "\n" << "\n";
+    std::vector<BubbleNodes> ordered;
+    ordered.reserve(bubbles_.size());
+    for (size_t i = 0; i < bubbles_.size(); ++i) {
+        BubbleNodes item;
+        item.bubble = i;
+        if (bubbles_[i].get_source() != UINT32_MAX) {
+            item.nodes.push_back(Vertex::get_segment_id(bubbles_[i].get_source()));
+        }
+        if (bubbles_[i].get_sink() != UINT32_MAX) {
+            item.nodes.push_back(Vertex::get_segment_id(bubbles_[i].get_sink()));
+        }
+        for (const auto& path : bubbles_[i].get_paths()) {
+            for (uint32_t vertex : path) item.nodes.push_back(Vertex::get_segment_id(vertex));
+        }
+        std::sort(item.nodes.begin(), item.nodes.end());
+        item.nodes.erase(std::unique(item.nodes.begin(), item.nodes.end()), item.nodes.end());
+        ordered.push_back(std::move(item));
+    }
+
+    std::sort(ordered.begin(), ordered.end(), [this](const BubbleNodes& a, const BubbleNodes& b) {
+        if (a.nodes.size() != b.nodes.size()) return a.nodes.size() > b.nodes.size();
+        if (bubbles_[a.bubble].get_len() != bubbles_[b.bubble].get_len()) {
+            return bubbles_[a.bubble].get_len() > bubbles_[b.bubble].get_len();
+        }
+        return a.bubble < b.bubble;
+    });
+
+    std::unordered_map<uint32_t, std::vector<uint32_t>> node_to_kept;
+    node_to_kept.reserve(ordered.size() * 4 + 16);
+    std::vector<BubbleNodes> kept_index;
+    kept_index.reserve(ordered.size());
+    std::vector<Bubble> kept;
+    kept.reserve(ordered.size());
+
+    for (BubbleNodes& item : ordered) {
+        const std::vector<uint32_t>* candidates = nullptr;
+        for (uint32_t node : item.nodes) {
+            const auto found = node_to_kept.find(node);
+            if (found == node_to_kept.end()) {
+                candidates = nullptr;
+                break;
+            }
+            if (!candidates || found->second.size() < candidates->size()) candidates = &found->second;
+        }
+
+        bool nested = false;
+        if (candidates) {
+            for (uint32_t id : *candidates) {
+                const auto& container = kept_index[id].nodes;
+                if (container.size() >= item.nodes.size() &&
+                    std::includes(container.begin(), container.end(), item.nodes.begin(), item.nodes.end())) {
+                    nested = true;
+                    break;
+                }
+            }
+        }
+        if (nested) continue;
+
+        const uint32_t id = static_cast<uint32_t>(kept_index.size());
+        for (uint32_t node : item.nodes) node_to_kept[node].push_back(id);
+        kept_index.push_back(std::move(item));
+        kept.push_back(std::move(bubbles_[kept_index.back().bubble]));
+    }
+
+    const size_t removed = bubbles_.size() - kept.size();
+    bubbles_ = std::move(kept);
+    log_stream() << "  - Fully nested bubbles removed: " << removed << "\n";
+    log_stream() << "  - Bubbles retained: " << bubbles_.size() << "\n\n";
+
+    bubble_branch_pairs_ = build_bubble_branch_pairs_();
 }
 
 

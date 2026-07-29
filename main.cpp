@@ -12,6 +12,7 @@
 #include "include/gfa_seq.hpp"
 #include "include/gfa_deoverlapper.hpp"
 #include "include/gfa_collapser.hpp"
+#include "include/gfa_ctg_collapser.hpp"
 #include "include/gfa_bubble.hpp"
 #include "include/gfa_gfa2fa.hpp"
 #include "include/file2map.hpp"
@@ -181,9 +182,56 @@ int main(int argc, char** argv) {
         G.save_to_disk(cfg.collapse.prefix + ".deoverlap.noseq.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/false, command_line);
     } else if (sub == "collapse") {
         AppConfig cfg = main_collapse(argc, argv);
+        const bool ctg_mode = !cfg.collapse.hap1Files.empty();
+        std::vector<std::string> cur_gfa_files;
+        std::vector<std::string> cur_gfa_names;
 
-        std::vector<std::string> cur_gfa_files = cfg.collapse.gfaFiles;
-        std::vector<std::string> cur_gfa_names = cfg.collapse.gfaNames;
+        if (ctg_mode) {
+            GfaCtgCollapser G(
+                cfg.collapse.min_jaccards.front(),
+                cfg.collapse.min_eqs.front(),
+                cfg.collapse.min_match_ratios.front(),
+                cfg.collapse.min_ali_ratios.front(),
+                cfg.collapse.min_mapq,
+                cfg.collapse.trim_min_len,
+                cfg.collapse.trim_max_overlap,
+                cfg.collapse.max_iters,
+                cfg.bubble.homo_k,
+                cfg.bubble.homo_w,
+                cfg.collapse.all_pair_len,
+                cfg.collapse.repeat_mask_min_len,
+                cfg.collapse.repeat_mask_max_period,
+                cfg.collapse.repeat_mask_max_mismatch,
+                cfg.collapse.max_abnormal_cut_len,
+                cfg.collapse.min_abnormal_cut_count,
+                cfg.collapse.min_trans_len,
+                cfg.collapse.mm2_preset
+            );
+            G.set_opts(
+                cfg.map.chainOpts,
+                cfg.map.anchorOpts,
+                cfg.map.extendOpts,
+                cfg.map.alignOpts,
+                cfg.map.use_wfa
+            );
+            G.set_component_filter(cfg.collapse.ctg_min_coverage, cfg.collapse.ctg_end_fraction);
+            cur_gfa_files = G.collapse_samples(
+                cfg.collapse.hap1Files,
+                cfg.collapse.hap2Files,
+                cfg.collapse.gfaNames,
+                cfg.collapse.vcfFiles,
+                cfg.collapse.prefix,
+                cfg.collapse.ctg_min_reads,
+                cfg.collapse.ctg_short_len,
+                cfg.collapse.ctg_min_len,
+                cfg.collapse.ctg_anchor_only,
+                cfg.collapse.paf,
+                command_line
+            );
+        } else {
+            cur_gfa_files = cfg.collapse.gfaFiles;
+            cur_gfa_names = cfg.collapse.gfaNames;
+        }
 
         auto iter_value = [](const auto& xs, size_t iter) {
             return xs[std::min(iter, xs.size() - 1)];
@@ -192,6 +240,7 @@ int main(int argc, char** argv) {
         for (size_t iter = 0; iter < cfg.collapse.iterations; ++iter) {
             const int min_eq = iter_value(cfg.collapse.min_eqs, iter);
             const double min_jaccard = iter_value(cfg.collapse.min_jaccards, iter);
+            const double min_match_ratio = iter_value(cfg.collapse.min_match_ratios, iter);
             const double min_ali_ratio = iter_value(cfg.collapse.min_ali_ratios, iter);
             const double same_sim = iter_value(cfg.collapse.same_sims, iter);
             const uint32_t same_min_len = iter_value(cfg.collapse.same_min_lens, iter);
@@ -202,6 +251,7 @@ int main(int argc, char** argv) {
             log_stream() << "Collapse iteration " << (iter + 1) << "/" << cfg.collapse.iterations << " ...\n";
             log_stream() << "  - min_eq       : " << format_size_arg_(min_eq) << "\n";
             log_stream() << "  - min_jaccard  : " << format_double_(min_jaccard) << "\n";
+            log_stream() << "  - min_match    : " << format_double_(min_match_ratio) << "\n";
             log_stream() << "  - min_ali_ratio: " << format_double_(min_ali_ratio) << "\n";
             log_stream() << "  - same_sim     : " << format_double_(same_sim) << "\n";
             log_stream() << "  - same_len     : " << format_size_arg_(same_min_len) << "\n";
@@ -209,10 +259,10 @@ int main(int argc, char** argv) {
             log_stream() << "  - diff_sim     : " << format_double_(diff_sim) << "\n";
             log_stream() << "  - diff_len     : " << format_size_arg_(diff_min_len) << "\n\n";
 
-            GfaCollapser G(
+            GfaCtgCollapser G(
                 min_jaccard,
                 min_eq,
-                cfg.collapse.min_match_ratio,
+                min_match_ratio,
                 min_ali_ratio,
                 cfg.collapse.min_mapq,
                 cfg.collapse.trim_min_len,
@@ -225,7 +275,7 @@ int main(int argc, char** argv) {
                 cfg.collapse.repeat_mask_max_period,
                 cfg.collapse.repeat_mask_max_mismatch,
                 cfg.collapse.max_abnormal_cut_len,
-                cfg.collapse.min_abnormal_cut_count, 
+                cfg.collapse.min_abnormal_cut_count,
                 cfg.collapse.min_trans_len,
                 cfg.collapse.mm2_preset
             );
@@ -238,10 +288,6 @@ int main(int argc, char** argv) {
                 cfg.map.use_wfa
             );
             G.load_from_GFA(cur_gfa_files, cur_gfa_names);
-            if (iter == 0 && cfg.collapse.long_node_len > 0) {
-                const uint32_t chunk_len = diff_min_src;
-                LongNodeSplitter::split(G, cfg.collapse.long_node_len, chunk_len);
-            }
             G.build_nodes_connectivity_index();
             G.build_vertex_topological_index();
             if (iter == 0 && cfg.bubble.check_complex) {
@@ -262,7 +308,7 @@ int main(int argc, char** argv) {
                 cfg.bubble.path_diff,
                 cfg.bubble.stall_round_limit,
                 /*skip_comp=*/false,
-                /*keep_nested=*/true,
+                /*keep_nested=*/false,
                 same_sim,
                 same_min_len,
                 diff_min_src,
@@ -302,14 +348,16 @@ int main(int argc, char** argv) {
 
             const std::string iter_prefix = cfg.collapse.prefix + ".iter" + std::to_string(iter + 1);
 
-            G.collapse_homologous_seq(bubbles, homologous_paths, iter_prefix, finder);
+            G.collapse_homologous_seq(bubbles, homologous_paths, iter_prefix);
+            if (G.getNumPaths() > 0) G.rebuild_component_paths();
 
             const std::string iter_gfa = iter_prefix + ".collapse.gfa";
             const std::string iter_noseq = iter_prefix + ".collapse.noseq.gfa";
             const std::string iter_bubble_noseq = iter_prefix + ".bubbles.noseq.gfa";
 
-            G.save_to_disk(iter_gfa, /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/true, command_line);
-            G.save_to_disk(iter_noseq, /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/false, command_line);
+            const bool write_paths = G.getNumPaths() > 0;
+            G.save_to_disk(iter_gfa, /*write_paths=*/write_paths, /*write_align=*/false, /*write_seq=*/true, command_line);
+            G.save_to_disk(iter_noseq, /*write_paths=*/write_paths, /*write_align=*/false, /*write_seq=*/false, command_line);
             finder.save_bubble_as_gfa(iter_bubble_noseq, cfg.bubble.min_len, cfg.bubble.min_num, /*write_seq=*/false, command_line);
 
             cur_gfa_files.assign(1, iter_gfa);

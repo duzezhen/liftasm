@@ -70,12 +70,61 @@ static std::string gfa_sample_name_from_path_(const std::string& path) {
     return s.empty() ? "gfa" : s;
 }
 
+bool GfaGraph::input_segment_names_need_namespace_(
+    const std::vector<std::string>& filenames,
+    const std::vector<uint32_t>& duplicate_groups
+) {
+    const bool grouped = !duplicate_groups.empty();
+    std::unordered_map<std::string, uint32_t> first_file;
+    std::unordered_set<std::string> grouped_names;
+    bool found_cross_file_duplicate = false;
+
+    for (uint32_t file_id = 0; file_id < filenames.size(); ++file_id) {
+        std::unordered_set<std::string> local_names;
+        GzChunkReader reader(filenames[file_id]);
+        std::string line;
+        while (reader.readLine(line)) {
+            if (line.empty() || line[0] != 'S') continue;
+            std::stringstream in(line);
+            char type = 0;
+            std::string name;
+            in >> type >> name;
+            if (type != 'S' || name.empty()) continue;
+
+            if (!local_names.insert(name).second) {
+                error_stream() << "Duplicate segment name '" << name << "' within GFA file '" << filenames[file_id] << "'\n";
+                std::exit(1);
+            }
+
+            if (grouped) {
+                const std::string key = std::to_string(duplicate_groups[file_id]) + '\t' + name;
+                if (!grouped_names.insert(key).second) {
+                    error_stream() << "Duplicate segment name '" << name << "' within contig sample " << (duplicate_groups[file_id] + 1) << "\n";
+                    std::exit(1);
+                }
+            }
+
+            const auto inserted = first_file.emplace(name, file_id);
+            if (!inserted.second && inserted.first->second != file_id) {
+                found_cross_file_duplicate = true;
+            }
+        }
+        reader.close();
+    }
+    return found_cross_file_duplicate;
+}
+
 
 GfaGraph::GfaGraph()  = default;
 GfaGraph::~GfaGraph() = default;
 
 // Load GFA file(s) into the graph structure
-void GfaGraph::load_from_GFA(const std::vector<std::string>& filenames, const std::vector<std::string>& sample_names) {
+void GfaGraph::load_from_GFA(
+    const std::vector<std::string>& filenames,
+    const std::vector<std::string>& sample_names,
+    bool read_links,
+    const std::vector<uint32_t>& duplicate_groups
+) {
     if (filenames.empty()) {
         error_stream() << "No GFA input file provided.\n";
         std::exit(1);
@@ -85,13 +134,26 @@ void GfaGraph::load_from_GFA(const std::vector<std::string>& filenames, const st
         error_stream() << "-n/--name must have the same number of values as -g/--gfa\n";
         std::exit(1);
     }
+    if (!duplicate_groups.empty() && duplicate_groups.size() != filenames.size()) {
+        error_stream() << "Internal error: duplicate-name groups must match the number of GFA files\n";
+        std::exit(1);
+    }
+
+    const bool has_cross_input_duplicate = filenames.size() > 1 && input_segment_names_need_namespace_(filenames, duplicate_groups);
+    const bool namespace_all = has_cross_input_duplicate;
+    if (has_cross_input_duplicate) {
+        warning_stream() << "Duplicate segment names found across input " << (duplicate_groups.empty() ? "files" : "samples") << "; adding a namespace suffix to every segment name\n\n";
+    }
 
     std::vector<gfa_name_check::FileRenamePlan> plans;
     plans.reserve(filenames.size());
 
     // pass-1: register S names file by file, and check for duplicates and invalid names
-    for (const auto& filename : filenames) {
-        gfa_name_check::FileRenamePlan plan(/*max_log_examples=*/5);
+    for (size_t file_id = 0; file_id < filenames.size(); ++file_id) {
+        const auto& filename = filenames[file_id];
+        const uint32_t namespace_id = duplicate_groups.empty() ? file_id : duplicate_groups[file_id];
+        const std::string suffix = namespace_all ? "_" + std::to_string(namespace_id + 1) : "";
+        gfa_name_check::FileRenamePlan plan(/*max_log_examples=*/5, suffix);
 
         GzChunkReader zr(filename);
         std::string line;
@@ -144,7 +206,7 @@ void GfaGraph::load_from_GFA(const std::vector<std::string>& filenames, const st
 
             switch (type) {
                 case 'S': parseSLine(ss, sample_name); break;
-                case 'L': parseLLine(ss); break;
+                case 'L': if (read_links) parseLLine(ss); break;
                 case 'P': parsePLine(ss); break;
                 case 'A': parseALine(ss); break;
                 default:  break;

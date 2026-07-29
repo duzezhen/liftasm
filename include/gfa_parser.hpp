@@ -36,12 +36,15 @@
 class GfaGraph {
 public:
     friend class GfaBamLoader;
-    friend class LongNodeSplitter;
-
     GfaGraph();
     ~GfaGraph();
 
-    void load_from_GFA(const std::vector<std::string>& filenames, const std::vector<std::string>& sample_names = {});
+    void load_from_GFA(
+        const std::vector<std::string>& filenames,
+        const std::vector<std::string>& sample_names = {},
+        bool read_links = true,
+        const std::vector<uint32_t>& duplicate_groups = {}
+    );
 
     const GfaNode*                       getNode(uint64_t internal_id)              const { return internal_id < nodes_.size() ? &nodes_[internal_id] : nullptr; }
     uint64_t                             getNodeInternalId(const std::string& name) const;
@@ -190,6 +193,11 @@ protected:
 
 
 protected:
+    static bool input_segment_names_need_namespace_(
+        const std::vector<std::string>& filenames,
+        const std::vector<uint32_t>& duplicate_groups
+    );
+
     uint32_t get_or_add_segment(const std::string& name, bool* is_new = nullptr);
 
     static std::string slice_seq_or_star_(const std::vector<GfaNode>& nodes, uint32_t seg_id, uint32_t beg, uint32_t end, bool is_rev);

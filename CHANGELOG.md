@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.3-r15 (2026-07-28)
+
+### Added
+
+- Added contig mode to directly collapse haplotype 1/2 `p_ctg` GFA files from multiple samples.
+
 ## v0.1.3-r14 (2026-07-19)
 
 ### Added

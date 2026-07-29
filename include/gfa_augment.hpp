@@ -18,7 +18,7 @@ public:
 
     Stats augment(const std::vector<std::string>& vcf_files, const std::string& prefix, const std::string& tag);
 
-private:
+protected:
     struct VariantInput {
         uint32_t sid{0};
         uint32_t beg{0};

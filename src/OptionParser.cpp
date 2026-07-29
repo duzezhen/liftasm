@@ -287,8 +287,50 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
 
         case ToolMode::collapse:
             ensure(
-                !cfg.collapse.gfaFiles.empty(), 
-                "-g/--gfa is required"
+                !cfg.collapse.gfaFiles.empty() || !cfg.collapse.hap1Files.empty(),
+                "either -g/--gfa or --c1/--c2 is required"
+            );
+            ensure(
+                cfg.collapse.gfaFiles.empty() || cfg.collapse.hap1Files.empty(),
+                "-g/--gfa and --c1/--c2 are mutually exclusive"
+            );
+            ensure(
+                cfg.collapse.hap1Files.size() == cfg.collapse.hap2Files.size(),
+                "--c1 and --c2 must have the same number of files"
+            );
+            ensure(
+                cfg.collapse.vcfFiles.empty() || !cfg.collapse.hap1Files.empty(),
+                "-v/--vcf is only supported with --c1/--c2"
+            );
+            ensure(
+                cfg.collapse.vcfFiles.empty() || cfg.collapse.vcfFiles.size() == cfg.collapse.hap1Files.size(),
+                "-v/--vcf must provide one file for each --c1/--c2 sample"
+            );
+            ensure(
+                cfg.collapse.hap1Files.empty() || cfg.collapse.ctg_min_reads >= 1,
+                "--ctg_reads must be >= 1"
+            );
+            ensure(
+                cfg.collapse.ctg_min_coverage >= 0.0 && cfg.collapse.ctg_min_coverage <= 1.0,
+                "--ctg_cov must be in [0,1]"
+            );
+            ensure(
+                cfg.collapse.ctg_end_fraction >= 0.0 && cfg.collapse.ctg_end_fraction <= 1.0,
+                "--ctg_end must be in [0,1]"
+            );
+            ensure(
+                !cfg.collapse.ctg_anchor_only || !cfg.collapse.hap1Files.empty(),
+                "--anchor_only is only supported with --c1/--c2"
+            );
+            ensure(
+                cfg.collapse.hap1Files.empty() || cfg.collapse.gfaNames.empty() ||
+                    cfg.collapse.gfaNames.size() == cfg.collapse.hap1Files.size(),
+                "-n/--name must have the same number of values as --c1"
+            );
+            ensure(
+                !cfg.collapse.hap1Files.empty() || cfg.collapse.gfaNames.empty() ||
+                    cfg.collapse.gfaNames.size() == cfg.collapse.gfaFiles.size(),
+                "-n/--name must have the same number of values as -g/--gfa"
             );
             ensure(
                 !cfg.collapse.prefix.empty(), 
@@ -451,9 +493,15 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--zdrop must be >= 0"
             );
             ensure(
-                cfg.collapse.min_match_ratio >= 0.0 && cfg.collapse.min_match_ratio <= 1.0,
-                "--min_match must be in [0,1]"
+                !cfg.collapse.min_match_ratios.empty(),
+                "--min_match must contain at least one value"
             );
+            for (double x : cfg.collapse.min_match_ratios) {
+                ensure(
+                    x >= 0.0 && x <= 1.0,
+                    "--min_match values must be in [0,1]"
+                );
+            }
             ensure(
                 !cfg.collapse.min_ali_ratios.empty(),
                 "--min_ali_ratio must contain at least one value"
@@ -782,7 +830,7 @@ void help_stat(char** argv) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ...\n\n"
         << "Collect statistics about GFA file\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
     hp.blank();
     hp.section("General Options");
@@ -835,7 +883,7 @@ void help_seq(char** argv) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ... -p FILE [options]\n\n"
         << "Extract sequences for compact marker paths or open walks (one record per line)\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
     hp.line("-p, --path", "FILE", "text file of paths/open walks (one per line)");
     hp.note(" * path format: '>S1<S2>S3' or 'S1+,S2-,S3+'");
@@ -903,7 +951,7 @@ void help_gfa2fa(char** argv) {
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ... [options]\n\n"
         << "Export all segments of a GFA to FASTA, extending both ends by Y bp\n"
         << "for segments whose effective length is shorter than X bp.\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
     hp.line("-o, --output", "FILE", "output FASTA file [stdout]");
     hp.blank();
@@ -996,7 +1044,7 @@ void help_depth(char** argv) {
         << "       " << argv[0] << " " << argv[1] << " -g graph.gfa --gaf aln.gaf -o graph.depth\n"
         << "  3. GFA-only mode (depth is calculated from 'A' lines in the GFA file):\n"
         << "       " << argv[0] << " " << argv[1] << " -g graph.gfa -o graph.depth\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
     hp.line("-r, --read", "FILE", "input sequencing data file(s) for k-mer mode");
     hp.note(" * depth calculated from k-mer coverage");
@@ -1118,7 +1166,7 @@ void help_bubble(char** argv, bool advanced) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ... [options]\n\n"
         << "Detect bubbles in GFA graph and write them to GFA/VCF file\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
     hp.line("-n, --name", "STR ...", "sample name(s) to add as node tags; if omitted, the prefix of each GFA filename is used");
     hp.line("-p, --prefix", "STR", "output prefix [" + BubbleOpts().out_prefix + "]");
@@ -1396,7 +1444,7 @@ void help_deoverlap(char** argv, bool advanced) {
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ... [options]\n\n"
         << "Convert an overlap-based GFA into a non-overlap GFA\n\n";
 
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
     hp.line("-n, --name", "STR ...", "sample name(s) to add as node tags; if omitted, the prefix of each GFA filename is used");
     hp.line("-p, --prefix", "STR", "output prefix [" + CollapseOpts().prefix + "]");
@@ -1598,28 +1646,33 @@ void help_collapse(char** argv, bool advanced) {
     HelpPrinter hp(std::cerr, 20, 20);
 
     std::cerr
-        << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ... [options]\n\n"
+        << "Usage: " << argv[0] << " " << argv[1] << " (-g FILE ... | --c1 FILE ... --c2 FILE ...) [options]\n\n"
         << "De-overlap (if needed) and collapse homologous sequences in GFA into single nodes\n\n";
 
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s) (overlap or no-overlap)");
+    hp.line("--c1", "FILE ...", "haplotype-1 contig GFA file(s) with read A-lines");
+    hp.line("--c2", "FILE ...", "haplotype-2 contig GFA file(s), paired with --c1");
+    hp.line("-v, --vcf", "FILE ...", "VCF file(s) added during haplotype contig collapse");
     hp.line("-n, --name", "STR ...", "sample name(s) to add as node tags; if omitted, the prefix of each GFA filename is used");
     hp.line("-p, --prefix", "STR", "output prefix [" + CollapseOpts().prefix + "]");
-    hp.note(" * <prefix>.iterN.collapse.{gfa,noseq.gfa,map}");
+    hp.note(" * -g: <prefix>.iterN.collapse.{gfa,noseq.gfa,map}");
+    hp.note(" * --c1/--c2: <prefix>.<name>.collapse.{gfa,noseq.gfa,map} and <prefix>.iter0.collapse.{gfa,noseq.gfa,map}");
+    hp.line("--paf", "", "write filtered and raw component alignments to <prefix>{,.all}.paf");
 
     hp.blank();
-    hp.section("Index options:");
+    hp.section("Index options");
     hp.line("-k, --kmer", "INT", "k-mer length [" + std::to_string(GlobalOpts().kmerLen) + "]");
     hp.line("-w, --window", "INT", "minimizer window [" + std::to_string(GlobalOpts().minimizerW) + "]");
 
     hp.blank();
-    hp.section("Align options:");
+    hp.section("Align options");
     if (advanced) {
         hp.line("--use_wfa", "", "whether to use WFA for alignment, if not use mm2 (beta)");
     }
     hp.line("-z, --zdrop", "INT", "Z-drop score [" + format_size_arg_(MapOpts().extendOpts.dyn_zdrop) + "]");
-    hp.line("--min_match", "FLOAT", "minimum match fraction in the alignment CIGAR [" + format_double_(CollapseOpts().min_match_ratio) + "]");
-    hp.line("--min_ali_ratio", "FLOAT[,FLOAT...]", "minimum aligned-length fractions by collapse iteration [" + join_doubles_(CollapseOpts().min_ali_ratios) + "]");
+    hp.line("--min_match", "FLOAT[,FLOAT...]", "minimum CIGAR match fractions by iteration [" + join_doubles_(CollapseOpts().min_match_ratios) + "]; contig mode uses the first value");
+    hp.line("--min_ali_ratio", "FLOAT[,FLOAT...]", "minimum aligned-length fractions by iteration [" + join_doubles_(CollapseOpts().min_ali_ratios) + "]; contig mode uses the first value");
     hp.line("--min_mapq", "INT", "minimum mapping quality (MAPQ) to keep (no larger than 60) [" + std::to_string(int(CollapseOpts().min_mapq)) + "]");
     hp.line("-x, --preset", "STR", "mapping preset: asm5/asm10/asm20/sr/lr:hq [" + CollapseOpts().mm2_preset + "]");
     if (advanced) {
@@ -1627,15 +1680,15 @@ void help_collapse(char** argv, bool advanced) {
         hp.line("--trim_len", "INT", "minimum length of both alignments to trim a small overlap [" + format_size_arg_(CollapseOpts().trim_min_len) + "]");
         hp.line("--trim_ovlp", "FLOAT", "maximum overlap fraction of the shorter alignment to trim [" + format_double_(CollapseOpts().trim_max_overlap) + "]");
     }
-
+    hp.line("--anchor_only", "", "align only shared-read anchor regions in contig collapse");
     hp.blank();
-    hp.section("Collapse options:");
+    hp.section("Collapse options");
     hp.line("--iterations", "INT", "number of collapse iterations [" + std::to_string(CollapseOpts().iterations) + "]");
-    hp.line("--min_jaccard", "FLOAT[,FLOAT...]", "Jaccard thresholds by collapse iteration [" + join_doubles_(CollapseOpts().min_jaccards) + "]");
-    hp.line("--min_eq", "INT[,INT...]", "minimum match lengths to add cut points at segment for iterative collapse [" + join_ints_(CollapseOpts().min_eqs) + "]");
     hp.note(" * lists shorter than --iterations reuse their last value");
-    hp.line("--long_node_len", "INT", "split longer nodes into pieces of size specified by --diff_src_len; 0 disables [" + format_size_arg_(CollapseOpts().long_node_len) + "]");
+    hp.line("--min_jaccard", "FLOAT[,FLOAT...]", "Jaccard thresholds by collapse iteration [" + join_doubles_(CollapseOpts().min_jaccards) + "]; contig mode uses the first value");
+    hp.line("--min_eq", "INT[,INT...]", "minimum match lengths for cut points [" + join_ints_(CollapseOpts().min_eqs) + "]; contig mode uses the first value");
     hp.line("--max_iters", "INT", "maximum iterations for cut point propagation [" + format_size_arg_(CollapseOpts().max_iters) + "]");
+    hp.line("--ctg_min_len", "INT", "ignore shorter input contigs in contig mode; 0 disables [" + format_size_arg_(CollapseOpts().ctg_min_len) + "]");
     if (advanced) {
         hp.line("--repeat_mask", "INT,INT,INT", "tandem-repeat masking as MIN_LEN,MAX_PERIOD,MAX_MISMATCH [" + std::to_string(CollapseOpts().repeat_mask_min_len) + "," + std::to_string(CollapseOpts().repeat_mask_max_period) + "," + std::to_string(CollapseOpts().repeat_mask_max_mismatch) + "]");
         hp.note(" * e.g. ATATATGATCG contains a 9 bp repeat with period 2 (AT) and 1 mismatch (G), detectable by 8,12,1");
@@ -1646,7 +1699,7 @@ void help_collapse(char** argv, bool advanced) {
     }
 
     hp.blank();
-    hp.section("Bubble Detection Options:");
+    hp.section("Bubble Detection Options");
     hp.line("--depth", "INT", "maximum DFS depth for path exploration inside a bubble [" + format_size_arg_(BubbleOpts().max_depth) + "]");
     hp.line("--paths", "INT", "maximum number of DFS paths to explore per bubble [" + format_size_arg_(BubbleOpts().max_paths) + "]");
     if (advanced) {
@@ -1664,7 +1717,7 @@ void help_collapse(char** argv, bool advanced) {
 
     if (advanced) {
         hp.blank();
-        hp.section("Homologous Path Detection Options:");
+        hp.section("Homologous Path Detection Options");
         hp.line("--same_sim", "FLOAT[,FLOAT...]", "same-source homologous path similarity thresholds by collapse iteration [" + join_doubles_(CollapseOpts().same_sims) + "]");
         hp.line("--same_len", "INT[,INT...]", "minimum total lengths of each same-source homologous path by collapse iteration [" + join_sizes_(CollapseOpts().same_min_lens) + "]");
         hp.line("--diff_src_len", "INT[,INT...]", "minimum source lengths for different-source search by collapse iteration [" + join_sizes_(CollapseOpts().diff_min_srcs) + "]");
@@ -1676,10 +1729,14 @@ void help_collapse(char** argv, bool advanced) {
         hp.line("--hextend", "INT", "bp extended per homologous-path extension round [" + format_size_arg_(BubbleOpts().homo_extend_bp) + "]");
         hp.line("--hbits", "INT", "Bloom filter size in bits for homologous-path sketches [" + format_size_arg_(BubbleOpts().homo_bloom_bits) + "]");
         hp.line("--hhash", "INT", "number of Bloom filter hash functions for homologous-path sketches [" + format_size_arg_(BubbleOpts().homo_bloom_hash) + "]");
+        hp.line("--ctg_reads", "INT", "minimum shared reads in a contig anchor block [" + std::to_string(CollapseOpts().ctg_min_reads) + "]");
+        hp.line("--ctg_short", "INT", "short contig length for one-partner filtering; 0 disables [" + format_size_arg_(CollapseOpts().ctg_short_len) + "]");
+        hp.line("--ctg_cov", "FLOAT", "minimum contig span coverage for within- or cross-sample support [" + format_double_(CollapseOpts().ctg_min_coverage) + "]");
+        hp.line("--ctg_end", "FLOAT", "maximum terminal overhang fraction for end-to-end support; 0 disables [" + format_double_(CollapseOpts().ctg_end_fraction) + "]");
     }
 
     hp.blank();
-    hp.section("General Options:");
+    hp.section("General Options");
     hp.line("-t, --threads", "INT", "number of threads (~5GB RAM per thread) [" + std::to_string(GlobalOpts().threads) + "]");
     hp.line("-d, --debug", "", "debug mode (forces threads=1)");
     hp.line("-h, --help", "", "show basic options");
@@ -1695,8 +1752,12 @@ AppConfig main_collapse(int argc, char** argv) {
 
     const struct option long_opts[] = {
         {"gfa",             required_argument, nullptr, 'g'},
+        {"c1",              required_argument, nullptr, 1001},
+        {"c2",              required_argument, nullptr, 1002},
+        {"vcf",             required_argument, nullptr, 'v'},
         {"name",            required_argument, nullptr, 'n'},
         {"prefix",          required_argument, nullptr, 'p'},
+        {"paf",             no_argument,       nullptr, 2009},
 
         {"kmer",            required_argument, nullptr, 'k'},
         {"window",          required_argument, nullptr, 'w'},
@@ -1710,12 +1771,13 @@ AppConfig main_collapse(int argc, char** argv) {
         {"all_pair_len",    required_argument, nullptr, 2005},
         {"trim_len",        required_argument, nullptr, 2006},
         {"trim_ovlp",       required_argument, nullptr, 2007},
+        {"anchor_only",     no_argument,       nullptr, 2008},
 
         {"iterations",      required_argument, nullptr, 3001},
         {"min_jaccard",     required_argument, nullptr, 3002},
         {"min_eq",          required_argument, nullptr, 3003},
-        {"long_node_len",   required_argument, nullptr, 3004},
-        {"max_iters",       required_argument, nullptr, 3005},
+        {"max_iters",       required_argument, nullptr, 3004},
+        {"ctg_min_len",     required_argument, nullptr, 3005},
         {"repeat_mask",     required_argument, nullptr, 3006},
         {"repeat_norm_len", required_argument, nullptr, 3007},
         {"abnormal_cut",    required_argument, nullptr, 3008},
@@ -1743,6 +1805,10 @@ AppConfig main_collapse(int argc, char** argv) {
         {"hextend",         required_argument, nullptr, 5009},
         {"hbits",           required_argument, nullptr, 5010},
         {"hhash",           required_argument, nullptr, 5011},
+        {"ctg_reads",       required_argument, nullptr, 5012},
+        {"ctg_short",       required_argument, nullptr, 5013},
+        {"ctg_cov",         required_argument, nullptr, 5014},
+        {"ctg_end",         required_argument, nullptr, 5015},
 
         {"threads",         required_argument, nullptr, 't'},
         {"debug",           no_argument,       nullptr, 'd'},
@@ -1750,7 +1816,7 @@ AppConfig main_collapse(int argc, char** argv) {
         {"advanced",        no_argument,       nullptr, 'H'},
         {0,0,0,0}
     };
-    const char* short_opts = "g:n:p:k:w:z:x:t:dhH";
+    const char* short_opts = "g:v:n:p:k:w:z:x:t:dhH";
 
     int idx = 0, c;
     while ((c = getopt_long(argc, argv, short_opts, long_opts, &idx)) != -1) {
@@ -1761,6 +1827,21 @@ AppConfig main_collapse(int argc, char** argv) {
                     cfg.collapse.gfaFiles.emplace_back(argv[optind]);
                     ++optind;
                 }
+                break;
+            }
+            case 1001: {
+                cfg.collapse.hap1Files.emplace_back(optarg);
+                while (optind < argc && !is_flag_(argv[optind])) cfg.collapse.hap1Files.emplace_back(argv[optind++]);
+                break;
+            }
+            case 1002: {
+                cfg.collapse.hap2Files.emplace_back(optarg);
+                while (optind < argc && !is_flag_(argv[optind])) cfg.collapse.hap2Files.emplace_back(argv[optind++]);
+                break;
+            }
+            case 'v': {
+                cfg.collapse.vcfFiles.emplace_back(optarg);
+                while (optind < argc && !is_flag_(argv[optind])) cfg.collapse.vcfFiles.emplace_back(argv[optind++]);
                 break;
             }
             case 'n': {
@@ -1795,11 +1876,15 @@ AppConfig main_collapse(int argc, char** argv) {
                 break;
             }
             case 2002: {
-                cfg.collapse.min_match_ratio = std::max(0.0, std::stod(optarg));
+                cfg.collapse.min_match_ratios = parse_double_list_(optarg);
+                if (!cfg.collapse.min_match_ratios.empty()) {
+                    cfg.collapse.min_match_ratio = cfg.collapse.min_match_ratios.front();
+                }
                 break;
             }
             case 2003: {
                 cfg.collapse.min_ali_ratios = parse_double_list_(optarg);
+                if (!cfg.collapse.min_ali_ratios.empty()) cfg.collapse.min_ali_ratio = cfg.collapse.min_ali_ratios.front();
                 break;
             }
             case 2004: {
@@ -1827,6 +1912,14 @@ AppConfig main_collapse(int argc, char** argv) {
                 cfg.collapse.trim_max_overlap = std::stod(optarg);
                 break;
             }
+            case 2008: {
+                cfg.collapse.ctg_anchor_only = true;
+                break;
+            }
+            case 2009: {
+                cfg.collapse.paf = true;
+                break;
+            }
 
             case 3001: {
                 cfg.collapse.iterations = parse_size_arg_u32_(optarg, argc, argv, optind, "--iterations");
@@ -1845,14 +1938,16 @@ AppConfig main_collapse(int argc, char** argv) {
                     ++optind;
                 }
 
+                if (!cfg.collapse.min_eqs.empty()) cfg.collapse.min_eq = cfg.collapse.min_eqs.front();
+
                 break;
             }
             case 3004: {
-                cfg.collapse.long_node_len = parse_size_arg_u32_(optarg, argc, argv, optind, "--long_node_len");
+                cfg.collapse.max_iters = parse_size_arg_u16_(optarg, argc, argv, optind, "--max_iters");
                 break;
             }
             case 3005: {
-                cfg.collapse.max_iters = parse_size_arg_u16_(optarg, argc, argv, optind, "--max_iters");
+                cfg.collapse.ctg_min_len = parse_size_arg_u32_(optarg, argc, argv, optind, "--ctg_min_len");
                 break;
             }
             case 3006: {
@@ -1957,6 +2052,22 @@ AppConfig main_collapse(int argc, char** argv) {
                 cfg.bubble.homo_bloom_hash = parse_size_arg_u32_(optarg, argc, argv, optind, "--hhash");
                 break;
             }
+            case 5012: {
+                cfg.collapse.ctg_min_reads = parse_size_arg_u32_(optarg, argc, argv, optind, "--ctg_reads");
+                break;
+            }
+            case 5013: {
+                cfg.collapse.ctg_short_len = parse_size_arg_u32_(optarg, argc, argv, optind, "--ctg_short");
+                break;
+            }
+            case 5014: {
+                cfg.collapse.ctg_min_coverage = std::stod(optarg);
+                break;
+            }
+            case 5015: {
+                cfg.collapse.ctg_end_fraction = std::stod(optarg);
+                break;
+            }
 
             case 't': {
                 cfg.global.threads = std::max(1, std::stoi(optarg));
@@ -2001,7 +2112,7 @@ void help_file2map(char** argv) {
         << "       Rename them to something like 'chr1_ref' and 'chr1_qry'.\n"
         << "     - Sequence names must NOT contain ':', '-' or '+' characters,\n"
         << "       to avoid confusion with map coordinate formats such as 'chr:beg-end+'.\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-i, --input", "FILE ...", "input PAF/GFA file(s)");
     hp.line("-o, --output", "FILE", "output file name [stdout]");
     hp.blank();
@@ -2082,7 +2193,7 @@ void help_liftover(char** argv, bool advanced) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -m FILE ... -b FILE [options]\n\n"
         << "LiftOver BED coordinates using a .map file, which produced by deoverlap/collapse/file2map\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-m, --map", "FILE ...", "coordinate mapping file(s) (generated by deoverlap/collapse/file2map)");
     hp.line("--paf", "FILE", "input PAF file to assist liftover (optional)");
     hp.line("-b, --bed", "FILE", "input BED file, required if not checking");
@@ -2329,7 +2440,7 @@ void help_mapq_boost(char** argv, bool advanced) {
         << "  minimap2 -ax map-ont -N 1000 HG002.hap1_hap2.fa pore-c.fq.gz \\\n"
         << kTail
         << std::endl;
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-m, --map", "FILE ...", "coordinate mapping file(s) (generated by deoverlap/collapse/file2map)");
     hp.line("-i, --in", "FILE", "input SAM/BAM [stdin]");
     hp.line("-o, --out", "FILE", "output SAM/BAM [stdout]");
@@ -2600,7 +2711,7 @@ void help_align(char** argv) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ... -r FILE ... [options]\n\n"
         << "Align sequencing data to a GFA\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
     hp.line("-r, --read", "FILE ...", "input sequencing data file(s)");
     hp.line("-p, --paf", "", "output PAF (default SAM)");
@@ -2720,7 +2831,7 @@ void help_res_cut(char** argv) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ... -e STR ... [options]\n\n"
         << "Build restriction cut-site index from a genome\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --genome", "FILE", "input genome FASTA");
     hp.line("-o, --output", "FILE", "output BED file (optional)");
     hp.blank();
@@ -2800,7 +2911,7 @@ void help_split(char** argv) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ... [options]\n\n"
         << "Split graph by connected components\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
     hp.line("-n, --name", "STR ...", "sample name(s) to add as node tags; if omitted, the prefix of each GFA filename is used");
     hp.line("-p, --prefix", "STR", "output prefix [" + SplitOpts().prefix + "]");
@@ -2870,7 +2981,7 @@ void help_augment(char** argv, bool advanced) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ... -v FILE ... [options]\n\n"
         << "Augment GFA segments with VCF alleles as variant bubbles\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
     hp.line("-n, --name", "STR ...", "sample name(s) to add as node tags; if omitted, the prefix of each GFA filename is used");
     hp.line("-v, --vcf", "FILE ...", "input VCF or VCF.GZ file(s)");
@@ -2996,7 +3107,7 @@ void help_clean(char** argv) {
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g UTG.gfa -c CTG1.gfa CTG2.gfa [options]\n\n"
         << "Remove weak UTG links using read components from contig GFAs (beta)\n\n";
-    hp.section("Input/Output:");
+    hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE", "input UTG GFA containing read A-lines");
     hp.line("-c, --ctg", "FILE ...", "contig GFA file(s) used together to build read components");
     hp.line("-p, --prefix", "STR", "output prefix [" + CleanOpts().prefix + "]");

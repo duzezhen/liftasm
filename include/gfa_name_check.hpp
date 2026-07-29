@@ -18,15 +18,18 @@ struct RenameStats {
     uint32_t invalid_reserved_total = 0;
     uint32_t trailing_sign_total    = 0;
     uint32_t duplicate_total        = 0;
+    uint32_t namespace_total        = 0;
 
     std::vector<std::pair<std::string, std::string>> invalid_reserved_examples;
     std::vector<std::pair<std::string, std::string>> trailing_sign_examples;
     std::vector<std::pair<std::string, std::string>> duplicate_examples;
+    std::vector<std::pair<std::string, std::string>> namespace_examples;
 };
 
 class FileRenamePlan {
 public:
-    explicit FileRenamePlan(std::size_t max_log_examples = 5) : max_log_examples_(max_log_examples) {}
+    explicit FileRenamePlan(std::size_t max_log_examples = 5, std::string name_suffix = {})
+        : max_log_examples_(max_log_examples), name_suffix_(std::move(name_suffix)) {}
 
     std::string register_segment_name(
         const std::string& raw_name,
@@ -54,6 +57,13 @@ public:
             sanitize_reserved_chars_(base);
             ++stats_.invalid_reserved_total;
             push_example_(stats_.invalid_reserved_examples, before, base);
+        }
+
+        if (!name_suffix_.empty()) {
+            const std::string before = base;
+            base = append_root_suffix_(base, name_suffix_);
+            ++stats_.namespace_total;
+            push_example_(stats_.namespace_examples, before, base);
         }
 
         std::string final_name = base;
@@ -134,17 +144,22 @@ public:
     void print_log(const std::string& filename) const {
         if (stats_.invalid_reserved_total == 0 &&
             stats_.trailing_sign_total == 0 &&
-            stats_.duplicate_total == 0) {
+            stats_.duplicate_total == 0 &&
+            stats_.namespace_total == 0) {
             return;
         }
 
+        log_stream() << "Renaming segments ...\n";
         print_one_log_("Fixed segment names: replaced invalid characters (':', ';', '-') with '_'", stats_.invalid_reserved_total, stats_.invalid_reserved_examples);
         print_one_log_("Fixed segment names: replaced trailing '+' or '-' with '_'", stats_.trailing_sign_total, stats_.trailing_sign_examples);
         print_one_log_("Fixed segment names: renamed duplicates by adding numeric suffix", stats_.duplicate_total, stats_.duplicate_examples);
+        print_one_log_("Namespaced all segment names", stats_.namespace_total, stats_.namespace_examples);
+        std::cerr << std::endl;
     }
 
 private:
     std::size_t max_log_examples_{5};
+    std::string name_suffix_;
     std::unordered_map<std::string, std::string> raw_to_norm_;
     std::unordered_set<std::string> staged_norm_names_;
     std::unordered_set<std::string> seen_raw_segment_names_;
@@ -184,6 +199,25 @@ private:
         }
 
         return true;
+    }
+
+    static std::string append_root_suffix_(const std::string& name, const std::string& suffix) {
+        if (name.find(':') == std::string::npos) return name + suffix;
+
+        gfaName gname(';');
+        const auto pieces = gname.parse_composite_with_dir(name);
+        const std::size_t token_count = 1 + static_cast<std::size_t>(std::count(name.begin(), name.end(), ';'));
+        if (pieces.size() != token_count) return name + suffix;
+
+        std::ostringstream out;
+        for (size_t i = 0; i < pieces.size(); ++i) {
+            if (i) out << ';';
+            const auto& piece = pieces[i];
+            out << piece.root << suffix << ':';
+            if (piece.rev) out << piece.hi << '-' << piece.lo;
+            else out << piece.lo << '-' << piece.hi;
+        }
+        return out.str();
     }
 
     bool is_name_used_(
@@ -312,12 +346,12 @@ private:
     ) const {
         if (total == 0) return;
 
-        warning_stream() << "  ! " << title << ": " << total << "\n";
+        warning_stream() << "    ! " << title << ": " << total << "\n";
         for (const auto& kv : ex) {
-            warning_stream() << "    ! " << kv.first << " -> " << kv.second << "\n";
+            warning_stream() << "      ! " << kv.first << " -> " << kv.second << "\n";
         }
         if (total > ex.size()) {
-            warning_stream() << "    ! ... (" << (total - ex.size()) << " more)\n";
+            warning_stream() << "      ! ... (" << (total - ex.size()) << " more)\n";
         }
     }
 };

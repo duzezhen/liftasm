@@ -2,7 +2,9 @@
 #include "../include/progress_tracker.hpp"
 
 #include <set>
+#include <deque>
 #include <tuple>
+#include <unordered_map>
 #include <iostream>
 #include <stdlib.h>
 #include <stdio.h>
@@ -816,17 +818,18 @@ void GfaDeoverlapper::dedup_aligns_(size_t begin)
     const size_t n_aln = bubble_aligns_.size();
     if (begin >= n_aln) return;
 
-    auto pair_key = [](uint32_t a, uint32_t b) -> uint64_t {
-        if (a > b) std::swap(a, b);
-        return (uint64_t(a) << 32) | uint64_t(b);
+    struct SeenSpan {
+        uint32_t a_beg, a_end;
+        uint32_t b_beg, b_end;
     };
 
-    std::unordered_map<uint64_t, int32_t> seen_idx;
-    seen_idx.reserve((n_aln - begin) * 2 + 8);
+    struct CandidateBatch {
+        int32_t idx;
+        std::vector<size_t> alignments;
+    };
 
     std::vector<BubbleAlignment> kept;
     kept.reserve(n_aln);
-
     for (size_t i = 0; i < begin; ++i) {
         kept.emplace_back(std::move(bubble_aligns_[i]));
     }
@@ -835,69 +838,120 @@ void GfaDeoverlapper::dedup_aligns_(size_t begin)
     log_stream() << "  - Number of alignments: " << n_aln << "\n";
     log_stream() << "  - Deduplication start: " << begin << "\n";
 
+    std::vector<CandidateBatch> batches;
+    std::unordered_map<int32_t, size_t> batch_of;
+    batch_of.reserve(n_aln - begin);
     for (size_t i = begin; i < n_aln; ++i) {
-        auto& aln = bubble_aligns_[i];
+        const int32_t idx = bubble_aligns_[i].idx;
+        auto inserted = batch_of.emplace(idx, batches.size());
+        if (inserted.second) batches.push_back({idx, {}});
+        batches[inserted.first->second].alignments.push_back(i);
+    }
 
-        const uint32_t seg_a = NodeHandle::get_segment_id(aln.v_a);
-        const uint32_t seg_b = NodeHandle::get_segment_id(aln.v_b);
+    std::unordered_map<uint64_t, std::vector<SeenSpan>> accepted;
+    accepted.reserve((n_aln - begin) * 2 + 8);
+    size_t rejected_batches = 0;
 
-        if (seg_a >= nodes_.size() || seg_b >= nodes_.size()) {
-            if (DEBUG_ENABLED) {
-                debug_stream() << "  - INVALID_SEGMENT_ID: " << "idx=" << aln.idx << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
-            }
-            continue;
-        }
+    for (const CandidateBatch& batch : batches) {
+        std::vector<size_t> valid;
+        valid.reserve(batch.alignments.size());
+        bool conflict = false;
 
-        std::vector<std::string> roots_a;
-        std::vector<std::string> roots_b;
+        for (size_t i : batch.alignments) {
+            const BubbleAlignment& aln = bubble_aligns_[i];
+            const uint32_t seg_a = NodeHandle::get_segment_id(aln.v_a);
+            const uint32_t seg_b = NodeHandle::get_segment_id(aln.v_b);
 
-        gfaName::collect_roots_from_name(nodes_[seg_a].name, roots_a);
-        gfaName::collect_roots_from_name(nodes_[seg_b].name, roots_b);
-
-        bool same_root = false;
-
-        for (const auto& a : roots_a) {
-            for (const auto& b : roots_b) {
-                if (a == b) {
-                    same_root = true;
-                    break;
-                }
-            }
-            if (same_root) break;
-        }
-
-        if (same_root) {
-            if (DEBUG_ENABLED) {
-                debug_stream() << "  - SHARED_ROOT: " << "idx=" << aln.idx << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
-            }
-
-            continue;
-        }
-
-        const uint64_t key = pair_key(seg_a, seg_b);
-        auto it = seen_idx.find(key);
-
-        if (it != seen_idx.end()) {
-            if (it->second != aln.idx) {
+            if (seg_a >= nodes_.size() || seg_b >= nodes_.size()) {
                 if (DEBUG_ENABLED) {
-                    debug_stream() << "  - DROP_SEEN: " << "idx=" << aln.idx << " prev_idx=" << it->second << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
+                    debug_stream() << "  - INVALID_SEGMENT_ID: " << "idx=" << aln.idx << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
+                }
+                continue;
+            }
+
+            std::vector<std::string> roots_a;
+            std::vector<std::string> roots_b;
+
+            gfaName::collect_roots_from_name(nodes_[seg_a].name, roots_a);
+            gfaName::collect_roots_from_name(nodes_[seg_b].name, roots_b);
+
+            bool same_root = false;
+
+            for (const auto& a : roots_a) {
+                for (const auto& b : roots_b) {
+                    if (a == b) {
+                        same_root = true;
+                        break;
+                    }
+                }
+                if (same_root) break;
+            }
+
+            if (same_root) {
+                if (DEBUG_ENABLED) {
+                    debug_stream() << "  - SHARED_ROOT: " << "idx=" << aln.idx << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
                 }
 
                 continue;
             }
-        } else {
-            seen_idx.emplace(key, aln.idx);
+
+            uint32_t a = seg_a;
+            uint32_t b = seg_b;
+            SeenSpan span{aln.beg_a, aln.end_a, aln.beg_b, aln.end_b};
+            if (a > b) {
+                std::swap(a, b);
+                std::swap(span.a_beg, span.b_beg);
+                std::swap(span.a_end, span.b_end);
+            }
+            const uint64_t key = (uint64_t(a) << 32) | uint64_t(b);
+
+            const auto found = accepted.find(key);
+            if (found != accepted.end()) {
+                for (const SeenSpan& previous : found->second) {
+                    const bool overlap_a = std::max(span.a_beg, previous.a_beg) < std::min(span.a_end, previous.a_end);
+                    const bool overlap_b = std::max(span.b_beg, previous.b_beg) < std::min(span.b_end, previous.b_end);
+                    if (overlap_a && overlap_b) {
+                        conflict = true;
+                        break;
+                    }
+                }
+            }
+            if (conflict) break;
+            valid.push_back(i);
         }
 
-        if (DEBUG_ENABLED) {
-            debug_stream() << "  - KEEP: " << "idx=" << aln.idx << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
+        if (conflict) {
+            ++rejected_batches;
+            if (DEBUG_ENABLED) {
+                debug_stream() << "  - DROP_OVERLAPPING_CANDIDATE: idx=" << batch.idx << "\n";
+            }
+            continue;
         }
 
-        kept.emplace_back(std::move(aln));
+        for (size_t i : valid) {
+            BubbleAlignment& aln = bubble_aligns_[i];
+            uint32_t a = NodeHandle::get_segment_id(aln.v_a);
+            uint32_t b = NodeHandle::get_segment_id(aln.v_b);
+            SeenSpan span{aln.beg_a, aln.end_a, aln.beg_b, aln.end_b};
+            if (a > b) {
+                std::swap(a, b);
+                std::swap(span.a_beg, span.b_beg);
+                std::swap(span.a_end, span.b_end);
+            }
+            accepted[(uint64_t(a) << 32) | uint64_t(b)].push_back(span);
+
+            if (DEBUG_ENABLED) {
+                debug_stream() << "  - KEEP: idx=" << aln.idx << " "
+                               << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " "
+                               << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
+            }
+            kept.emplace_back(std::move(aln));
+        }
     }
 
     bubble_aligns_ = std::move(kept);
 
+    log_stream() << "  - Overlapping candidates removed: " << rejected_batches << "\n";
     log_stream() << "  - Number of alignments after deduplication: " << bubble_aligns_.size() << "\n\n";
 }
 
@@ -2203,6 +2257,14 @@ SegReplace::RuleMap GfaDeoverlapper::build_rulemap_run_(
         if (!(align.beg_a < align.end_a && align.end_a <= len_a)) continue;
         if (!(align.beg_b < align.end_b && align.end_b <= len_b)) continue;
 
+        uint64_t consumed_a = 0;
+        uint64_t consumed_b = 0;
+        for (const CIGAR::COp& op : align.ops) {
+            if (op.op == 'M' || op.op == '=' || op.op == 'X' || op.op == 'D') consumed_a += op.len;
+            if (op.op == 'M' || op.op == '=' || op.op == 'X' || op.op == 'I') consumed_b += op.len;
+        }
+        if (consumed_a != align.end_a - align.beg_a || consumed_b != align.end_b - align.beg_b) continue;
+
         uint32_t pos_a = rev_a ? align.end_a : align.beg_a;
         uint32_t pos_b = rev_b ? align.end_b : align.beg_b;
 
@@ -2287,25 +2349,32 @@ void GfaDeoverlapper::build_rulemap_(const std::vector<std::vector<size_t>>& gro
     std::vector<std::unordered_set<uint32_t>> cut_sets = build_cut_sets_();
 
     ThreadPool pool(alignOpts_.threads);
-    std::vector<std::future<SegReplace::RuleMap>> futs;
-    futs.reserve(groups.size());
+    std::deque<std::future<SegReplace::RuleMap>> futs;
+    const size_t max_pending = std::max<size_t>(1, alignOpts_.threads * 2);
+    ProgressTracker prog(groups.size());
 
     for (const auto& group : groups) {
         const auto* group_ptr = &group;
         futs.emplace_back(pool.submit([this, group_ptr, &cut_sets]() {
             return build_rulemap_run_(*group_ptr, cut_sets);
         }));
+
+        if (futs.size() >= max_pending) {
+            SegReplace::RuleMap local = futs.front().get();
+            futs.pop_front();
+            for (auto& kv : local) {
+                rulemap_.emplace(kv.first, std::move(kv.second));
+            }
+            prog.hit();
+        }
     }
-
-    ProgressTracker prog(groups.size());
-
-    for (auto& f : futs) {
-        SegReplace::RuleMap local = f.get();
-        prog.hit();
-
+    while (!futs.empty()) {
+        SegReplace::RuleMap local = futs.front().get();
+        futs.pop_front();
         for (auto& kv : local) {
             rulemap_.emplace(kv.first, std::move(kv.second));
         }
+        prog.hit();
     }
 
     prog.finish();
@@ -2335,6 +2404,62 @@ SegReplace::Expander GfaDeoverlapper::build_SegReplace_()
     if (DEBUG_ENABLED) rulemap_verify(nodes_, ex.index_view());
 
     return ex;
+}
+
+uint32_t GfaDeoverlapper::materialized_segment_(SegReplace::Seg interval) const {
+    const uint32_t sid = static_cast<uint32_t>(SegReplace::Interval::seg_id(interval));
+    if (sid >= nodes_.size()) return UINT32_MAX;
+
+    const uint32_t beg = SegReplace::Interval::beg(interval);
+    const uint32_t end = SegReplace::Interval::end(interval);
+    if (beg == 0 && end == nodes_[sid].length) return sid;
+
+    const gfaName namer;
+    const std::string name = namer.format_interval_name(nodes_[sid].name, beg, end, false);
+    const auto found = name_to_id_map_.find(name);
+    return found == name_to_id_map_.end() ? UINT32_MAX : static_cast<uint32_t>(found->second);
+}
+
+void GfaDeoverlapper::rewrite_paths_(const SegReplace::Expander& expander) {
+    std::vector<GfaPath> rewritten;
+    rewritten.reserve(paths_.size());
+
+    for (const GfaPath& source : paths_) {
+        GfaPath path;
+        path.name = source.name;
+        for (const PathSegment& segment : source.segments) {
+            const uint32_t sid = static_cast<uint32_t>(segment.node_id);
+            if (sid >= nodes_.size()) continue;
+
+            std::vector<uint32_t> boundaries;
+            if (sid < cuts_.size() && cuts_[sid].v.size() >= 2) boundaries = cuts_[sid].v;
+            else boundaries = {0, nodes_[sid].length};
+
+            SegReplace::Expansion pieces;
+            pieces.reserve(boundaries.size() - 1);
+            for (size_t i = 1; i < boundaries.size(); ++i) {
+                pieces.push_back(SegReplace::Interval::pack(
+                    sid, boundaries[i - 1], boundaries[i], segment.is_reverse
+                ));
+            }
+            if (segment.is_reverse) std::reverse(pieces.begin(), pieces.end());
+
+            for (SegReplace::Seg piece : pieces) {
+                for (SegReplace::Seg interval : expander.query(piece)) {
+                    const uint32_t mapped = materialized_segment_(interval);
+                    if (mapped == UINT32_MAX || mapped >= nodes_.size() || nodes_[mapped].deleted) {
+                        error_stream() << "Path replacement was not materialized for segment '" << nodes_[sid].name << "'\n";
+                        std::exit(1);
+                    }
+                    const bool reverse = SegReplace::Interval::is_reverse(interval);
+                    if (!path.segments.empty() && path.segments.back().node_id == mapped && path.segments.back().is_reverse == reverse) continue;
+                    path.segments.push_back({mapped, reverse});
+                }
+            }
+        }
+        if (!path.segments.empty()) rewritten.push_back(std::move(path));
+    }
+    paths_ = std::move(rewritten);
 }
 
 void GfaDeoverlapper::rulemap_verify(const std::vector<GfaNode>& nodes, const SegReplace::RuleMap& idx) {
@@ -3185,7 +3310,6 @@ void GfaDeoverlapper::remove_unused_nodes_() {
         used[e.get_source_segment_id()] = true;
         used[e.get_target_segment_id()] = true;
     }
-
     uint64_t removed_num = 0;
     for (size_t i = 0; i < nodes_.size(); i++) {
         if (nodes_[i].deleted) continue;
