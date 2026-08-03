@@ -8,7 +8,6 @@
 #include <vector>
 
 class CtgCollapseDebugger;
-class CtgPathCycleGuard;
 
 /* ================================================================================================================
  *                                        CTG COLLAPSER START
@@ -52,7 +51,6 @@ public:
 
 private:
     friend class CtgCollapseDebugger;
-    friend class CtgPathCycleGuard;
 
     double min_component_coverage_{0.5};
     double component_end_fraction_{0.01};
@@ -198,54 +196,6 @@ private:
 };
 /* ================================================================================================================
  *                                         CTG COLLAPSER END
- * ================================================================================================================ */
-
-/* ================================================================================================================
- *                                      CTG PATH CYCLE GUARD START
- * ================================================================================================================ */
-class CtgPathCycleGuard {
-public:
-    explicit CtgPathCycleGuard(GfaCtgCollapser& graph);
-
-    size_t filter_contig_rules(SegReplace::Expander& expander) const;
-    size_t filter_path_rules(SegReplace::Expander& expander) const;
-
-private:
-    struct ExpandedStep {
-        SegReplace::Seg interval{0};
-        SegReplace::Seg owner{0};
-        bool replaced{false};
-    };
-
-    struct PathScan {
-        std::vector<ExpandedStep> steps;
-        std::vector<SegReplace::Seg> bad_rules;
-    };
-
-    struct CycleIndex {
-        std::vector<uint32_t> component;
-        std::vector<uint8_t> cyclic;
-    };
-
-    GfaCtgCollapser& graph_;
-
-    size_t filter_(
-        const std::vector<const GfaPath*>& paths,
-        SegReplace::Expander& expander
-    ) const;
-
-    PathScan scan_path_(
-        const GfaPath& path,
-        const SegReplace::Expander& expander
-    ) const;
-
-    static CycleIndex find_cycles_(
-        uint32_t node_count,
-        const std::vector<uint64_t>& edges
-    );
-};
-/* ================================================================================================================
- *                                       CTG PATH CYCLE GUARD END
  * ================================================================================================================ */
 
 /* ================================================================================================================

@@ -23,6 +23,7 @@
 #include "include/gfa_split.hpp"
 #include "include/gfa_augment.hpp"
 #include "include/gfa_clean.hpp"
+#include "include/gfa_gapfill.hpp"
 #include "include/aligner.hpp"
 #include "include/sys.hpp"
 
@@ -214,6 +215,7 @@ int main(int argc, char** argv) {
                 cfg.map.alignOpts,
                 cfg.map.use_wfa
             );
+            G.set_complex_marking(false);
             G.set_component_filter(cfg.collapse.ctg_min_coverage, cfg.collapse.ctg_end_fraction);
             cur_gfa_files = G.collapse_samples(
                 cfg.collapse.hap1Files,
@@ -287,10 +289,11 @@ int main(int argc, char** argv) {
                 cfg.map.alignOpts,
                 cfg.map.use_wfa
             );
+            G.set_complex_marking(!ctg_mode && cfg.bubble.check_complex);
             G.load_from_GFA(cur_gfa_files, cur_gfa_names);
             G.build_nodes_connectivity_index();
             G.build_vertex_topological_index();
-            if (iter == 0 && cfg.bubble.check_complex) {
+            if (!ctg_mode && iter == 0 && cfg.bubble.check_complex) {
                 G.detect_complex_regions(
                     cfg.bubble.cx_branch_degree,
                     cfg.bubble.cx_hub_degree,
@@ -308,7 +311,7 @@ int main(int argc, char** argv) {
                 cfg.bubble.path_diff,
                 cfg.bubble.stall_round_limit,
                 /*skip_comp=*/false,
-                /*keep_nested=*/false,
+                /*keep_nested=*/true,
                 same_sim,
                 same_min_len,
                 diff_min_src,
@@ -332,8 +335,10 @@ int main(int argc, char** argv) {
             if (DEBUG_ENABLED) finder.print_homologous_paths();
 
             // Mark complex
-            std::vector<uint32_t> complex_segs = finder.collect_orientation_conflict_segments();
-            G.mark_segments_complex(complex_segs);
+            if (!ctg_mode && cfg.bubble.check_complex) {
+                std::vector<uint32_t> complex_segs = finder.collect_orientation_conflict_segments();
+                G.mark_segments_complex(complex_segs);
+            }
 
             // Repeat normalization
             const bool is_last_iter = (iter + 1 == cfg.collapse.iterations);
@@ -364,6 +369,69 @@ int main(int argc, char** argv) {
 
             cur_gfa_names.assign(1, "");
         }
+    } else if (sub == "gapfill") {
+        AppConfig cfg = main_gapfill(argc, argv);
+        GfaGapfill G({
+            cfg.gapfill.min_overlap,
+            cfg.gapfill.min_contig,
+            cfg.gapfill.max_gap,
+            cfg.gapfill.min_similarity,
+            cfg.gapfill.min_overlap_fraction,
+            cfg.gapfill.max_overlap,
+            cfg.gapfill.min_probability,
+            cfg.gapfill.misassembly_len,
+            cfg.gapfill.misassembly_similarity,
+            cfg.gapfill.path_diff,
+            cfg.gapfill.phase_path_len,
+            cfg.gapfill.phase_skip,
+            cfg.gapfill.phase_win,
+            cfg.gapfill.phase_min_bp,
+            static_cast<uint32_t>(cfg.global.threads),
+            cfg.gapfill.prefix + ".gapfill.html"
+        });
+        G.set_alignment_options(
+            cfg.map.chainOpts,
+            cfg.map.anchorOpts,
+            cfg.map.extendOpts,
+            cfg.map.alignOpts,
+            cfg.collapse.mm2_preset,
+            cfg.gapfill.min_match,
+            cfg.gapfill.min_ali_ratio,
+            cfg.gapfill.min_mapq
+        );
+        G.load_from_GFA({cfg.gapfill.gfa_file});
+        const bool debug = DEBUG_ENABLED;
+        DEBUG_ENABLED = false;
+        G.build_nodes_connectivity_index(false);
+        G.build_vertex_topological_index(false);
+
+        const BubbleOpts bubble_defaults;
+        GfaBubble::GfaBubbleFinder finder(
+            G,
+            cfg.gapfill.max_depth,
+            cfg.gapfill.max_paths,
+            cfg.gapfill.DFS_guard,
+            cfg.gapfill.path_diff,
+            cfg.gapfill.stall_round_limit,
+            /*skip_comp=*/false,
+            /*keep_nested=*/true,
+            bubble_defaults.same_sim,
+            static_cast<uint32_t>(bubble_defaults.same_min_len),
+            bubble_defaults.diff_min_src,
+            bubble_defaults.diff_sim,
+            static_cast<uint32_t>(bubble_defaults.diff_min_len),
+            bubble_defaults.homo_num,
+            bubble_defaults.homo_k,
+            bubble_defaults.homo_w,
+            bubble_defaults.homo_extend_bp,
+            bubble_defaults.homo_bloom_bits,
+            bubble_defaults.homo_bloom_hash,
+            cfg.global.threads
+        );
+        finder.find_bubbles();
+        DEBUG_ENABLED = debug;
+        G.gapfill(finder.get_bubbles());
+        G.save_samples(cfg.gapfill.prefix, command_line);
     } else if (sub == "file2map") {
         AppConfig cfg = main_file2map(argc, argv);
         mapconv::file_to_map_auto(cfg.file2map.inputFiles, cfg.file2map.outFile, cfg.file2map.paf_primary_only, cfg.file2map.min_len, cfg.file2map.min_mapq);
@@ -510,14 +578,11 @@ int main(int argc, char** argv) {
             cfg.collapse.min_trans_len,
             cfg.collapse.mm2_preset
         );
-        G.set_opts(cfg.map.chainOpts, cfg.map.anchorOpts, cfg.map.extendOpts,
-                   cfg.map.alignOpts, cfg.map.use_wfa);
+        G.set_opts(cfg.map.chainOpts, cfg.map.anchorOpts, cfg.map.extendOpts, cfg.map.alignOpts, cfg.map.use_wfa);
         G.load_from_GFA(cfg.augment.gfa_files, cfg.augment.gfa_names);
         G.augment(cfg.augment.vcf_files, cfg.augment.prefix, cfg.augment.tag);
-        G.save_to_disk(cfg.augment.prefix + ".augment.gfa", /*write_paths=*/false, /*write_align=*/false,
-                       /*write_seq=*/true, command_line);
-        G.save_to_disk(cfg.augment.prefix + ".augment.noseq.gfa", /*write_paths=*/false, /*write_align=*/false,
-                       /*write_seq=*/false, command_line);
+        G.save_to_disk(cfg.augment.prefix + ".augment.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/true, command_line);
+        G.save_to_disk(cfg.augment.prefix + ".augment.noseq.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/false, command_line);
     } else if (sub == "clean") {
         AppConfig cfg = main_clean(argc, argv);
         GfaCleaner G({

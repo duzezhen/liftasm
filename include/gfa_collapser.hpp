@@ -17,6 +17,7 @@
 #include "bindings/cpp/WFAligner.hpp"
 
 class LocalGraphComplexity;
+class GfaPathCycleGuard;
 
 class GfaCollapser : public GfaAugmenter {
 
@@ -87,6 +88,10 @@ public:
         REPEAT_MASK_MAX_MISMATCH_ = 0;
     }
 
+    void set_complex_marking(bool enabled) noexcept {
+        mark_rejected_complex_ = enabled;
+    }
+
     /**
      * @brief Collapse homologous sequences within bubbles/paths into a single node.
      * @date 2026-04-03
@@ -113,6 +118,7 @@ protected:
 
 private:
     friend class LocalGraphComplexity;
+    friend class GfaPathCycleGuard;
 
     /* -------------------------------------------- merge_linear_chains -------------------------------------------- */
     /**
@@ -169,6 +175,7 @@ private:
     };
 
     std::vector<AlignmentCandidate_> alignment_candidates_;
+    bool mark_rejected_complex_{true};
 
     std::vector<AlignmentCandidate_> build_alignment_candidates_(
         const std::vector<GfaBubble::Bubble>& bubbles,
@@ -235,33 +242,50 @@ private:
     GfaCollapser& collapser_;
     const size_t alignment_begin_;
 
-    LocalGraph build_local_graph_(
-        const std::vector<uint32_t>& vertices,
-        const SegReplace::Expander* expander
-    ) const;
-
-    bool candidate_increases_(
-        size_t candidate_id,
-        const SegReplace::Expander& expander
-    ) const;
-
-    bool increases_(
-        uint32_t input_paths,
-        const LocalGraph& before,
-        const LocalGraph& after
-    ) const;
-
-    Metrics measure_(
-        uint32_t node_count,
-        const std::unordered_set<uint64_t>& directed_edges
-    ) const;
-
-    static void measure_block_(
-        const std::vector<std::pair<uint32_t, uint32_t>>& edges,
-        const std::vector<uint32_t>& block_edges,
-        Metrics& metrics
-    );
+    LocalGraph build_local_graph_(const std::vector<uint32_t>& vertices, const SegReplace::Expander* expander) const;
+    bool candidate_increases_(size_t candidate_id, const SegReplace::Expander& expander) const;
+    bool increases_(uint32_t input_paths, const LocalGraph& before, const LocalGraph& after) const;
+    Metrics measure_(uint32_t node_count, const std::unordered_set<uint64_t>& directed_edges) const;
+    static void measure_block_(const std::vector<std::pair<uint32_t, uint32_t>>& edges, const std::vector<uint32_t>& block_edges, Metrics& metrics);
 };
 /* ================================================================================================================
  *                                          LOCAL GRAPH COMPLEXITY END
+ * ================================================================================================================ */
+
+/* ================================================================================================================
+ *                                         PATH CYCLE GUARD START
+ * ================================================================================================================ */
+class GfaPathCycleGuard {
+public:
+    explicit GfaPathCycleGuard(GfaCollapser& graph);
+
+    size_t filter_path_rules(SegReplace::Expander& expander) const;
+    size_t filter_rules(const std::vector<GfaPath>& paths, SegReplace::Expander& expander) const;
+
+private:
+    struct ExpandedStep {
+        SegReplace::Seg interval{0};
+        SegReplace::Seg owner{0};
+        bool replaced{false};
+    };
+
+    struct PathScan {
+        std::vector<ExpandedStep> steps;
+        std::vector<SegReplace::Seg> bad_rules;
+    };
+
+    struct CycleIndex {
+        std::vector<uint32_t> component;
+        std::vector<uint8_t> cyclic;
+    };
+
+    GfaCollapser& graph_;
+
+    size_t filter_(const std::vector<const GfaPath*>& paths, SegReplace::Expander& expander) const;
+    std::unordered_set<SegReplace::Seg, SegReplace::U128Hash, SegReplace::U128Eq> find_bad_rules_(const std::vector<const GfaPath*>& paths, const SegReplace::Expander& expander) const;
+    PathScan scan_path_(const GfaPath& path, const SegReplace::Expander& expander) const;
+    static CycleIndex find_cycles_(uint32_t node_count, const std::vector<uint64_t>& edges);
+};
+/* ================================================================================================================
+ *                                          PATH CYCLE GUARD END
  * ================================================================================================================ */

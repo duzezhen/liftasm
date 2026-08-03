@@ -1,7 +1,9 @@
 #pragma once
 #include <cstddef>
-#include <string>
 #include <iomanip>
+#include <memory>
+#include <mutex>
+#include <string>
 #include "logger.hpp"
 
 /*
@@ -68,16 +70,25 @@ public:
     }
 
     void hit() {
+        std::lock_guard<std::mutex> lock(*mutex_);
         ++processed_;
         check_progress_();
     }
 
+    void add(std::size_t count) {
+        std::lock_guard<std::mutex> lock(*mutex_);
+        processed_ += count;
+        check_progress_();
+    }
+
     void update(std::size_t done) {
+        std::lock_guard<std::mutex> lock(*mutex_);
         processed_ = done;
         check_progress_();
     }
 
     void finish() {
+        std::lock_guard<std::mutex> lock(*mutex_);
         if (mode_ == Mode::Percent) {  // Mode::Percent
             if (!finished_printed_ && total_ > 0) {
                 log_stream()
@@ -142,4 +153,5 @@ private:
     bool        finished_printed_{false};
     int         width_count_{1};
     std::string task_name_;        // Reserved, not used in logic
+    std::shared_ptr<std::mutex> mutex_{std::make_shared<std::mutex>()};
 };

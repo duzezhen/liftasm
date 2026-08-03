@@ -106,7 +106,18 @@ struct CollapseOpts {
     std::vector<std::string> vcfFiles;  // variants added during contig collapse
     std::vector<std::string> gfaNames;  // will be added to S-line as "SN:Z:" tag in output stats file
     std::string prefix = "out";         // output file prefix
-    uint32_t ctg_min_reads = 10;        // minimum unique shared reads in a final contig anchor block
+
+    std::string mm2_preset = "asm5";
+    double min_match_ratio = 0.9;  // minimum CIGAR match ratio for non-iterative commands
+    std::vector<double> min_match_ratios = {0.9, 0.95, 0.95};  // collapse defaults by iteration
+    double min_ali_ratio = 0.001;  // minimum aligned length ratio to keep (deoverlap default)
+    std::vector<double> min_ali_ratios = {0.05, 0.01, 0.001};  // minimum aligned length ratio to keep (collapse default)
+    uint8_t min_mapq = 30;  // minimum mapping quality to keep
+    uint32_t all_pair_len = 1000;  // align all pairs when every path is shorter than this
+    uint32_t trim_min_len = 5'000'000;
+    double trim_max_overlap = 0.05;
+
+    uint32_t ctg_min_reads = 5;         // minimum unique shared reads in a final contig anchor block
     uint32_t ctg_short_len = 5'000'000; // short contigs can participate in only one selected contig pair
     uint32_t ctg_min_len = 2'000'000;   // ignore shorter input contigs in contig mode
     double ctg_min_coverage = 0.5;      // minimum contig span coverage for within- or cross-sample support
@@ -114,12 +125,12 @@ struct CollapseOpts {
     bool ctg_anchor_only = false;       // align only shared-read anchor blocks in contig collapse
     bool paf = false;                   // write cross-sample component alignments in PAF
     uint32_t iterations = 3;            // number of collapse rounds
-    std::vector<double>   min_jaccards     = {0.9, 0.95, 0.95};  // collapse
+    std::vector<double>   min_jaccards     = {0.9};  // collapse
     std::vector<double>   same_sims        = {0.9};
     std::vector<uint32_t> same_min_lens    = {1000000};
     std::vector<uint32_t> diff_min_srcs    = {500000};
     std::vector<double>   diff_sims        = {0.9};
-    std::vector<uint32_t> diff_min_lens    = {10000000};  // (default: 10Mb)
+    std::vector<uint32_t> diff_min_lens    = {20000000};  // (default: 20Mb)
     std::vector<int>      min_eqs          = {1000, 3, 3};  // collapse defaults
     int                   min_eq           = 3;  // deoverlap default
 
@@ -136,16 +147,6 @@ struct CollapseOpts {
 
     uint32_t min_trans_len = 3;  // Minimum interval length to allow transitive replacement expansion (i.e. if A->B and B->C, then A->C is allowed only if the replacement interval is >= this length)
 
-    double min_match_ratio = 0.9;  // minimum CIGAR match ratio for non-iterative commands
-    std::vector<double> min_match_ratios = {0.9, 0.95, 0.95};  // collapse defaults by iteration
-    double min_ali_ratio = 0.001;  // minimum aligned length ratio to keep (deoverlap default)
-    std::vector<double> min_ali_ratios = {0.05, 0.01, 0.001};  // minimum aligned length ratio to keep (collapse default)
-    uint8_t min_mapq = 30;  // minimum mapping quality to keep
-    uint32_t all_pair_len = 1000;  // align all pairs when every path is shorter than this
-    uint32_t trim_min_len = 5'000'000;
-    double trim_max_overlap = 0.05;
-
-    std::string mm2_preset = "asm5";
 };
 
 struct File2mapOpts {
@@ -266,6 +267,40 @@ struct CleanOpts {
     double min_comp_overlap = 0.05;
 };
 
+struct GapfillOpts {
+    std::string gfa_file;
+    std::string prefix = "out";
+
+    // minimap2 alignment filters
+    double min_match = 0.9;
+    double min_ali_ratio = 0.05;
+    uint8_t min_mapq = 30;
+
+    // bubble search
+    uint32_t max_depth = BubbleOpts().max_depth;
+    uint16_t max_paths = BubbleOpts().max_paths;
+    uint64_t DFS_guard = BubbleOpts().DFS_guard;
+    double path_diff = BubbleOpts().path_diff;
+    uint32_t stall_round_limit = BubbleOpts().stall_round_limit;
+
+    // phasing
+    uint32_t phase_path_len = 10;
+    uint64_t phase_skip = 500'000;
+    uint64_t phase_win = 500'000;
+    uint64_t phase_min_bp = 1'000;
+
+    // gap detection, selection, and replacement
+    uint64_t min_overlap = 1'000'000;
+    uint64_t min_contig = 1'000'000;
+    uint64_t max_gap = 10'000'000;
+    double min_similarity = 0.7;
+    double min_overlap_fraction = 0.1;
+    double max_overlap = 0.5;
+    double min_probability = 0.5;
+    uint64_t misassembly_len = 10'000'000;
+    double misassembly_similarity = 0.7;
+};
+
 enum class ToolMode {
     stat,       // print graph statistics
     bubble,     // identify bubble in graph
@@ -282,6 +317,7 @@ enum class ToolMode {
     split,      // split graph by connected components
     augment,    // augment a GFA with VCF alleles
     clean,      // remove weak UTG links using contig read components
+    gapfill,    // fill sample contig gaps from cross-sample paths
 };
 
 struct AppConfig {
@@ -302,6 +338,7 @@ struct AppConfig {
     SplitOpts        split;
     AugmentOpts      augment;
     CleanOpts        clean;
+    GapfillOpts      gapfill;
 };
 
 void help(char** argv, bool advanced=false);
@@ -365,5 +402,9 @@ void help_augment(char** argv, bool advanced=false);
 // remove weak UTG links using contig read components
 AppConfig main_clean(int argc, char** argv);
 void help_clean(char** argv);
+
+// fill sample contig gaps from cross-sample paths
+AppConfig main_gapfill(int argc, char** argv);
+void help_gapfill(char** argv);
 
 void finalize_opt_cfg(AppConfig& cfg);

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.3-r16 (2026-08-03)
+
+### Added
+
+- Added the `gapfill` subcommand to fill contig gaps using phased paths from other samples.
+
 ## v0.1.3-r15 (2026-07-28)
 
 ### Added

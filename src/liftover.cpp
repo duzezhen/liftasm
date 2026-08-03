@@ -302,6 +302,9 @@ std::vector<std::string> liftover(const RunOpts& opt)
     ThreadPool pool(opt.threads);
     std::vector<std::future<std::string>> futs;
     futs.reserve(1024);
+    size_t task_count = 0;
+    for (const auto& bed : beds) task_count += bed.second.size();
+    ProgressTracker prog(task_count);
 
     auto submit_one =
         [&] (std::string qname, BEDinfo b)
@@ -337,6 +340,7 @@ std::vector<std::string> liftover(const RunOpts& opt)
                         buf += r.rest;
                         buf += '\n';
                     }
+                    prog.hit();
                     return buf;
                 })
             );
@@ -351,10 +355,8 @@ std::vector<std::string> liftover(const RunOpts& opt)
     }
 
     // Collect
-    ProgressTracker prog(futs.size());
     blocks.reserve(futs.size());
     for (auto& f : futs) {
-        prog.hit();
         blocks.emplace_back(f.get());
     }
 

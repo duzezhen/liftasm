@@ -199,10 +199,11 @@ void GfaBubbleFinder::find_bubbles()
     ProgressTracker prog(sources_.size());
 
     for (Vertex src : sources_) {
-        prog.hit();
         futs.emplace_back(
             pool.submit([&, src]() -> Bubble {
-                return detect_closed_bubble_from_source_(src, bfs_limit);
+                Bubble bubble = detect_closed_bubble_from_source_(src, bfs_limit);
+                prog.hit();
+                return bubble;
             })
         );
     }
@@ -922,28 +923,31 @@ std::vector<minimizerdna::Sketch> GfaBubbleFinder::build_source_mm_library_(
     ProgressTracker prog(sources.size());
 
     for (Vertex v : sources) {
-        prog.hit();
-
         futs.emplace_back(
             pool.submit([&, v]() -> std::pair<uint32_t, minimizerdna::Sketch> {
                 const uint32_t vid = v.vertex_id();
                 const uint32_t sid = v.segment_id();
 
                 if (vid >= node_sketches.size()) {
+                    prog.hit();
                     return {vid, minimizerdna::Sketch{}};
                 }
 
                 if (graph_.getNodeDeleted(sid)) {
+                    prog.hit();
                     return {vid, minimizerdna::Sketch{}};
                 }
 
                 const std::string seq = graph_.get_oriented_sequence(v);
                 if (seq.empty() || seq == "*") {
+                    prog.hit();
                     return {vid, minimizerdna::Sketch{}};
                 }
 
                 const minimizerdna::MinimizerBuilder mzb(mm_opt_);
-                return {vid, mzb.build(seq)};
+                auto result = std::make_pair(vid, mzb.build(seq));
+                prog.hit();
+                return result;
             })
         );
     }
@@ -1473,11 +1477,13 @@ void GfaBubbleFinder::find_homologous_paths()
                     const HomoTask_& task = tasks[task_id];
                     const HomologousParam& params = task.type == Type::SameSource ? homo_sameSource_Param : homo_diffSource_Param;
 
-                    return detect_homologous_paths_from_sources_(
+                    HomologousPath path = detect_homologous_paths_from_sources_(
                         task.srcs,
                         params,
                         bubble_branch_pairs_
                     );
+                    prog.hit();
+                    return path;
                 }
             )
         );
@@ -1485,7 +1491,6 @@ void GfaBubbleFinder::find_homologous_paths()
 
     for (auto& f : futs) {
         HomologousPath hp = f.get();
-        prog.hit();
 
         if (hp.sources.empty()) continue;
         if (hp.starts.size() < 2) continue;
@@ -3085,7 +3090,8 @@ std::vector<uint32_t> PathClusterer::cluster(
     std::vector<size_t> order(paths.size());
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return lengths[a] > lengths[b];
+        if (lengths[a] != lengths[b]) return lengths[a] > lengths[b];
+        return a < b;
     });
 
     std::vector<size_t> representatives;
@@ -3139,8 +3145,10 @@ void GfaBubbleFinder::label_path_clusters()
     bubble_futs.reserve(bubbles_.size());
 
     for (Bubble& bubble : bubbles_) {
-        bubble_futs.push_back(pool.submit([&clusterer, &bubble]() {
-            return clusterer.cluster(bubble.get_paths(), Type::Normal);
+        bubble_futs.push_back(pool.submit([&clusterer, &bubble, &prog]() {
+            std::vector<uint32_t> clusters = clusterer.cluster(bubble.get_paths(), Type::Normal);
+            prog.hit();
+            return clusters;
         }));
     }
 
@@ -3148,7 +3156,7 @@ void GfaBubbleFinder::label_path_clusters()
     homo_futs.reserve(homologous_paths_.size());
 
     for (HomologousPath& hp : homologous_paths_) {
-        homo_futs.push_back(pool.submit([&clusterer, &hp]() {
+        homo_futs.push_back(pool.submit([&clusterer, &hp, &prog]() {
             std::vector<std::vector<uint32_t>> paths;
             paths.reserve(hp.paths.size());
 
@@ -3163,18 +3171,18 @@ void GfaBubbleFinder::label_path_clusters()
                 paths.push_back(std::move(vertices));
             }
 
-            return clusterer.cluster(paths, hp.type);
+            std::vector<uint32_t> clusters = clusterer.cluster(paths, hp.type);
+            prog.hit();
+            return clusters;
         }));
     }
 
     for (size_t i = 0; i < bubble_futs.size(); ++i) {
         bubbles_[i].set_path_clusters(bubble_futs[i].get());
-        prog.hit();
     }
 
     for (size_t i = 0; i < homo_futs.size(); ++i) {
         homologous_paths_[i].path_clusters = homo_futs[i].get();
-        prog.hit();
     }
 
     prog.finish();

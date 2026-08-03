@@ -2,8 +2,11 @@
 #include "../include/gfa_name.hpp"
 #include "../include/aligner.hpp"
 #include "../include/minimizer_dna.hpp"
+#include "../include/ThreadPool.hpp"
+#include "../include/progress_tracker.hpp"
 
 #include <algorithm>
+#include <future>
 #include <limits>
 #include <cstdint>
 #include <numeric>
@@ -1997,25 +2000,23 @@ void GfaCollapser::homologous_align_(
     std::deque<std::future<std::vector<BubbleAlignment>>> futures;
     ProgressTracker progress(candidates.size());
     size_t submitted = 0;
-    size_t processed = 0;
 
     while (submitted < groups.size() || !futures.empty()) {
         while (submitted < groups.size() && futures.size() < max_inflight) {
             const size_t group_id = submitted++;
             futures.emplace_back(pool.submit(
-                [this, group_id, &groups, &candidates, &bubbles, &homologous_paths]() {
-                    return align_candidate_group_(
+                [this, group_id, &groups, &candidates, &bubbles, &homologous_paths, &progress]() {
+                    std::vector<BubbleAlignment> result = align_candidate_group_(
                         groups[group_id], candidates, bubbles, homologous_paths
                     );
+                    progress.add(groups[group_id].size());
+                    return result;
                 }
             ));
         }
 
-        const size_t completed_group = submitted - futures.size();
         std::vector<BubbleAlignment> alignments = futures.front().get();
         futures.pop_front();
-        processed += groups[completed_group].size();
-        progress.update(processed);
 
         for (BubbleAlignment& alignment : alignments) {
             const uint32_t sid_a = NodeHandle::get_segment_id(alignment.v_a);
@@ -2050,6 +2051,7 @@ void GfaCollapser::collapse_homologous_seq(
     dedup_aligns_(homologous_align_begin);
 
     SegReplace::Expander ex = build_safe_expander_(homologous_align_begin);
+    GfaPathCycleGuard(*this).filter_path_rules(ex);
     ex.save_map(prefix + ".collapse.map");
     expand_and_rewire_edges_(ex);
     rewrite_paths_(ex);
@@ -2073,16 +2075,18 @@ LocalGraphComplexity::LocalGraphComplexity(
 size_t LocalGraphComplexity::reject_candidates(
     const std::unordered_set<int32_t>& candidates
 ) {
-    std::vector<uint32_t> segments;
-    for (size_t i = alignment_begin_; i < collapser_.bubble_aligns_.size(); ++i) {
-        const auto& alignment = collapser_.bubble_aligns_[i];
-        if (!candidates.contains(alignment.idx)) continue;
-        segments.push_back(NodeHandle::get_segment_id(alignment.v_a));
-        segments.push_back(NodeHandle::get_segment_id(alignment.v_b));
+    if (collapser_.mark_rejected_complex_) {
+        std::vector<uint32_t> segments;
+        for (size_t i = alignment_begin_; i < collapser_.bubble_aligns_.size(); ++i) {
+            const auto& alignment = collapser_.bubble_aligns_[i];
+            if (!candidates.contains(alignment.idx)) continue;
+            segments.push_back(NodeHandle::get_segment_id(alignment.v_a));
+            segments.push_back(NodeHandle::get_segment_id(alignment.v_b));
+        }
+        std::sort(segments.begin(), segments.end());
+        segments.erase(std::unique(segments.begin(), segments.end()), segments.end());
+        collapser_.mark_segments_complex(segments);
     }
-    std::sort(segments.begin(), segments.end());
-    segments.erase(std::unique(segments.begin(), segments.end()), segments.end());
-    collapser_.mark_segments_complex(segments);
 
     const size_t old_size = collapser_.bubble_aligns_.size();
     collapser_.bubble_aligns_.erase(
@@ -2448,4 +2452,298 @@ void LocalGraphComplexity::measure_block_(
 }
 /* ================================================================================================================
  *                                          LOCAL GRAPH COMPLEXITY END
+ * ================================================================================================================ */
+
+/* ================================================================================================================
+ *                                         PATH CYCLE GUARD START
+ * ================================================================================================================ */
+GfaPathCycleGuard::GfaPathCycleGuard(GfaCollapser& graph)
+    : graph_(graph) {}
+
+size_t GfaPathCycleGuard::filter_rules(
+    const std::vector<GfaPath>& source_paths,
+    SegReplace::Expander& expander
+) const {
+    std::vector<const GfaPath*> paths;
+    paths.reserve(source_paths.size());
+    for (const GfaPath& path : source_paths) {
+        if (!path.segments.empty()) paths.push_back(&path);
+    }
+    return filter_(paths, expander);
+}
+
+size_t GfaPathCycleGuard::filter_path_rules(SegReplace::Expander& expander) const {
+    return filter_rules(graph_.paths_, expander);
+}
+
+size_t GfaPathCycleGuard::filter_(
+    const std::vector<const GfaPath*>& paths,
+    SegReplace::Expander& expander
+) const {
+    log_stream() << "Checking paths for replacement cycles ...\n";
+    if (paths.empty()) {
+        log_stream() << "  - Paths checked: 0\n";
+        log_stream() << "  - Replacement rules reverted: 0\n\n";
+        return 0;
+    }
+
+    size_t total_removed = 0;
+    size_t round = 0;
+    while (true) {
+        ++round;
+        const auto bad = find_bad_rules_(paths, expander);
+        if (bad.empty()) {
+            log_stream() << "  - Round " << round << " reverted rules: 0\n";
+            break;
+        }
+
+        for (SegReplace::Seg rule : bad) expander.remove_from_index_by_key(rule);
+        total_removed += bad.size();
+        log_stream() << "  - Round " << round << " reverted rules: " << bad.size() << "\n";
+    }
+
+    log_stream() << "  - Paths checked: " << paths.size() << "\n";
+    log_stream() << "  - Replacement rules reverted: " << total_removed << "\n\n";
+    return total_removed;
+}
+
+std::unordered_set<SegReplace::Seg, SegReplace::U128Hash, SegReplace::U128Eq> GfaPathCycleGuard::find_bad_rules_(
+    const std::vector<const GfaPath*>& paths,
+    const SegReplace::Expander& expander
+) const {
+    ThreadPool pool(graph_.alignOpts_.threads);
+    const size_t max_inflight = std::max<size_t>(1, graph_.alignOpts_.threads * 2);
+    std::deque<std::future<PathScan>> futures;
+    std::unordered_set<SegReplace::Seg, SegReplace::U128Hash, SegReplace::U128Eq> bad;
+    std::unordered_map<SegReplace::Seg, uint32_t, SegReplace::U128Hash, SegReplace::U128Eq> node_ids;
+    std::unordered_set<uint64_t> edge_set;
+    std::unordered_map<uint32_t, std::vector<SegReplace::Seg>> node_rules;
+    ProgressTracker progress(paths.size());
+    size_t submitted = 0;
+
+    while (submitted < paths.size() || !futures.empty()) {
+        while (submitted < paths.size() && futures.size() < max_inflight) {
+            const GfaPath* path = paths[submitted++];
+            futures.emplace_back(pool.submit([this, path, &expander, &progress]() {
+                PathScan result = scan_path_(*path, expander);
+                progress.hit();
+                return result;
+            }));
+        }
+
+        PathScan scan = futures.front().get();
+        futures.pop_front();
+        bad.insert(scan.bad_rules.begin(), scan.bad_rules.end());
+
+        std::vector<uint32_t> path_nodes;
+        path_nodes.reserve(scan.steps.size());
+        for (const ExpandedStep& step : scan.steps) {
+            const auto inserted = node_ids.emplace(step.interval, static_cast<uint32_t>(node_ids.size()));
+            path_nodes.push_back(inserted.first->second);
+            if (step.replaced) node_rules[inserted.first->second].push_back(step.owner);
+        }
+        for (size_t i = 1; i < path_nodes.size(); ++i) {
+            const uint32_t from = path_nodes[i - 1];
+            const uint32_t to = path_nodes[i];
+            if (from != to) edge_set.insert((uint64_t(from) << 32) | to);
+        }
+    }
+    progress.finish();
+    pool.stop();
+
+    const std::vector<uint64_t> edges(edge_set.begin(), edge_set.end());
+    const CycleIndex cycles = find_cycles_(static_cast<uint32_t>(node_ids.size()), edges);
+    for (uint32_t node = 0; node < cycles.component.size(); ++node) {
+        if (!cycles.cyclic[cycles.component[node]]) continue;
+        const auto found = node_rules.find(node);
+        if (found != node_rules.end()) bad.insert(found->second.begin(), found->second.end());
+    }
+    return bad;
+}
+
+GfaPathCycleGuard::PathScan GfaPathCycleGuard::scan_path_(
+    const GfaPath& path,
+    const SegReplace::Expander& expander
+) const {
+    struct LastInterval {
+        SegReplace::Seg owner{0};
+        uint32_t beg{0};
+        uint32_t end{0};
+        size_t step{0};
+        bool reverse{false};
+        bool replaced{false};
+    };
+
+    std::unordered_map<uint64_t, LastInterval> last;
+    PathScan result;
+    std::vector<std::pair<size_t, size_t>> bad_ranges;
+
+    for (const PathSegment& segment : path.segments) {
+        const uint32_t sid = static_cast<uint32_t>(segment.node_id);
+        if (sid >= graph_.nodes_.size() || graph_.nodes_[sid].deleted) continue;
+
+        const std::vector<uint32_t>* boundaries = nullptr;
+        std::vector<uint32_t> fallback;
+        if (sid < graph_.cuts_.size() && graph_.cuts_[sid].v.size() >= 2) {
+            boundaries = &graph_.cuts_[sid].v;
+        } else {
+            fallback = {0, graph_.nodes_[sid].length};
+            boundaries = &fallback;
+        }
+
+        for (size_t step = 0; step + 1 < boundaries->size(); ++step) {
+            const size_t i = segment.is_reverse ? boundaries->size() - step - 2 : step;
+            const SegReplace::Seg owner = SegReplace::Interval::pack(
+                sid, (*boundaries)[i], (*boundaries)[i + 1], segment.is_reverse
+            );
+            const SegReplace::Expansion expansion = expander.query(owner);
+            const bool replaced = expansion.size() != 1 || expansion.front() != owner;
+
+            for (SegReplace::Seg interval : expansion) {
+                const size_t current_step = result.steps.size();
+                result.steps.push_back({interval, owner, replaced});
+                const uint64_t target = SegReplace::Interval::seg_id(interval);
+                const uint32_t beg = SegReplace::Interval::beg(interval);
+                const uint32_t end = SegReplace::Interval::end(interval);
+                const bool reverse = SegReplace::Interval::is_reverse(interval);
+                auto found = last.find(target);
+                if (found == last.end()) {
+                    last.emplace(target, LastInterval{owner, beg, end, current_step, reverse, replaced});
+                    continue;
+                }
+
+                const LastInterval& previous = found->second;
+                const bool conflict = reverse != previous.reverse || (!reverse && beg < previous.end) || (reverse && end > previous.beg);
+                if (!conflict) {
+                    found->second = {owner, beg, end, current_step, reverse, replaced};
+                    continue;
+                }
+
+                if (previous.replaced || replaced) {
+                    bad_ranges.emplace_back(previous.step, current_step);
+                }
+                if (!previous.replaced || replaced) continue;
+                found->second = {owner, beg, end, current_step, reverse, false};
+            }
+        }
+    }
+
+    std::sort(bad_ranges.begin(), bad_ranges.end());
+    size_t range = 0;
+    while (range < bad_ranges.size()) {
+        size_t begin = bad_ranges[range].first;
+        size_t end = bad_ranges[range].second;
+        while (++range < bad_ranges.size() && bad_ranges[range].first <= end + 1) {
+            end = std::max(end, bad_ranges[range].second);
+        }
+        for (size_t i = begin; i <= end; ++i) {
+            if (result.steps[i].replaced) result.bad_rules.push_back(result.steps[i].owner);
+        }
+    }
+
+    std::sort(result.bad_rules.begin(), result.bad_rules.end());
+    result.bad_rules.erase(
+        std::unique(result.bad_rules.begin(), result.bad_rules.end()),
+        result.bad_rules.end()
+    );
+    return result;
+}
+
+GfaPathCycleGuard::CycleIndex GfaPathCycleGuard::find_cycles_(
+    uint32_t node_count,
+    const std::vector<uint64_t>& edges
+) {
+    CycleIndex result;
+    result.component.assign(node_count, UINT32_MAX);
+    if (node_count == 0) return result;
+
+    std::vector<uint64_t> out_offset(node_count + 1, 0);
+    std::vector<uint64_t> in_offset(node_count + 1, 0);
+    for (uint64_t edge : edges) {
+        ++out_offset[static_cast<uint32_t>(edge >> 32) + 1];
+        ++in_offset[static_cast<uint32_t>(edge) + 1];
+    }
+    for (uint32_t i = 1; i <= node_count; ++i) {
+        out_offset[i] += out_offset[i - 1];
+        in_offset[i] += in_offset[i - 1];
+    }
+
+    std::vector<uint32_t> out(edges.size());
+    std::vector<uint32_t> in(edges.size());
+    std::vector<uint64_t> out_next = out_offset;
+    std::vector<uint64_t> in_next = in_offset;
+    for (uint64_t edge : edges) {
+        const uint32_t from = static_cast<uint32_t>(edge >> 32);
+        const uint32_t to = static_cast<uint32_t>(edge);
+        out[out_next[from]++] = to;
+        in[in_next[to]++] = from;
+    }
+
+    struct Frame {
+        uint32_t node;
+        uint64_t next;
+    };
+    std::vector<uint8_t> seen(node_count, 0);
+    std::vector<uint32_t> order;
+    std::vector<Frame> dfs;
+    order.reserve(node_count);
+    dfs.reserve(256);
+    for (uint32_t start = 0; start < node_count; ++start) {
+        if (seen[start]) continue;
+        seen[start] = 1;
+        dfs.push_back({start, out_offset[start]});
+        while (!dfs.empty()) {
+            Frame& frame = dfs.back();
+            if (frame.next < out_offset[frame.node + 1]) {
+                const uint32_t next = out[frame.next++];
+                if (!seen[next]) {
+                    seen[next] = 1;
+                    dfs.push_back({next, out_offset[next]});
+                }
+                continue;
+            }
+            order.push_back(frame.node);
+            dfs.pop_back();
+        }
+    }
+
+    std::vector<uint32_t> stack;
+    std::vector<uint32_t> component_size;
+    stack.reserve(256);
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+        const uint32_t start = *it;
+        if (result.component[start] != UINT32_MAX) continue;
+
+        const uint32_t component = static_cast<uint32_t>(component_size.size());
+        uint32_t size = 0;
+        result.component[start] = component;
+        stack.push_back(start);
+        while (!stack.empty()) {
+            const uint32_t node = stack.back();
+            stack.pop_back();
+            ++size;
+            for (uint64_t i = in_offset[node]; i < in_offset[node + 1]; ++i) {
+                const uint32_t next = in[i];
+                if (result.component[next] == UINT32_MAX) {
+                    result.component[next] = component;
+                    stack.push_back(next);
+                }
+            }
+        }
+        component_size.push_back(size);
+    }
+
+    result.cyclic.resize(component_size.size(), 0);
+    for (uint32_t i = 0; i < component_size.size(); ++i) {
+        result.cyclic[i] = component_size[i] > 1;
+    }
+    for (uint64_t edge : edges) {
+        const uint32_t from = static_cast<uint32_t>(edge >> 32);
+        const uint32_t to = static_cast<uint32_t>(edge);
+        if (from == to) result.cyclic[result.component[from]] = 1;
+    }
+    return result;
+}
+/* ================================================================================================================
+ *                                          PATH CYCLE GUARD END
  * ================================================================================================================ */

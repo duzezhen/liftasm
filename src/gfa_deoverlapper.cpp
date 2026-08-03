@@ -850,15 +850,15 @@ void GfaDeoverlapper::dedup_aligns_(size_t begin)
 
     std::unordered_map<uint64_t, std::vector<SeenSpan>> accepted;
     accepted.reserve((n_aln - begin) * 2 + 8);
+    size_t rejected_alignments = 0;
     size_t rejected_batches = 0;
 
     for (const CandidateBatch& batch : batches) {
-        std::vector<size_t> valid;
-        valid.reserve(batch.alignments.size());
-        bool conflict = false;
+        size_t kept_in_batch = 0;
+        size_t rejected_in_batch = 0;
 
         for (size_t i : batch.alignments) {
-            const BubbleAlignment& aln = bubble_aligns_[i];
+            BubbleAlignment& aln = bubble_aligns_[i];
             const uint32_t seg_a = NodeHandle::get_segment_id(aln.v_a);
             const uint32_t seg_b = NodeHandle::get_segment_id(aln.v_b);
 
@@ -905,6 +905,7 @@ void GfaDeoverlapper::dedup_aligns_(size_t begin)
             }
             const uint64_t key = (uint64_t(a) << 32) | uint64_t(b);
 
+            bool conflict = false;
             const auto found = accepted.find(key);
             if (found != accepted.end()) {
                 for (const SeenSpan& previous : found->second) {
@@ -916,42 +917,30 @@ void GfaDeoverlapper::dedup_aligns_(size_t begin)
                     }
                 }
             }
-            if (conflict) break;
-            valid.push_back(i);
-        }
-
-        if (conflict) {
-            ++rejected_batches;
-            if (DEBUG_ENABLED) {
-                debug_stream() << "  - DROP_OVERLAPPING_CANDIDATE: idx=" << batch.idx << "\n";
+            if (conflict) {
+                ++rejected_alignments;
+                ++rejected_in_batch;
+                if (DEBUG_ENABLED) {
+                    debug_stream() << "  - DROP_OVERLAPPING_ALIGNMENT: idx=" << aln.idx << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
+                }
+                continue;
             }
-            continue;
-        }
 
-        for (size_t i : valid) {
-            BubbleAlignment& aln = bubble_aligns_[i];
-            uint32_t a = NodeHandle::get_segment_id(aln.v_a);
-            uint32_t b = NodeHandle::get_segment_id(aln.v_b);
-            SeenSpan span{aln.beg_a, aln.end_a, aln.beg_b, aln.end_b};
-            if (a > b) {
-                std::swap(a, b);
-                std::swap(span.a_beg, span.b_beg);
-                std::swap(span.a_end, span.b_end);
-            }
-            accepted[(uint64_t(a) << 32) | uint64_t(b)].push_back(span);
-
+            accepted[key].push_back(span);
             if (DEBUG_ENABLED) {
-                debug_stream() << "  - KEEP: idx=" << aln.idx << " "
-                               << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " "
-                               << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
+                debug_stream() << "  - KEEP: idx=" << aln.idx << " " << aln.name_a << ":" << aln.beg_a << "-" << aln.end_a << " " << aln.name_b << ":" << aln.beg_b << "-" << aln.end_b << "\n";
             }
             kept.emplace_back(std::move(aln));
+            ++kept_in_batch;
         }
+
+        if (kept_in_batch == 0 && rejected_in_batch > 0) ++rejected_batches;
     }
 
     bubble_aligns_ = std::move(kept);
 
-    log_stream() << "  - Overlapping candidates removed: " << rejected_batches << "\n";
+    log_stream() << "  - Overlapping alignments removed: " << rejected_alignments << "\n";
+    log_stream() << "  - Candidates fully removed: " << rejected_batches << "\n";
     log_stream() << "  - Number of alignments after deduplication: " << bubble_aligns_.size() << "\n\n";
 }
 
@@ -1437,22 +1426,22 @@ void GfaDeoverlapper::build_propagate_prune_cuts_(const std::vector<std::vector<
     ThreadPool pool(alignOpts_.threads);
     std::vector<std::future<std::pair<uint64_t, uint64_t>>> futs;
     futs.reserve(groups.size());
+    ProgressTracker prog(groups.size());
 
     for (const auto& group : groups) {
         const auto* group_ptr = &group;
-        futs.emplace_back(pool.submit([this, group_ptr]() {
-            return build_propagate_prune_cuts_run_(*group_ptr);
+        futs.emplace_back(pool.submit([this, group_ptr, &prog]() {
+            auto result = build_propagate_prune_cuts_run_(*group_ptr);
+            prog.hit();
+            return result;
         }));
     }
-
-    ProgressTracker prog(groups.size());
 
     uint64_t total_changed = 0;
     uint64_t total_removed = 0;
 
     for (auto& f : futs) {
         auto [changed, removed] = f.get();
-        prog.hit();
 
         total_changed += changed;
         total_removed += removed;
@@ -2355,8 +2344,10 @@ void GfaDeoverlapper::build_rulemap_(const std::vector<std::vector<size_t>>& gro
 
     for (const auto& group : groups) {
         const auto* group_ptr = &group;
-        futs.emplace_back(pool.submit([this, group_ptr, &cut_sets]() {
-            return build_rulemap_run_(*group_ptr, cut_sets);
+        futs.emplace_back(pool.submit([this, group_ptr, &cut_sets, &prog]() {
+            SegReplace::RuleMap result = build_rulemap_run_(*group_ptr, cut_sets);
+            prog.hit();
+            return result;
         }));
 
         if (futs.size() >= max_pending) {
@@ -2365,7 +2356,6 @@ void GfaDeoverlapper::build_rulemap_(const std::vector<std::vector<size_t>>& gro
             for (auto& kv : local) {
                 rulemap_.emplace(kv.first, std::move(kv.second));
             }
-            prog.hit();
         }
     }
     while (!futs.empty()) {
@@ -2374,7 +2364,6 @@ void GfaDeoverlapper::build_rulemap_(const std::vector<std::vector<size_t>>& gro
         for (auto& kv : local) {
             rulemap_.emplace(kv.first, std::move(kv.second));
         }
-        prog.hit();
     }
 
     prog.finish();

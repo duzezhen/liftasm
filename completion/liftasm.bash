@@ -22,6 +22,7 @@ _liftasm_completion()
             align
             ressit
             split
+            gapfill
         "
 
         COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
