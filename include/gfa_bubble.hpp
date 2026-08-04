@@ -83,6 +83,7 @@ private:
     std::vector<NodeGroupEntry> dedup_adjacent_source_groups_(std::vector<NodeGroupEntry> groups) const;
     std::vector<HomoTask_> build_homo_tasks_(std::vector<NodeGroupEntry> groups) const;
     void sort_and_dedup_homologous_paths_(const HomologousParam& same_params, const HomologousParam& diff_params);
+    void filter_diff_source_context_();
     HomologousPath detect_homologous_paths_from_sources_(const std::vector<Vertex>& srcs, const HomologousParam& params, const GfaBubble::BubbleBranchPairs_& bubble_pairs) const;
 
 private:

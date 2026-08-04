@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.3-r17 (2026-08-04)
+
+### Fixed
+
+- Prevented misassemblies and repeats from joining unrelated components.
+- Fixed strand-insensitive clustering of bubble paths.
+- Improved phase-aware gap filling to reduce switch errors.
+
 ## v0.1.3-r16 (2026-08-03)
 
 ### Added

@@ -26,7 +26,7 @@ public:
     void collapse_ctgs(
         const std::vector<std::string>& vcf_files,
         const std::string& prefix,
-        uint32_t min_anchor_reads,
+        double min_anchor_coverage,
         uint32_t short_contig_len,
         bool anchor_only,
         bool write_paf
@@ -38,7 +38,7 @@ public:
         const std::vector<std::string>& sample_names,
         const std::vector<std::string>& vcf_files,
         const std::string& prefix,
-        uint32_t min_anchor_reads,
+        double min_anchor_coverage,
         uint32_t short_contig_len,
         uint32_t min_contig_len,
         bool anchor_only,
@@ -127,16 +127,13 @@ private:
     void initialize_backbones_();
     std::vector<Anchor> collect_unique_shared_anchors_() const;
     std::vector<AnchorBlock> build_anchor_blocks_(std::vector<Anchor> anchors) const;
-    std::vector<AnchorBlock> filter_supported_blocks_(
-        const std::vector<AnchorBlock>& blocks,
-        uint32_t min_anchor_reads
-    ) const;
     std::vector<AnchorBlock> select_nonconflicting_blocks_(
         std::vector<AnchorBlock> blocks,
         uint32_t short_contig_len
     ) const;
     std::vector<AnchorBlock> filter_spanning_blocks_(
-        std::vector<AnchorBlock> blocks
+        std::vector<AnchorBlock> blocks,
+        double min_coverage
     ) const;
     void align_unanchored_contigs_(
         const std::vector<AnchorBlock>& blocks,

@@ -223,7 +223,7 @@ int main(int argc, char** argv) {
                 cfg.collapse.gfaNames,
                 cfg.collapse.vcfFiles,
                 cfg.collapse.prefix,
-                cfg.collapse.ctg_min_reads,
+                cfg.collapse.ctg_anchor_coverage,
                 cfg.collapse.ctg_short_len,
                 cfg.collapse.ctg_min_len,
                 cfg.collapse.ctg_anchor_only,

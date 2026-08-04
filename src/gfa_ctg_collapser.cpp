@@ -490,28 +490,6 @@ std::vector<GfaCtgCollapser::AnchorBlock> GfaCtgCollapser::build_anchor_blocks_(
     return blocks;
 }
 
-std::vector<GfaCtgCollapser::AnchorBlock> GfaCtgCollapser::filter_supported_blocks_(
-    const std::vector<AnchorBlock>& blocks,
-    uint32_t min_anchor_reads
-) const {
-    log_stream() << "Filtering anchor blocks by read support ...\n";
-
-    std::vector<AnchorBlock> supported;
-    supported.reserve(blocks.size());
-    for (const AnchorBlock& block : blocks) {
-        if (block.anchors < min_anchor_reads) {
-            CtgCollapseDebugger::block_decision(*this, block, "drop:too-few-reads");
-            continue;
-        }
-        supported.push_back(block);
-    }
-
-    log_stream() << "  - Read-supported blocks: " << supported.size() << "\n\n";
-    CtgCollapseDebugger::blocks(*this, supported, "read-supported");
-
-    return supported;
-}
-
 std::vector<GfaCtgCollapser::AnchorBlock> GfaCtgCollapser::select_nonconflicting_blocks_(
     std::vector<AnchorBlock> blocks,
     uint32_t short_contig_len
@@ -637,9 +615,10 @@ std::vector<GfaCtgCollapser::AnchorBlock> GfaCtgCollapser::select_nonconflicting
 }
 
 std::vector<GfaCtgCollapser::AnchorBlock> GfaCtgCollapser::filter_spanning_blocks_(
-    std::vector<AnchorBlock> blocks
+    std::vector<AnchorBlock> blocks,
+    double min_coverage
 ) const {
-    if (blocks.empty() || min_component_coverage_ <= 0.0) return blocks;
+    if (blocks.empty() || min_coverage <= 0.0) return blocks;
 
     struct Bounds {
         uint32_t a_beg{UINT32_MAX}, a_end{0};
@@ -662,7 +641,7 @@ std::vector<GfaCtgCollapser::AnchorBlock> GfaCtgCollapser::filter_spanning_block
         const Bounds& span = item.second;
         const double a_cov = nodes_[a_sid].length == 0 ? 0.0 : static_cast<double>(span.a_end - span.a_beg) / nodes_[a_sid].length;
         const double b_cov = nodes_[b_sid].length == 0 ? 0.0 : static_cast<double>(span.b_end - span.b_beg) / nodes_[b_sid].length;
-        if (std::max(a_cov, b_cov) >= min_component_coverage_) {
+        if (std::max(a_cov, b_cov) >= min_coverage) {
             supported.insert((uint64_t(a_sid) << 33) | (uint64_t(b_sid) << 1) | reverse);
         }
     }
@@ -1178,7 +1157,7 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::split_component_a
 void GfaCtgCollapser::collapse_ctgs(
     const std::vector<std::string>& vcf_files,
     const std::string& prefix,
-    uint32_t min_anchor_reads,
+    double min_anchor_coverage,
     uint32_t short_contig_len,
     bool anchor_only,
     bool write_paf
@@ -1200,9 +1179,8 @@ void GfaCtgCollapser::collapse_ctgs(
     initialize_cuts_();
     std::vector<Anchor> anchors = collect_unique_shared_anchors_();
     std::vector<AnchorBlock> blocks = build_anchor_blocks_(std::move(anchors));
-    blocks = filter_supported_blocks_(blocks, min_anchor_reads);
     blocks = select_nonconflicting_blocks_(std::move(blocks), short_contig_len);
-    blocks = filter_spanning_blocks_(std::move(blocks));
+    blocks = filter_spanning_blocks_(std::move(blocks), min_anchor_coverage);
     const std::vector<AnchorBlock> regions = build_alignment_regions_(blocks, anchor_only);
     align_regions_(regions);
     align_unanchored_contigs_(blocks, short_contig_len, prefix, write_paf);
@@ -1244,7 +1222,7 @@ std::vector<std::string> GfaCtgCollapser::collapse_samples(
     const std::vector<std::string>& sample_names,
     const std::vector<std::string>& vcf_files,
     const std::string& prefix,
-    uint32_t min_anchor_reads,
+    double min_anchor_coverage,
     uint32_t short_contig_len,
     uint32_t min_contig_len,
     bool anchor_only,
@@ -1295,7 +1273,10 @@ std::vector<std::string> GfaCtgCollapser::collapse_samples(
         GfaCtgCollapser sample(*this);
         sample.load_ctgs({hap1_files[i]}, {hap2_files[i]}, {unique_name}, min_contig_len);
         if (namespace_samples) sample.namespace_segment_names_("_" + std::to_string(i + 1));
-        sample.collapse_ctgs(sample_vcf, sample_prefix, min_anchor_reads, short_contig_len, anchor_only, write_paf);
+        sample.collapse_ctgs(
+            sample_vcf, sample_prefix, min_anchor_coverage,
+            short_contig_len, anchor_only, write_paf
+        );
         sample.save_to_disk(sample_prefix + ".collapse.gfa", true, false, true, command_line);
         sample.save_to_disk(sample_prefix + ".collapse.noseq.gfa", true, false, false, command_line);
         outputs.push_back(sample_prefix + ".collapse.gfa");

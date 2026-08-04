@@ -308,8 +308,8 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "-v/--vcf must provide one file for each --c1/--c2 sample"
             );
             ensure(
-                cfg.collapse.hap1Files.empty() || cfg.collapse.ctg_min_reads >= 1,
-                "--ctg_reads must be >= 1"
+                cfg.collapse.ctg_anchor_coverage >= 0.0 && cfg.collapse.ctg_anchor_coverage <= 1.0,
+                "--ctg_anchor_cov must be in [0,1]"
             );
             ensure(
                 cfg.collapse.ctg_min_coverage >= 0.0 && cfg.collapse.ctg_min_coverage <= 1.0,
@@ -1919,9 +1919,9 @@ void help_collapse(char** argv, bool advanced) {
         hp.line("--hextend", "INT", "bp extended per homologous-path extension round [" + format_size_arg_(BubbleOpts().homo_extend_bp) + "]");
         hp.line("--hbits", "INT", "Bloom filter size in bits for homologous-path sketches [" + format_size_arg_(BubbleOpts().homo_bloom_bits) + "]");
         hp.line("--hhash", "INT", "number of Bloom filter hash functions for homologous-path sketches [" + format_size_arg_(BubbleOpts().homo_bloom_hash) + "]");
-        hp.line("--ctg_reads", "INT", "minimum shared reads in a contig anchor block [" + std::to_string(CollapseOpts().ctg_min_reads) + "]");
+        hp.line("--ctg_anchor_cov", "FLOAT", "shared-read coverage required to consider two contigs homologous [" + format_double_(CollapseOpts().ctg_anchor_coverage) + "]");
         hp.line("--ctg_short", "INT", "short contig length for one-partner filtering; 0 disables [" + format_size_arg_(CollapseOpts().ctg_short_len) + "]");
-        hp.line("--ctg_cov", "FLOAT", "minimum contig span coverage for within- or cross-sample support [" + format_double_(CollapseOpts().ctg_min_coverage) + "]");
+        hp.line("--ctg_cov", "FLOAT", "minimum aligned span coverage for component merging [" + format_double_(CollapseOpts().ctg_min_coverage) + "]");
         hp.line("--ctg_end", "FLOAT", "maximum terminal overhang fraction for end-to-end support; 0 disables [" + format_double_(CollapseOpts().ctg_end_fraction) + "]");
     }
 
@@ -1997,7 +1997,7 @@ AppConfig main_collapse(int argc, char** argv) {
         {"hextend",         required_argument, nullptr, 5009},
         {"hbits",           required_argument, nullptr, 5010},
         {"hhash",           required_argument, nullptr, 5011},
-        {"ctg_reads",       required_argument, nullptr, 5012},
+        {"ctg_anchor_cov",  required_argument, nullptr, 5012},
         {"ctg_short",       required_argument, nullptr, 5013},
         {"ctg_cov",         required_argument, nullptr, 5014},
         {"ctg_end",         required_argument, nullptr, 5015},
@@ -2245,7 +2245,7 @@ AppConfig main_collapse(int argc, char** argv) {
                 break;
             }
             case 5012: {
-                cfg.collapse.ctg_min_reads = parse_size_arg_u32_(optarg, argc, argv, optind, "--ctg_reads");
+                cfg.collapse.ctg_anchor_coverage = std::stod(optarg);
                 break;
             }
             case 5013: {

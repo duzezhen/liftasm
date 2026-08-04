@@ -2,6 +2,7 @@
 #include "../include/progress_tracker.hpp"
 #include "../include/ThreadPool.hpp"
 
+#include <iomanip>
 #include <numeric>
 #include <type_traits>
 
@@ -1411,6 +1412,179 @@ void GfaBubbleFinder::sort_and_dedup_homologous_paths_(
     dedup.run(homologous_paths_);
 }
 
+void GfaBubbleFinder::filter_diff_source_context_()
+{
+    struct Anchor {
+        size_t path_id{0};
+        std::array<uint32_t, 2> components{};
+        std::array<Vertex, 2> sources{};
+        std::array<Vertex, 2> starts{};
+        std::array<Vertex, 2> ends{};
+    };
+
+    const uint32_t context_bp = diff_min_len_;
+    if (context_bp == 0 || homologous_paths_.empty()) return;
+
+    bool has_diff_source = false;
+    for (const HomologousPath& hp : homologous_paths_) {
+        if (hp.type == Type::DiffSource) {
+            has_diff_source = true;
+            break;
+        }
+    }
+    if (!has_diff_source) return;
+
+    const uint32_t vertex_count = static_cast<uint32_t>(graph_.getNumNodes() * 2);
+    std::vector<uint32_t> order;
+    order.reserve(vertex_count);
+
+    for (uint32_t v = 0; v < vertex_count; ++v) {
+        if (!graph_.getNodeDeleted(Vertex(v).segment_id())) order.push_back(v);
+    }
+
+    std::sort(order.begin(), order.end(), [this](uint32_t a, uint32_t b) {
+        const uint32_t rank_a = graph_.vertex_topo_rank(Vertex(a));
+        const uint32_t rank_b = graph_.vertex_topo_rank(Vertex(b));
+        return rank_a != rank_b ? rank_a < rank_b : a < b;
+    });
+
+    std::vector<uint32_t> suffix_bp(vertex_count, 0);
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+        const uint32_t v = *it;
+        if (graph_.vertex_in_cycle(Vertex(v))) {
+            suffix_bp[v] = context_bp;
+            continue;
+        }
+
+        uint64_t best = 0;
+        for (const GfaArc* arc : graph_.getArcsFromVertex(v)) {
+            if (!arc || arc->get_del() || (skip_comp_ && arc->get_comp())) continue;
+
+            const uint32_t w = arc->get_target_vertex_id();
+            if (w >= vertex_count) continue;
+
+            const uint32_t length = graph_.getNodeLength(Vertex(w).segment_id());
+            const uint32_t overlap = graph_.get_edge_ow(v, w);
+            const uint64_t step = length - std::min(length, overlap);
+            best = std::max(best, step + suffix_bp[w]);
+            if (best >= context_bp) break;
+        }
+        suffix_bp[v] = static_cast<uint32_t>(std::min<uint64_t>(best, context_bp));
+    }
+
+    std::vector<Anchor> anchors;
+    std::unordered_map<uint64_t, std::vector<size_t>> component_pairs;
+
+    for (size_t path_id = 0; path_id < homologous_paths_.size(); ++path_id) {
+        const HomologousPath& hp = homologous_paths_[path_id];
+        if (hp.type != Type::DiffSource || hp.sources.size() < 2) continue;
+        if (hp.starts.size() != hp.sources.size() || hp.ends.size() != hp.sources.size()) continue;
+
+        for (size_t i = 0; i + 1 < hp.sources.size(); ++i) {
+            for (size_t j = i + 1; j < hp.sources.size(); ++j) {
+                const uint32_t component_i = graph_.node_connectivity_id(hp.sources[i]);
+                const uint32_t component_j = graph_.node_connectivity_id(hp.sources[j]);
+                if (component_i == UINT32_MAX || component_j == UINT32_MAX || component_i == component_j) continue;
+
+                Anchor anchor;
+                anchor.path_id = path_id;
+                size_t first = i;
+                size_t second = j;
+                if (component_i > component_j) std::swap(first, second);
+
+                anchor.components = {
+                    graph_.node_connectivity_id(hp.sources[first]),
+                    graph_.node_connectivity_id(hp.sources[second])
+                };
+                anchor.sources = {hp.sources[first], hp.sources[second]};
+                anchor.starts = {hp.starts[first], hp.starts[second]};
+                anchor.ends = {hp.ends[first], hp.ends[second]};
+
+                const uint64_t key = (uint64_t(anchor.components[0]) << 32) | anchor.components[1];
+                component_pairs[key].push_back(anchors.size());
+                anchors.push_back(anchor);
+            }
+        }
+    }
+
+    std::vector<uint8_t> rejected(homologous_paths_.size(), 0);
+
+    for (size_t anchor_id = 0; anchor_id < anchors.size(); ++anchor_id) {
+        const Anchor& anchor = anchors[anchor_id];
+        const uint64_t key = (uint64_t(anchor.components[0]) << 32) | anchor.components[1];
+        const std::vector<size_t>& peers = component_pairs.at(key);
+
+        const uint32_t left_a = suffix_bp[Vertex::get_reverse(anchor.starts[0]).vertex_id()];
+        const uint32_t left_b = suffix_bp[Vertex::get_reverse(anchor.starts[1]).vertex_id()];
+        const uint32_t right_a = suffix_bp[anchor.ends[0].vertex_id()];
+        const uint32_t right_b = suffix_bp[anchor.ends[1].vertex_id()];
+
+        bool left_supported = left_a < context_bp || left_b < context_bp;
+        bool right_supported = right_a < context_bp || right_b < context_bp;
+        const bool relative_reverse = anchor.sources[0].is_reverse() != anchor.sources[1].is_reverse();
+
+        for (size_t peer_id : peers) {
+            if (peer_id == anchor_id) continue;
+            const Anchor& peer = anchors[peer_id];
+            if (peer.path_id == anchor.path_id) continue;
+            if ((peer.sources[0].is_reverse() != peer.sources[1].is_reverse()) != relative_reverse) continue;
+
+            std::array<Vertex, 2> peer_starts = peer.starts;
+            std::array<Vertex, 2> peer_ends = peer.ends;
+            if (peer.sources[0].is_reverse() != anchor.sources[0].is_reverse()) {
+                for (size_t i = 0; i < 2; ++i) {
+                    const Vertex start = Vertex::get_reverse(peer.ends[i]);
+                    peer_ends[i] = Vertex::get_reverse(peer.starts[i]);
+                    peer_starts[i] = start;
+                }
+            }
+
+            const bool before =
+                graph_.vertex_topo_rank(peer_ends[0]) < graph_.vertex_topo_rank(anchor.starts[0]) &&
+                graph_.vertex_topo_rank(peer_ends[1]) < graph_.vertex_topo_rank(anchor.starts[1]);
+            const bool after =
+                graph_.vertex_topo_rank(peer_starts[0]) > graph_.vertex_topo_rank(anchor.ends[0]) &&
+                graph_.vertex_topo_rank(peer_starts[1]) > graph_.vertex_topo_rank(anchor.ends[1]);
+
+            left_supported = left_supported || before;
+            right_supported = right_supported || after;
+            if (left_supported && right_supported) break;
+        }
+
+        if (left_supported && right_supported) continue;
+        rejected[anchor.path_id] = 1;
+    }
+
+    size_t next = 0;
+    size_t removed = 0;
+    for (size_t i = 0; i < homologous_paths_.size(); ++i) {
+        if (rejected[i]) {
+            const HomologousPath& path = homologous_paths_[i];
+            warning_stream() << "  ! Possible misassembly or repetitive region " << ++removed << '\n';
+
+            for (size_t j = 0; j < path.sources.size(); ++j) {
+                std::ostringstream line;
+                line << std::fixed << std::setprecision(2)
+                     << "    ! path" << j << ": "
+                     << graph_.getNodeName(path.sources[j].segment_id())
+                     << (path.sources[j].is_reverse() ? '-' : '+')
+                     << " -> "
+                     << graph_.getNodeName(path.ends[j].segment_id())
+                     << (path.ends[j].is_reverse() ? '-' : '+')
+                     << " (" << static_cast<double>(path.lens[j]) / 1'000'000.0 << " Mb)";
+                warning_stream() << line.str() << '\n';
+            }
+            continue;
+        }
+
+        if (next != i) homologous_paths_[next] = std::move(homologous_paths_[i]);
+        ++next;
+    }
+    homologous_paths_.resize(next);
+
+    log_stream() << "  - Internal different-source paths without collinear context removed: " << removed << '\n';
+}
+
 void GfaBubbleFinder::find_homologous_paths()
 {
     bool has_sequence = false;
@@ -1509,6 +1683,8 @@ void GfaBubbleFinder::find_homologous_paths()
         homo_sameSource_Param, 
         homo_diffSource_Param
     );
+
+    filter_diff_source_context_();
 
     uint64_t same_source_num = 0;
     uint64_t diff_source_num = 0;
@@ -3077,6 +3253,7 @@ std::vector<uint32_t> PathClusterer::cluster(
     minimizerdna::Options options;
     options.k = kmer_;
     options.w = window_;
+    options.canonical = false;
 
     const minimizerdna::MinimizerBuilder builder(options);
     std::vector<minimizerdna::Sketch> sketches(paths.size());

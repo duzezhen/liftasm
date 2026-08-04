@@ -117,7 +117,7 @@ struct CollapseOpts {
     uint32_t trim_min_len = 5'000'000;
     double trim_max_overlap = 0.05;
 
-    uint32_t ctg_min_reads = 5;         // minimum unique shared reads in a final contig anchor block
+    double ctg_anchor_coverage = 0.5;   // minimum contig span covered by shared-read anchor blocks
     uint32_t ctg_short_len = 5'000'000; // short contigs can participate in only one selected contig pair
     uint32_t ctg_min_len = 2'000'000;   // ignore shorter input contigs in contig mode
     double ctg_min_coverage = 0.5;      // minimum contig span coverage for within- or cross-sample support
@@ -130,7 +130,7 @@ struct CollapseOpts {
     std::vector<uint32_t> same_min_lens    = {1000000};
     std::vector<uint32_t> diff_min_srcs    = {500000};
     std::vector<double>   diff_sims        = {0.9};
-    std::vector<uint32_t> diff_min_lens    = {20000000};  // (default: 20Mb)
+    std::vector<uint32_t> diff_min_lens    = {3000000};
     std::vector<int>      min_eqs          = {1000, 3, 3};  // collapse defaults
     int                   min_eq           = 3;  // deoverlap default
 
