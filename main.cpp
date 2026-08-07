@@ -227,7 +227,6 @@ int main(int argc, char** argv) {
                 cfg.collapse.ctg_short_len,
                 cfg.collapse.ctg_min_len,
                 cfg.collapse.ctg_anchor_only,
-                cfg.collapse.paf,
                 command_line
             );
         } else {
@@ -376,7 +375,6 @@ int main(int argc, char** argv) {
             cfg.gapfill.min_contig,
             cfg.gapfill.max_gap,
             cfg.gapfill.min_similarity,
-            cfg.gapfill.min_overlap_fraction,
             cfg.gapfill.max_overlap,
             cfg.gapfill.min_probability,
             cfg.gapfill.misassembly_len,
@@ -397,9 +395,12 @@ int main(int argc, char** argv) {
             cfg.map.extendOpts,
             cfg.map.alignOpts,
             cfg.collapse.mm2_preset,
+            cfg.gapfill.max_occ,
             cfg.gapfill.min_match,
             cfg.gapfill.min_ali_ratio,
-            cfg.gapfill.min_mapq
+            cfg.gapfill.min_mapq,
+            cfg.gapfill.boundary_identity,
+            cfg.gapfill.boundary_coverage
         );
         G.load_from_GFA({cfg.gapfill.gfa_file});
         const bool debug = DEBUG_ENABLED;

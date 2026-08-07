@@ -180,7 +180,38 @@ bool closest_match_cut(
     return found;
 }
 
-constexpr uint64_t BOUNDARY_ANCHOR_SLOP = 10'000;
+std::string metric(double value) {
+    if (value < 0.0) return "NA";
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2) << value;
+    return out.str();
+}
+
+std::string boundary_table_header() {
+    std::ostringstream out;
+    out << "  - " << std::left << std::setw(9) << "Boundary"
+        << std::right << std::setw(8) << "Phase"
+        << std::setw(18) << "Bubble bp"
+        << std::setw(12) << "Minimizer"
+        << std::setw(12) << "Alignment";
+    return out.str();
+}
+
+std::string boundary_table_row(
+    const char* label,
+    const GfaGapfillDebugger::BoundarySupport& support,
+    double alignment
+) {
+    std::ostringstream bubble;
+    bubble << support.first_bubble_bp << '/' << support.second_bubble_bp;
+    std::ostringstream out;
+    out << "  - " << std::left << std::setw(9) << label
+        << std::right << std::setw(8) << metric(support.phase)
+        << std::setw(18) << bubble.str()
+        << std::setw(12) << metric(support.minimizer)
+        << std::setw(12) << metric(alignment);
+    return out.str();
+}
 
 void place_contigs(std::vector<GfaGapfillPlotter::Contig>& contigs);
 
@@ -194,18 +225,24 @@ void GfaGapfill::set_alignment_options(
     const opt::ExtendOpts& extend,
     const opt::AlignOpts& align,
     const std::string& preset,
+    uint32_t max_occ,
     double min_match,
     double min_ali_ratio,
-    uint8_t min_mapq
+    uint8_t min_mapq,
+    double boundary_identity,
+    double boundary_coverage
 ) {
     mm2_.k = chain.k;
     mm2_.w = chain.w;
     mm2_.best_n = anchor.max_kept;
     mm2_.zdrop = extend.dyn_zdrop;
     mm2_.preset = preset;
+    mm2_.max_occ = max_occ;
     mm2_.min_match = min_match;
     mm2_.min_ali_ratio = min_ali_ratio;
     mm2_.min_mapq = min_mapq;
+    mm2_.boundary_identity = boundary_identity;
+    mm2_.boundary_coverage = boundary_coverage;
     params_.threads = std::max<uint32_t>(1, align.threads);
 }
 
@@ -883,12 +920,9 @@ bool GfaGapfill::homolog_spans_(
         if (right_it == overlaps[bridge_id].end()) continue;
         const OverlapSupport left_support = overlap_support_(left, bridge, item.second);
         const OverlapSupport right_support = overlap_support_(bridge, right, right_it->second);
-        const double left_fraction = static_cast<double>(left_support.shared_bp) / std::min(left.length, bridge.length);
-        const double right_fraction = static_cast<double>(right_support.shared_bp) / std::min(right.length, bridge.length);
         if (
             left_support.overlap_bp < params_.min_overlap_bp || right_support.overlap_bp < params_.min_overlap_bp ||
-            left_support.similarity < params_.min_similarity || right_support.similarity < params_.min_similarity ||
-            left_fraction < params_.min_overlap_fraction || right_fraction < params_.min_overlap_fraction
+            left_support.similarity < params_.min_similarity || right_support.similarity < params_.min_similarity
         ) continue;
 
         const int64_t left_end = left.layout_start + static_cast<int64_t>(left.length);
@@ -1077,7 +1111,7 @@ bool GfaGapfill::align_boundary_(
     index_options.k = static_cast<short>(mm2_.k);
     index_options.w = static_cast<short>(mm2_.w);
     map_options.best_n = 1;
-    map_options.mid_occ = 10;
+    map_options.mid_occ = static_cast<int32_t>(mm2_.max_occ);
     map_options.zdrop = mm2_.zdrop;
     map_options.flag |= MM_F_CIGAR;
 
@@ -1110,15 +1144,14 @@ bool GfaGapfill::align_boundary_(
         const mm_reg1_t& hit = hits[i];
         if (hit.blen <= 0 || hit.parent != hit.id) continue;
         if (!raw_best || hit.mlen > raw_best->mlen) raw_best = &hit;
-        if (hit.rev || hit.mapq < mm2_.min_mapq) continue;
+        if (hit.rev) continue;
         const double identity = static_cast<double>(hit.mlen) / hit.blen;
         const double coverage = static_cast<double>(hit.qe - hit.qs) / query.size();
-        if (identity < mm2_.min_match || coverage < mm2_.min_ali_ratio) continue;
+        if (identity < mm2_.boundary_identity || coverage < mm2_.boundary_coverage) continue;
 
         const uint64_t distance = before ?
             static_cast<uint64_t>(hit.qs) + hit.rs :
             query.size() - hit.qe + reference.size() - hit.re;
-        if (distance > BOUNDARY_ANCHOR_SLOP) continue;
         if (!best || distance < best_distance ||
             (distance == best_distance && hit.mlen > best->mlen)) {
             best = &hit;
@@ -1285,12 +1318,10 @@ bool GfaGapfill::refine_boundary_(Candidate& candidate) const {
         );
     }
     if (mapped_left) {
-        candidate.left_alignment_similarity =
-            alignments[0].identity * alignments[0].coverage;
+        candidate.left_alignment_similarity = alignments[0].identity;
     }
     if (mapped_right) {
-        candidate.right_alignment_similarity =
-            alignments[1].identity * alignments[1].coverage;
+        candidate.right_alignment_similarity = alignments[1].identity;
     }
 
     const GfaGapfillDebugger::Alignment left_result{
@@ -1383,14 +1414,18 @@ void GfaGapfill::refine_boundaries_(
             }
             break;
         }
-        if (!changed) continue;
-        ++refined;
+        if (changed) ++refined;
         GfaGapfillDebugger::refined_boundary(
             paths_[fragments_[candidate.left].path_id].name,
+            candidate.left_cut_bp,
             paths_[fragments_[candidate.right].path_id].name,
+            candidate.right_cut_bp, fragments_[candidate.right].length,
             paths_[fragments_[candidate.bridge].path_id].name,
-            vertex_name_(fragments_[candidate.left].vertices[candidate.left_pos]),
-            vertex_name_(fragments_[candidate.right].vertices[candidate.right_pos]),
+            candidate.bridge_left_cut_bp, candidate.bridge_right_cut_bp,
+            {candidate.left_boundary_similarity, candidate.left_phase.similarity,
+             candidate.left_phase.target_bp, candidate.left_phase.bridge_bp},
+            {candidate.right_boundary_similarity, candidate.right_phase.similarity,
+             candidate.right_phase.target_bp, candidate.right_phase.bridge_bp},
             candidate.left_alignment_similarity,
             candidate.right_alignment_similarity
         );
@@ -2083,9 +2118,9 @@ std::vector<GfaGapfill::Candidate> GfaGapfill::build_candidates_(
                     const OverlapSupport left_support = overlap_support_(
                         left, bridge, bridge_item.second
                     );
-                    const double left_fraction = static_cast<double>(left_support.shared_bp) / std::min(left.length, bridge.length);
+                    const double left_fraction = static_cast<double>(left_support.shared_bp) /
+                        std::min(left.length, bridge.length);
                     if (left_support.overlap_bp < params_.min_overlap_bp ||
-                        left_fraction < params_.min_overlap_fraction ||
                         (left_support.similarity < params_.min_similarity &&
                          !gap_boundary_supported_(left, bridge, bridge_item.second, true))) {
                         ++batch.low_support;
@@ -2099,9 +2134,9 @@ std::vector<GfaGapfill::Candidate> GfaGapfill::build_candidates_(
                         const OverlapSupport right_support = overlap_support_(
                             bridge, right, right_item.second
                         );
-                        const double right_fraction = static_cast<double>(right_support.shared_bp) / std::min(right.length, bridge.length);
+                        const double right_fraction = static_cast<double>(right_support.shared_bp) /
+                            std::min(right.length, bridge.length);
                         if (right_support.overlap_bp < params_.min_overlap_bp ||
-                            right_fraction < params_.min_overlap_fraction ||
                             (right_support.similarity < params_.min_similarity &&
                              !gap_boundary_supported_(bridge, right, right_item.second, false))) {
                             ++batch.low_support;
@@ -2235,8 +2270,6 @@ std::vector<GfaGapfill::Candidate> GfaGapfill::build_candidates_(
             paths_[fragments_[candidate.right].path_id].name,
             paths_[fragments_[candidate.bridge].path_id].name,
             fragments_[candidate.left].component,
-            vertex_name_(fragments_[candidate.left].vertices[candidate.left_pos]),
-            vertex_name_(fragments_[candidate.right].vertices[candidate.right_pos]),
             candidate.left_phase.similarity, candidate.right_phase.similarity,
             candidate.left_phase.target_bp, candidate.left_phase.bridge_bp,
             candidate.right_phase.target_bp, candidate.right_phase.bridge_bp,
@@ -2673,15 +2706,14 @@ void GfaGapfill::write_html_(const std::vector<Candidate>& candidates) const {
         connection.sample_support = candidate.sample_support;
         connection.informative_samples = candidate.informative_samples;
         connection.spanning_samples = candidate.spanning_samples;
-        connection.left_anchor = vertex_name_(fragments_[candidate.left].vertices[candidate.left_pos]);
-        connection.right_anchor = vertex_name_(fragments_[candidate.right].vertices[candidate.right_pos]);
         const Fragment& left = fragments_[candidate.left];
         const Fragment& right = fragments_[candidate.right];
         const Fragment& bridge = fragments_[candidate.bridge];
-        connection.left_anchor_bp = left.path_bp[candidate.left_pos] + nodes_[Vertex::get_segment_id(left.vertices[candidate.left_pos])].length / 2;
-        connection.right_anchor_bp = right.path_bp[candidate.right_pos] + nodes_[Vertex::get_segment_id(right.vertices[candidate.right_pos])].length / 2;
-        connection.bridge_left_bp = bridge.path_bp[candidate.bridge_left] + nodes_[Vertex::get_segment_id(bridge.vertices[candidate.bridge_left])].length / 2;
-        connection.bridge_right_bp = bridge.path_bp[candidate.bridge_right] + nodes_[Vertex::get_segment_id(bridge.vertices[candidate.bridge_right])].length / 2;
+        const bool final_boundary = candidate.status == Candidate::KEPT;
+        connection.left_cut_bp = final_boundary ? candidate.left_cut_bp : left.path_bp[candidate.left_pos + 1];
+        connection.right_cut_bp = final_boundary ? candidate.right_cut_bp : right.path_bp[candidate.right_pos];
+        connection.bridge_left_bp = final_boundary ? candidate.bridge_left_cut_bp : bridge.path_bp[candidate.bridge_left + 1];
+        connection.bridge_right_bp = final_boundary ? candidate.bridge_right_cut_bp : bridge.path_bp[candidate.bridge_right];
         switch (candidate.status) {
             case Candidate::KEPT: connection.status = "keep"; break;
             case Candidate::LOW_PROBABILITY: connection.status = "drop:low-probability"; break;
@@ -3274,7 +3306,7 @@ void GfaGapfill::save_samples(
              << record.contig << '\t' << record.left << '\t' << record.right << '\t'
              << record.bridge << '\t'
              << record.gap_beg << '-' << record.gap_end << '\t'
-             << std::fixed << std::setprecision(4);
+             << std::fixed << std::setprecision(2);
         if (record.phase_left < 0.0) line << ".\t";
         else line << record.phase_left << '\t';
         if (record.phase_right < 0.0) line << ".\t";
@@ -3300,7 +3332,7 @@ void GfaGapfill::save_samples(
              << (record.relocated_contig.empty() ? "." : record.relocated_contig) << '\t';
         if (record.target_component == UINT32_MAX) line << ".\t.\t.\t.\t";
         else line << record.target_component << '\t' << record.target_backbone << '\t' << record.target_beg << '-' << record.target_end << '\t' << record.strand << '\t';
-        line << std::fixed << std::setprecision(4) << record.probability << '\t' << (record.used_for_gap ? 1 : 0) << '\n';
+        line << std::fixed << std::setprecision(2) << record.probability << '\t' << (record.used_for_gap ? 1 : 0) << '\n';
         relocation_report.save(line.str());
     }
     log_stream() << "  - Samples written: " << sample_chains_.size() << "\n\n";
@@ -3393,8 +3425,6 @@ void GfaGapfillDebugger::candidate(
     const std::string& right,
     const std::string& bridge,
     uint32_t component,
-    const std::string& left_anchor,
-    const std::string& right_anchor,
     double left_phase,
     double right_phase,
     uint64_t left_target_bp,
@@ -3416,49 +3446,37 @@ void GfaGapfillDebugger::candidate(
     debug_stream() << "  - Left: " << left << '\n';
     debug_stream() << "  - Right: " << right << '\n';
     debug_stream() << "  - Bridge: " << bridge << '\n';
-    debug_stream() << "  - Anchors: " << left_anchor << " -> " << right_anchor << '\n';
-    std::ostringstream left_evidence;
-    left_evidence << "  - Left gap boundary: phase=" << std::fixed << std::setprecision(3);
-    if (left_phase < 0.0) left_evidence << "NA";
-    else left_evidence << left_phase;
-    left_evidence << " bubble_bp=" << left_target_bp << '/' << left_bridge_bp << " minimizer=";
-    if (left_boundary < 0.0) left_evidence << "NA";
-    else left_evidence << left_boundary;
-    debug_stream() << left_evidence.str() << '\n';
-
-    std::ostringstream right_evidence;
-    right_evidence << "  - Right gap boundary: phase=" << std::fixed << std::setprecision(3);
-    if (right_phase < 0.0) right_evidence << "NA";
-    else right_evidence << right_phase;
-    right_evidence << " bubble_bp=" << right_target_bp << '/' << right_bridge_bp << " minimizer=";
-    if (right_boundary < 0.0) right_evidence << "NA";
-    else right_evidence << right_boundary;
-    debug_stream() << right_evidence.str() << '\n';
+    const BoundarySupport left_support{
+        left_boundary, left_phase, left_target_bp, left_bridge_bp
+    };
+    const BoundarySupport right_support{
+        right_boundary, right_phase, right_target_bp, right_bridge_bp
+    };
+    debug_stream() << boundary_table_header() << '\n';
+    debug_stream() << boundary_table_row("Left", left_support, -1.0) << '\n';
+    debug_stream() << boundary_table_row("Right", right_support, -1.0) << '\n';
     debug_stream() << "  - Best phase partner: " << (phase_consistent ? "yes" : "no") << '\n';
     debug_stream() << "  - Other hap spans gap: " << (homolog_span ? "yes" : "no") << '\n';
     debug_stream() << "  - Sample support: " << sample_support << '/' << informative_samples << " spanning=" << spanning_samples << " p=" << std::fixed << std::setprecision(4) << probability << '\n';
 }
 
 void GfaGapfillDebugger::refined_boundary(
-    const std::string& left,
-    const std::string& right,
-    const std::string& bridge,
-    const std::string& left_anchor,
-    const std::string& right_anchor,
-    double left_similarity,
-    double right_similarity
+    const std::string& left, uint64_t left_cut,
+    const std::string& right, uint64_t right_cut, uint64_t right_length,
+    const std::string& bridge, uint64_t bridge_begin, uint64_t bridge_end,
+    const BoundarySupport& left_support,
+    const BoundarySupport& right_support,
+    double left_alignment,
+    double right_alignment
 ) {
     if (!DEBUG_ENABLED) return;
-    debug_stream() << "Refined gap boundary: " << left << " -> " << right << " via " << bridge << '\n';
-    debug_stream() << "  - Anchors: " << left_anchor << " -> " << right_anchor << '\n';
-    std::ostringstream evidence;
-    evidence << std::fixed << std::setprecision(3) << "  - Alignment: left=";
-    if (left_similarity < 0.0) evidence << "NA";
-    else evidence << left_similarity;
-    evidence << " right=";
-    if (right_similarity < 0.0) evidence << "NA";
-    else evidence << right_similarity;
-    debug_stream() << evidence.str() << '\n';
+    debug_stream() << "Final gap boundary:\n";
+    debug_stream() << "  - Left: " << left << ":0-" << left_cut << '\n';
+    debug_stream() << "  - Right: " << right << ':' << right_cut << '-' << right_length << '\n';
+    debug_stream() << "  - Bridge: " << bridge << ':' << bridge_begin << '-' << bridge_end << '\n';
+    debug_stream() << boundary_table_header() << '\n';
+    debug_stream() << boundary_table_row("Left", left_support, left_alignment) << '\n';
+    debug_stream() << boundary_table_row("Right", right_support, right_alignment) << '\n';
 }
 
 void GfaGapfillDebugger::boundary_alignment(
@@ -3480,7 +3498,8 @@ void GfaGapfillDebugger::boundary_alignment(
                        << alignment.target_begin << '-' << alignment.target_end
                        << " vs " << bridge << ':' << alignment.bridge_begin
                        << '-' << alignment.bridge_end
-                       << " query=" << alignment.query_begin << '-' << alignment.query_end
+                       << " query=" << alignment.target_begin + alignment.query_begin
+                       << '-' << alignment.target_begin + alignment.query_end
                        << " ref=" << alignment.bridge_begin + alignment.reference_begin
                        << '-' << alignment.bridge_begin + alignment.reference_end
                        << (alignment.reverse ? '-' : '+')
@@ -3711,6 +3730,7 @@ aside{display:flex;min-height:0;flex-direction:column;border-right:1px solid #d8
 label{display:block;margin:0 0 5px;color:#536174;font-size:12px;font-weight:700;text-transform:uppercase}
 select,input[type=search]{width:100%;padding:7px;margin-bottom:12px;border:1px solid #b8c1cf;border-radius:5px;background:white}input[type=range]{width:100%;margin:2px 0 14px}
 #selection{padding:12px 16px;border-bottom:1px solid #e1e6ee;background:#fff;flex:none}#selection.focused{background:linear-gradient(135deg,#fff8f4,#fff)}#selection.focused label{color:#c94622}#detail{max-height:34vh;overflow:auto;white-space:pre-wrap;padding:11px 12px;border:1px solid #dfe5ed;border-radius:8px;background:#f4f6f9;line-height:1.48;overflow-wrap:anywhere}#selection.focused #detail{border-color:#f0a48e;background:#fff;box-shadow:0 4px 14px #c9462215}
+.coordinates{margin-top:9px}.evidence{width:100%;margin:10px 0 8px;border-collapse:collapse;font-size:11px;white-space:nowrap}.evidence th,.evidence td{padding:5px 4px;border-bottom:1px solid #e7eaf0;text-align:right}.evidence th:first-child{text-align:left}.evidence thead th{color:#607087;font-weight:700}.support{color:#536174;font-size:12px}
 #candidatePanel{min-height:0;flex:1;overflow:auto;padding:11px 16px 14px}#summary{margin:0 0 10px;color:#536174}.tools{display:flex;gap:7px;margin:-4px 0 7px}.tool{padding:6px 11px;border:1px solid #bcc6d4;border-radius:6px;background:#fff;color:#34435a;cursor:pointer}.tool:hover{background:#edf4ff}
 .candidate{width:100%;padding:10px 11px;margin:0 0 8px;text-align:left;border:1px solid #dde3ec;border-left:4px solid #aab4c3;border-radius:8px;background:white;cursor:pointer;transition:background .14s,border-color .14s,box-shadow .14s,transform .14s}.candidate.keep{border-left-color:#159447}.candidate:hover{background:#edf4ff;transform:translateY(-1px);box-shadow:0 4px 10px #1b35551a}.candidate.active{border-color:#e4572e;border-left:7px solid #e4572e;background:linear-gradient(110deg,#fff0e9,#fff);box-shadow:0 0 0 2px #e4572e26,0 7px 18px #b83f1e24;transform:none}.candidate.active .route{color:#b53618}.route{display:block;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.via,.metrics{display:block;margin-top:3px;color:#657286;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #view{overflow:auto;position:relative;background:#fff;scroll-behavior:smooth}svg{min-height:100%;background:#fff}.lane{fill:#f8faff}.lane.alt{fill:#fff}.row{stroke:#e2e7ef;stroke-width:1}.axis{font-size:10px;fill:#77859a}.sample{font-size:12px;font-weight:700;fill:#34435a}.edge{fill:none;stroke:#9aa5b5;stroke-width:1.5;opacity:.20;cursor:pointer;transition:opacity .18s,stroke-width .18s}.edge.keep{stroke:#159447;stroke-width:2.5;opacity:.82}.edge.related{opacity:.42}.edge.active{stroke:#e4572e;stroke-width:4;opacity:1}.edge.dim{opacity:.025}.bridge-span{stroke-width:7;stroke-linecap:round;opacity:.32}.bridge-span.keep{opacity:.9}.anchor{stroke:white;stroke-width:1.5;fill:#7d8999;opacity:.7}.anchor.keep{fill:#159447;opacity:1}.anchor.active{fill:#e4572e}
@@ -3758,9 +3778,8 @@ const N=)HTML");
              << ",ns:" << e.informative_samples
              << ",sp:" << e.spanning_samples
              << ",hs:" << (e.homolog_span ? 1 : 0)
-             << ",lp:" << e.left_anchor_bp << ",rp:" << e.right_anchor_bp
+             << ",lp:" << e.left_cut_bp << ",rp:" << e.right_cut_bp
              << ",bl:" << e.bridge_left_bp << ",br:" << e.bridge_right_bp
-             << ",la:" << json_string(e.left_anchor) << ",ra:" << json_string(e.right_anchor)
              << ",st:" << json_string(e.status) << "}";
         out.save(line.str());
     }
@@ -3770,19 +3789,12 @@ const ns='http://www.w3.org/2000/svg',byId=new Map(N.map(function(n){return[n.i,
 function S(tag,attrs,text){const x=document.createElementNS(ns,tag);Object.keys(attrs||{}).forEach(function(k){x.setAttribute(k,attrs[k])});if(text!==undefined)x.textContent=text;return x}
 function visible(e){const status=filter.value==='all'||(filter.value==='keep'&&e.st==='keep')||(filter.value==='drop'&&e.st!=='keep');if(!status)return false;const q=query.value.trim().toLowerCase();if(!q)return true;const a=byId.get(e.l),b=byId.get(e.r),c=byId.get(e.b);return[a.n,b.n,c.n,a.s,b.s,c.s,e.st].join(' ').toLowerCase().includes(q)}
 function fmt(n){return n.toLocaleString()}
+function val(n){return n<0?'NA':n.toFixed(2)}
+function esc(s){return s.replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function phase(e){const values=[e.pl,e.prh].filter(function(x){return x>=0});return values.length?values.reduce(function(a,b){return a+b},0)/values.length:-1}
-function tipText(e){return byId.get(e.l).n+' → '+byId.get(e.r).n+'\nvia '+byId.get(e.b).n+'\nphase '+(e.pl<0?'NA':e.pl.toFixed(3))+' / '+(e.prh<0?'NA':e.prh.toFixed(3))+' · support '+e.ss+'/'+e.ns+' · p '+e.pr.toFixed(4)}
+function tipText(e){return byId.get(e.l).n+' → '+byId.get(e.r).n+'\nvia '+byId.get(e.b).n+'\nphase '+val(e.pl)+' / '+val(e.prh)+' · support '+e.ss+'/'+e.ns+' · p '+e.pr.toFixed(2)}
 function bindTip(mark,e){mark.onpointermove=function(event){tooltip.style.display='block';tooltip.style.left=Math.min(innerWidth-430,event.clientX+14)+'px';tooltip.style.top=Math.min(innerHeight-80,event.clientY+14)+'px';tooltip.textContent=tipText(e)};mark.onpointerleave=function(){tooltip.style.display='none'}}
-function describe(e){const l=byId.get(e.l),r=byId.get(e.r),b=byId.get(e.b);return[
-  'Status: '+e.st,'Component: '+e.c,'','Left: '+l.n,'Right: '+r.n,'Bridge: '+b.n,'',
-  'Anchors: '+e.la+' -> '+e.ra,'',
-  'Left gap boundary: phase='+(e.pl<0?'NA':e.pl.toFixed(3))+' bubble_bp='+fmt(e.plt)+'/'+fmt(e.plb)+' minimizer='+(e.ml<0?'NA':e.ml.toFixed(3))+' alignment='+(e.al<0?'NA':e.al.toFixed(3)),
-  'Right gap boundary: phase='+(e.prh<0?'NA':e.prh.toFixed(3))+' bubble_bp='+fmt(e.prt)+'/'+fmt(e.prb)+' minimizer='+(e.mr<0?'NA':e.mr.toFixed(3))+' alignment='+(e.ar<0?'NA':e.ar.toFixed(3)),
-  'Other hap spans gap: '+(e.hs?'yes':'no'),
-  'Sample support: '+e.ss+' / '+e.ns,
-  'Spanning samples: '+e.sp,
-  'Posterior p: '+e.pr.toFixed(4)
-].join('\n')}
+function describe(e){const l=byId.get(e.l),r=byId.get(e.r),b=byId.get(e.b);return '<div><b>Status:</b> '+esc(e.st)+' &nbsp; <b>Component:</b> '+e.c+'</div><div class="coordinates"><b>Left:</b> '+esc(l.n)+':0-'+fmt(e.lp)+'<br><b>Right:</b> '+esc(r.n)+':'+fmt(e.rp)+'-'+fmt(r.b)+'<br><b>Bridge:</b> '+esc(b.n)+':'+fmt(e.bl)+'-'+fmt(e.br)+'</div><table class="evidence"><thead><tr><th>Boundary</th><th>Phase</th><th>Bubble bp</th><th>Minimizer</th><th>Alignment</th></tr></thead><tbody><tr><th>Left</th><td>'+val(e.pl)+'</td><td>'+fmt(e.plt)+'/'+fmt(e.plb)+'</td><td>'+val(e.ml)+'</td><td>'+val(e.al)+'</td></tr><tr><th>Right</th><td>'+val(e.prh)+'</td><td>'+fmt(e.prt)+'/'+fmt(e.prb)+'</td><td>'+val(e.mr)+'</td><td>'+val(e.ar)+'</td></tr></tbody></table><div class="support">Other hap spans gap: '+(e.hs?'yes':'no')+'<br>Sample support: '+e.ss+' / '+e.ns+'<br>Spanning samples: '+e.sp+'<br>Posterior p: '+e.pr.toFixed(2)+'</div>'}
 let selectedEdge=null;
 function centerEdge(id){const marks=svg.querySelectorAll('[data-e="'+id+'"]');let left=Infinity,right=-Infinity,top=Infinity,bottom=-Infinity;marks.forEach(function(mark){const box=mark.getBBox();left=Math.min(left,box.x);right=Math.max(right,box.x+box.width);top=Math.min(top,box.y);bottom=Math.max(bottom,box.y+box.height)});if(left!==Infinity)view.scrollTo({left:Math.max(0,(left+right-view.clientWidth)/2),top:Math.max(0,(top+bottom-view.clientHeight)/2),behavior:'smooth'})}
 function selectEdge(id){selectedEdge=selectedEdge===id?null:id;render();if(selectedEdge!==null)requestAnimationFrame(function(){centerEdge(id)})}
@@ -3805,8 +3817,8 @@ function render(){
   edges.forEach(function(e){const a=byId.get(e.l),m=byId.get(e.b),z=byId.get(e.r),active=focused?' active':'';if(!a||!m||!z)return;const points=[{x:anchorX(a,e.lp,scale,left,origin),y:pos.get(a.s+'\t'+a.h)},{x:anchorX(m,e.bl,scale,left,origin),y:pos.get(m.s+'\t'+m.h)},{x:anchorX(m,e.br,scale,left,origin),y:pos.get(m.s+'\t'+m.h)},{x:anchorX(z,e.rp,scale,left,origin),y:pos.get(z.s+'\t'+z.h)}];[[points[0],points[1]],[points[2],points[3]]].forEach(function(pair){const middle=(pair[0].y+pair[1].y)/2,path=S('path',{d:'M'+pair[0].x+','+pair[0].y+' C'+pair[0].x+','+middle+' '+pair[1].x+','+middle+' '+pair[1].x+','+pair[1].y,class:'edge '+(e.st==='keep'?'keep':'')+active,'data-e':e.i});path.onclick=function(){selectEdge(e.i)};bindTip(path,e);svg.appendChild(path)})});
   nodes.sort(function(a,b){return a.s.localeCompare(b.s)||a.h-b.h||a.x-b.x}).forEach(function(n){const y=pos.get(n.s+'\t'+n.h),nodeBegin=Math.max(n.x,origin),nodeEnd=Math.min(n.x+n.b,origin+span);if(nodeEnd<=nodeBegin)return;const x=left+(nodeBegin-origin)*scale,w=Math.max(1,(nodeEnd-nodeBegin)*scale),g=S('g',{class:'node h'+n.h+(focused?' active':''),'data-n':n.i});g.appendChild(S('rect',{x:x,y:y-(focused?16:11),width:w,height:focused?32:22,rx:3}));if(w>55)g.appendChild(S('text',{x:x+w/2,y:y+4,'text-anchor':'middle'},n.n.length>34?n.n.slice(0,31)+'...':n.n));g.appendChild(S('title',{},n.n+'\ncomponent: '+(n.x/1000000).toFixed(3)+'-'+((n.x+n.b)/1000000).toFixed(3)+' Mb\nlength: '+fmt(n.b)+' bp\norientation: '+(n.rv?'reverse':'forward')+'\n'+n.a+' -> '+n.z));g.onclick=function(event){event.stopPropagation();const edge=edges.find(function(e){return e.l===n.i||e.r===n.i||e.b===n.i});if(edge)selectEdge(edge.i)};svg.appendChild(g)});
   edges.forEach(function(e){const m=byId.get(e.b),y=pos.get(m.s+'\t'+m.h),x1=anchorX(m,e.bl,scale,left,origin),x2=anchorX(m,e.br,scale,left,origin),kind=(e.st==='keep'?'keep ':'')+(focused?'active':'');const bridgeMark=S('line',{x1:x1,y1:y,x2:x2,y2:y,class:'edge bridge-span '+kind,'data-e':e.i});bridgeMark.onclick=function(){selectEdge(e.i)};bindTip(bridgeMark,e);svg.appendChild(bridgeMark);[x1,x2].forEach(function(x){const dot=S('circle',{cx:x,cy:y,r:focused?6:4,class:'edge anchor '+kind,'data-e':e.i});dot.onclick=function(){selectEdge(e.i)};bindTip(dot,e);svg.appendChild(dot)})});
-  list.replaceChildren();edges.slice().sort(function(a,b){return(a.st==='keep'?0:1)-(b.st==='keep'?0:1)||byId.get(a.l).x-byId.get(b.l).x}).forEach(function(e){const button=document.createElement('button'),route=document.createElement('span'),via=document.createElement('span'),metrics=document.createElement('span'),p=phase(e);button.className='candidate '+(e.st==='keep'?'keep ':'')+(focused?'active':'');button.dataset.e=e.i;route.className='route';route.textContent=byId.get(e.l).n+' → '+byId.get(e.r).n;via.className='via';via.textContent='via '+byId.get(e.b).n;metrics.className='metrics';metrics.textContent=e.st+' · phase '+(p<0?'NA':p.toFixed(3))+' · support '+e.ss+'/'+e.ns+' · p '+e.pr.toFixed(4);button.append(route,via,metrics);button.onclick=function(){selectEdge(e.i)};list.appendChild(button)});
-  selection.classList.toggle('focused',focused);detail.textContent=focused?describe(focus):'Click a connection or candidate.';const kept=edges.filter(function(e){return e.st==='keep'}).length;summary.textContent=focused?'Focused connection · '+nodes.length+' contigs':nodes.length+' contigs · '+kept+' kept · '+(edges.length-kept)+' rejected';view.scrollTo({left:0,top:0})
+  list.replaceChildren();edges.slice().sort(function(a,b){return(a.st==='keep'?0:1)-(b.st==='keep'?0:1)||byId.get(a.l).x-byId.get(b.l).x}).forEach(function(e){const button=document.createElement('button'),route=document.createElement('span'),via=document.createElement('span'),metrics=document.createElement('span'),p=phase(e);button.className='candidate '+(e.st==='keep'?'keep ':'')+(focused?'active':'');button.dataset.e=e.i;route.className='route';route.textContent=byId.get(e.l).n+' → '+byId.get(e.r).n;via.className='via';via.textContent='via '+byId.get(e.b).n;metrics.className='metrics';metrics.textContent=e.st+' · phase '+val(p)+' · support '+e.ss+'/'+e.ns+' · p '+e.pr.toFixed(2);button.append(route,via,metrics);button.onclick=function(){selectEdge(e.i)};list.appendChild(button)});
+  selection.classList.toggle('focused',focused);if(focused)detail.innerHTML=describe(focus);else detail.textContent='Click a connection or candidate.';const kept=edges.filter(function(e){return e.st==='keep'}).length;summary.textContent=focused?'Focused connection · '+nodes.length+' contigs':nodes.length+' contigs · '+kept+' kept · '+(edges.length-kept)+' rejected';view.scrollTo({left:0,top:0})
 }
 [...new Set(N.map(function(n){return n.c}))].sort(function(a,b){return a-b}).forEach(function(c){const o=document.createElement('option');o.value=c;o.textContent='component '+c;comp.appendChild(o)});comp.onchange=function(){selectedEdge=null;render()};filter.onchange=function(){selectedEdge=null;render()};query.oninput=function(){selectedEdge=null;render()};$('fit').onclick=function(){zoom.value=1;render()};$('clear').onclick=function(){selectedEdge=null;render()};let zoomFrame=0;zoom.oninput=function(){cancelAnimationFrame(zoomFrame);zoomFrame=requestAnimationFrame(render)};svg.onclick=function(event){if(!event.target.closest('[data-e],[data-n]')){selectedEdge=null;render()}};document.onkeydown=function(event){if(event.key==='Escape')$('clear').click()};render();
 </script></body></html>)HTML");

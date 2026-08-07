@@ -123,7 +123,6 @@ struct CollapseOpts {
     double ctg_min_coverage = 0.5;      // minimum contig span coverage for within- or cross-sample support
     double ctg_end_fraction = 0.01;     // terminal overhang fraction allowed for end-to-end component support
     bool ctg_anchor_only = false;       // align only shared-read anchor blocks in contig collapse
-    bool paf = false;                   // write cross-sample component alignments in PAF
     uint32_t iterations = 3;            // number of collapse rounds
     std::vector<double>   min_jaccards     = {0.9};  // collapse
     std::vector<double>   same_sims        = {0.9};
@@ -271,7 +270,8 @@ struct GapfillOpts {
     std::string gfa_file;
     std::string prefix = "out";
 
-    // minimap2 alignment filters
+    // minimap2 index and alignment filters
+    uint32_t max_occ = 10;
     double min_match = 0.9;
     double min_ali_ratio = 0.05;
     uint8_t min_mapq = 30;
@@ -294,9 +294,12 @@ struct GapfillOpts {
     uint64_t min_contig = 1'000'000;
     uint64_t max_gap = 10'000'000;
     double min_similarity = 0.7;
-    double min_overlap_fraction = 0.1;
-    double max_overlap = 0.5;
+    double boundary_identity = 0.9;
+    double boundary_coverage = 0.8;
+    double max_overlap = 0.1;
     double min_probability = 0.5;
+
+    // misassembly detection
     uint64_t misassembly_len = 10'000'000;
     double misassembly_similarity = 0.7;
 

@@ -28,8 +28,7 @@ public:
         const std::string& prefix,
         double min_anchor_coverage,
         uint32_t short_contig_len,
-        bool anchor_only,
-        bool write_paf
+        bool anchor_only
     );
 
     std::vector<std::string> collapse_samples(
@@ -42,7 +41,6 @@ public:
         uint32_t short_contig_len,
         uint32_t min_contig_len,
         bool anchor_only,
-        bool write_paf,
         const std::string& command_line
     ) const;
 
@@ -138,8 +136,7 @@ private:
     void align_unanchored_contigs_(
         const std::vector<AnchorBlock>& blocks,
         uint32_t short_contig_len,
-        const std::string& prefix,
-        bool write_paf
+        const std::string& prefix
     );
     std::vector<AnchorBlock> build_alignment_regions_(
         const std::vector<AnchorBlock>& anchors,
@@ -160,7 +157,6 @@ private:
         const std::vector<std::string>& sample_names,
         const std::string& prefix,
         uint32_t short_contig_len,
-        bool write_paf,
         const std::string& command_line
     );
     std::vector<ComponentBackbone> component_backbones_(const std::vector<std::string>& sample_names) const;
@@ -172,8 +168,7 @@ private:
         const std::vector<ComponentBackbone>& backbones,
         const std::vector<std::string>& sample_names,
         const std::string& prefix,
-        uint32_t short_contig_len,
-        bool write_paf
+        uint32_t short_contig_len
     );
     std::vector<std::vector<ComponentHit>> select_component_hits_(
         std::vector<std::vector<ComponentHit>> hits,

@@ -5,11 +5,11 @@
 #include "../include/gfa_name_check.hpp"
 #include "../include/logger.hpp"
 #include "../include/progress_tracker.hpp"
+#include "../include/save.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <deque>
-#include <fstream>
 #include <future>
 #include <iomanip>
 #include <map>
@@ -661,8 +661,7 @@ std::vector<GfaCtgCollapser::AnchorBlock> GfaCtgCollapser::filter_spanning_block
 void GfaCtgCollapser::align_unanchored_contigs_(
     const std::vector<AnchorBlock>& blocks,
     uint32_t short_contig_len,
-    const std::string& prefix,
-    bool write_paf
+    const std::string& prefix
 ) {
     std::vector<uint8_t> anchored(nodes_.size(), 0);
     for (const AnchorBlock& block : blocks) {
@@ -694,7 +693,7 @@ void GfaCtgCollapser::align_unanchored_contigs_(
     log_stream() << "  - Unanchored hap1 contigs: " << hap1_count << "\n";
     log_stream() << "  - Unanchored hap2 contigs: " << contigs.size() - hap1_count << "\n\n";
     std::vector<BubbleAlignment> alignments = align_component_backbones_(
-        contigs, {"hap1", "hap2"}, prefix, short_contig_len, write_paf
+        contigs, {"hap1", "hap2"}, prefix, short_contig_len
     );
     if (alignments.empty() || min_component_coverage_ <= 0.0) return;
 
@@ -1159,8 +1158,7 @@ void GfaCtgCollapser::collapse_ctgs(
     const std::string& prefix,
     double min_anchor_coverage,
     uint32_t short_contig_len,
-    bool anchor_only,
-    bool write_paf
+    bool anchor_only
 ) {
     log_stream() << "Collapsing haplotype contigs from unique shared-read anchors ...\n\n";
 
@@ -1183,7 +1181,7 @@ void GfaCtgCollapser::collapse_ctgs(
     blocks = filter_spanning_blocks_(std::move(blocks), min_anchor_coverage);
     const std::vector<AnchorBlock> regions = build_alignment_regions_(blocks, anchor_only);
     align_regions_(regions);
-    align_unanchored_contigs_(blocks, short_contig_len, prefix, write_paf);
+    align_unanchored_contigs_(blocks, short_contig_len, prefix);
     if (!alt_nodes_.empty()) inject_variant_alignments_();
 
     const auto groups = build_align_groups_();
@@ -1226,7 +1224,6 @@ std::vector<std::string> GfaCtgCollapser::collapse_samples(
     uint32_t short_contig_len,
     uint32_t min_contig_len,
     bool anchor_only,
-    bool write_paf,
     const std::string& command_line
 ) const {
     std::vector<std::string> names = sample_names;
@@ -1275,7 +1272,7 @@ std::vector<std::string> GfaCtgCollapser::collapse_samples(
         if (namespace_samples) sample.namespace_segment_names_("_" + std::to_string(i + 1));
         sample.collapse_ctgs(
             sample_vcf, sample_prefix, min_anchor_coverage,
-            short_contig_len, anchor_only, write_paf
+            short_contig_len, anchor_only
         );
         sample.save_to_disk(sample_prefix + ".collapse.gfa", true, false, true, command_line);
         sample.save_to_disk(sample_prefix + ".collapse.noseq.gfa", true, false, false, command_line);
@@ -1285,7 +1282,7 @@ std::vector<std::string> GfaCtgCollapser::collapse_samples(
 
     if (outputs.size() > 1) {
         GfaCtgCollapser combined(*this);
-        combined.collapse_backbone_samples_(outputs, output_names, prefix, short_contig_len, write_paf, command_line);
+        combined.collapse_backbone_samples_(outputs, output_names, prefix, short_contig_len, command_line);
         return {prefix + ".iter0.collapse.gfa"};
     }
     return outputs;
@@ -1627,8 +1624,7 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     const std::vector<ComponentBackbone>& backbones,
     const std::vector<std::string>& sample_names,
     const std::string& prefix,
-    uint32_t short_contig_len,
-    bool write_paf
+    uint32_t short_contig_len
 ) {
     if (backbones.empty()) return {};
 
@@ -1645,11 +1641,8 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     map_options.best_n = static_cast<short>(anchorOpts_.max_kept);
     map_options.zdrop = extendOpts_.dyn_zdrop;
 
-    std::ofstream paf, paf_all;
-    if (write_paf) {
-        paf.open(prefix + ".paf");
-        paf_all.open(prefix + ".all.paf");
-    }
+    SAVE paf(prefix + ".paf");
+    SAVE paf_all(prefix + ".all.paf");
     std::vector<BubbleAlignment> alignments;
 
     uint32_t max_sample = 0;
@@ -1789,17 +1782,17 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     mm_idx_destroy(index);
     progress.finish();
 
-    if (paf_all) {
-        for (uint32_t qid = 0; qid < all_hits.size(); ++qid) {
-            for (const ComponentHit& hit : all_hits[qid]) {
-                const ComponentBackbone& query = backbones[qid];
-                const ComponentBackbone& ref = backbones[hit.rid];
-                paf_all << query.name << '\t' << query.sequence.size() << '\t'
-                    << hit.raw_query_beg << '\t' << hit.raw_query_end << '\t'
-                    << (hit.reverse ? '-' : '+') << '\t' << ref.name << '\t' << ref.sequence.size() << '\t'
-                    << hit.ref_beg << '\t' << hit.ref_end << '\t' << hit.matches << '\t' << hit.block_len << '\t'
-                    << static_cast<unsigned>(hit.mapq) << "\ttp:A:P\tcg:Z:" << hit.cigar << '\n';
-            }
+    for (uint32_t qid = 0; qid < all_hits.size(); ++qid) {
+        for (const ComponentHit& hit : all_hits[qid]) {
+            const ComponentBackbone& query = backbones[qid];
+            const ComponentBackbone& ref = backbones[hit.rid];
+            std::ostringstream line;
+            line << query.name << '\t' << query.sequence.size() << '\t'
+                 << hit.raw_query_beg << '\t' << hit.raw_query_end << '\t'
+                 << (hit.reverse ? '-' : '+') << '\t' << ref.name << '\t' << ref.sequence.size() << '\t'
+                 << hit.ref_beg << '\t' << hit.ref_end << '\t' << hit.matches << '\t' << hit.block_len << '\t'
+                 << static_cast<unsigned>(hit.mapq) << "\ttp:A:P\tcg:Z:" << hit.cigar << '\n';
+            paf_all.save(line.str());
         }
     }
 
@@ -1817,13 +1810,13 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
                 alignments.end(), std::make_move_iterator(split.begin()), std::make_move_iterator(split.end())
             );
             ++component_hits;
-            if (paf) {
-                paf << query.name << '\t' << query.sequence.size() << '\t'
-                    << hit.raw_query_beg << '\t' << hit.raw_query_end << '\t'
-                    << (hit.reverse ? '-' : '+') << '\t' << ref.name << '\t' << ref.sequence.size() << '\t'
-                    << hit.ref_beg << '\t' << hit.ref_end << '\t' << hit.matches << '\t' << hit.block_len << '\t'
-                    << static_cast<unsigned>(hit.mapq) << "\ttp:A:P\tcg:Z:" << hit.cigar << '\n';
-            }
+            std::ostringstream line;
+            line << query.name << '\t' << query.sequence.size() << '\t'
+                 << hit.raw_query_beg << '\t' << hit.raw_query_end << '\t'
+                 << (hit.reverse ? '-' : '+') << '\t' << ref.name << '\t' << ref.sequence.size() << '\t'
+                 << hit.ref_beg << '\t' << hit.ref_end << '\t' << hit.matches << '\t' << hit.block_len << '\t'
+                 << static_cast<unsigned>(hit.mapq) << "\ttp:A:P\tcg:Z:" << hit.cigar << '\n';
+            paf.save(line.str());
         }
     }
 
@@ -1837,7 +1830,6 @@ void GfaCtgCollapser::collapse_backbone_samples_(
     const std::vector<std::string>& sample_names,
     const std::string& prefix,
     uint32_t short_contig_len,
-    bool write_paf,
     const std::string& command_line
 ) {
     log_stream() << "Loading sample graphs for cross-sample component collapse ...\n\n";
@@ -1846,7 +1838,7 @@ void GfaCtgCollapser::collapse_backbone_samples_(
     log_stream() << "Samples: " << sample_names.size() << "\n";
     log_stream() << "Component backbones: " << backbones.size() << "\n\n";
     std::string file_prefix = prefix + ".iter0";
-    bubble_aligns_ = align_component_backbones_(backbones, sample_names, file_prefix, short_contig_len, write_paf);
+    bubble_aligns_ = align_component_backbones_(backbones, sample_names, file_prefix, short_contig_len);
 
     if (bubble_aligns_.empty()) {
         warning_stream() << "  ! No valid cross-sample component alignments; writing the combined graph unchanged\n";

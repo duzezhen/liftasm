@@ -892,8 +892,12 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--min_similarity must be in [0,1]"
             );
             ensure(
-                cfg.gapfill.min_overlap_fraction >= 0.0 && cfg.gapfill.min_overlap_fraction <= 1.0,
-                "--min_overlap_frac must be in [0,1]"
+                cfg.gapfill.boundary_identity >= 0.0 && cfg.gapfill.boundary_identity <= 1.0,
+                "--boundary_identity must be in [0,1]"
+            );
+            ensure(
+                cfg.gapfill.boundary_coverage >= 0.0 && cfg.gapfill.boundary_coverage <= 1.0,
+                "--boundary_coverage must be in [0,1]"
             );
             ensure(
                 cfg.gapfill.max_overlap >= 0.0 && cfg.gapfill.max_overlap <= 1.0,
@@ -1865,7 +1869,7 @@ void help_collapse(char** argv, bool advanced) {
     hp.line("-p, --prefix", "STR", "output prefix [" + CollapseOpts().prefix + "]");
     hp.note(" * -g: <prefix>.iterN.collapse.{gfa,noseq.gfa,map}");
     hp.note(" * --c1/--c2: <prefix>.<name>.collapse.{gfa,noseq.gfa,map} and <prefix>.iterN.collapse.{gfa,noseq.gfa,map}");
-    hp.line("--paf", "", "write filtered and raw component alignments to <prefix>{,.all}.paf");
+    hp.note(" * contig mode always writes filtered and raw component alignments as *.paf and *.all.paf");
 
     hp.blank();
     
@@ -1972,7 +1976,6 @@ AppConfig main_collapse(int argc, char** argv) {
         {"vcf",             required_argument, nullptr, 'v'},
         {"name",            required_argument, nullptr, 'n'},
         {"prefix",          required_argument, nullptr, 'p'},
-        {"paf",             no_argument,       nullptr, 0003},
 
         {"kmer",            required_argument, nullptr, 'k'},
         {"window",          required_argument, nullptr, 'w'},
@@ -2071,11 +2074,6 @@ AppConfig main_collapse(int argc, char** argv) {
                 cfg.collapse.prefix = optarg;
                 break;
             }
-            case 0003: {
-                cfg.collapse.paf = true;
-                break;
-            }
-
             case 'k': {
                 cfg.global.kmerLen = std::max(1, std::stoi(optarg));
                 break;
@@ -3595,6 +3593,7 @@ void help_gapfill(char** argv) {
     hp.section("Index options");
     hp.line("-k, --kmer", "INT", "minimizer k-mer size [" + std::to_string(GlobalOpts().kmerLen) + "]");
     hp.line("-w, --window", "INT", "minimizer window size [" + std::to_string(GlobalOpts().minimizerW) + "]");
+    hp.line("--max_occ", "INT", "ignore local bridge minimizers occurring more than this many times [" + std::to_string(GapfillOpts().max_occ) + "]");
 
     hp.blank();
 
@@ -3630,9 +3629,14 @@ void help_gapfill(char** argv) {
     hp.line("--max_gap", "INT", "largest graph gap that may be filled [" + format_size_arg_(GapfillOpts().max_gap) + "]");
     hp.line("--max_overlap", "FLOAT", "largest allowed overlap between the two target contigs [" + format_double_(GapfillOpts().max_overlap) + "]");
     hp.line("--min_overlap", "INT", "fill contig must overlap each target contig by at least this many bp [" + format_size_arg_(GapfillOpts().min_overlap) + "]");
-    hp.line("--min_overlap_frac", "FLOAT", "required overlap fraction of the shorter contig [" + format_double_(GapfillOpts().min_overlap_fraction) + "]");
-    hp.line("--min_similarity", "FLOAT", "required similarity across an overlap or at its gap-facing boundary [" + format_double_(GapfillOpts().min_similarity) + "]");
+    hp.line("--min_similarity", "FLOAT", "minimum shared-node similarity across an overlap; a matching local boundary may rescue it [" + format_double_(GapfillOpts().min_similarity) + "]");
+    hp.line("--boundary_identity", "FLOAT", "minimum identity for using an exact gap boundary [" + format_double_(GapfillOpts().boundary_identity) + "]");
+    hp.line("--boundary_coverage", "FLOAT", "minimum query coverage for using an exact gap boundary [" + format_double_(GapfillOpts().boundary_coverage) + "]");
     hp.line("--min_prob", "FLOAT", "required sample support unless the other haplotype spans the gap [" + format_double_(GapfillOpts().min_probability) + "]");
+
+    hp.blank();
+
+    hp.section("Misassembly options");
     hp.line("--misassembly_len", "INT", "check an unmatched contig end when it is at least this long [" + format_size_arg_(GapfillOpts().misassembly_len) + "]");
     hp.line("--misassembly_similarity", "FLOAT", "matching fraction needed to keep a long unmatched end at this gap [" + format_double_(GapfillOpts().misassembly_similarity) + "]");
 
@@ -3664,6 +3668,7 @@ AppConfig main_gapfill(int argc, char** argv) {
 
         {"kmer",                   required_argument, nullptr, 'k'},
         {"window",                 required_argument, nullptr, 'w'},
+        {"max_occ",                required_argument, nullptr, 1001},
 
         {"preset",                 required_argument, nullptr, 'x'},
         {"zdrop",                  required_argument, nullptr, 'z'},
@@ -3686,13 +3691,16 @@ AppConfig main_gapfill(int argc, char** argv) {
         {"max_gap",                required_argument, nullptr, 5002},
         {"max_overlap",            required_argument, nullptr, 5003},
         {"min_overlap",            required_argument, nullptr, 5004},
-        {"min_overlap_frac",       required_argument, nullptr, 5005},
-        {"min_similarity",         required_argument, nullptr, 5006},
-        {"min_prob",               required_argument, nullptr, 5007},
-        {"misassembly_len",        required_argument, nullptr, 5008},
-        {"misassembly_similarity", required_argument, nullptr, 5009},
-        {"dedup_sim",              required_argument, nullptr, 5010},
-        {"dedup_component",        required_argument, nullptr, 5011},
+        {"min_similarity",         required_argument, nullptr, 5005},
+        {"boundary_identity",      required_argument, nullptr, 5006},
+        {"boundary_coverage",      required_argument, nullptr, 5007},
+        {"min_prob",               required_argument, nullptr, 5008},
+
+        {"misassembly_len",        required_argument, nullptr, 6001},
+        {"misassembly_similarity", required_argument, nullptr, 6002},
+
+        {"dedup_sim",              required_argument, nullptr, 7001},
+        {"dedup_component",        required_argument, nullptr, 7002},
 
         {"threads",                required_argument, nullptr, 't'},
         {"debug",                  no_argument,       nullptr, 'd'},
@@ -3719,6 +3727,10 @@ AppConfig main_gapfill(int argc, char** argv) {
             }
             case 'w': {
                 cfg.global.minimizerW = std::max(1, std::stoi(optarg)); 
+                break;
+            }
+            case 1001: {
+                cfg.gapfill.max_occ = std::max(1, std::stoi(optarg));
                 break;
             }
 
@@ -3748,7 +3760,6 @@ AppConfig main_gapfill(int argc, char** argv) {
                 cfg.gapfill.min_mapq = static_cast<uint8_t>(value);
                 break;
             }
-
             case 3001: {
                 cfg.gapfill.max_depth = parse_size_arg_u32_(optarg, argc, argv, optind, "--depth");
                 break;
@@ -3804,30 +3815,36 @@ AppConfig main_gapfill(int argc, char** argv) {
                 break;
             }
             case 5005: {
-                cfg.gapfill.min_overlap_fraction = std::stod(optarg);
-                break;
-            }
-            case 5006: {
                 cfg.gapfill.min_similarity = std::stod(optarg);
                 break;
             }
+            case 5006: {
+                cfg.gapfill.boundary_identity = std::stod(optarg);
+                break;
+            }
             case 5007: {
-                cfg.gapfill.min_probability = std::stod(optarg);
+                cfg.gapfill.boundary_coverage = std::stod(optarg);
                 break;
             }
             case 5008: {
+                cfg.gapfill.min_probability = std::stod(optarg);
+                break;
+            }
+
+            case 6001: {
                 cfg.gapfill.misassembly_len = parse_size_arg_u64_(optarg, argc, argv, optind, "--misassembly_len");
                 break;
             }
-            case 5009: {
+            case 6002: {
                 cfg.gapfill.misassembly_similarity = std::stod(optarg);
                 break;
             }
-            case 5010: {
+
+            case 7001: {
                 cfg.gapfill.dedup_similarity = std::stod(optarg);
                 break;
             }
-            case 5011: {
+            case 7002: {
                 cfg.gapfill.dedup_component = parse_size_arg_u64_(optarg, argc, argv, optind, "--dedup_component");
                 break;
             }

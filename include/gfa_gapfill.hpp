@@ -19,8 +19,7 @@ public:
         uint64_t min_contig_bp{1'000'000};
         uint64_t max_gap_bp{10'000'000};
         double min_similarity{0.7};
-        double min_overlap_fraction{0.1};
-        double max_target_overlap{0.5};
+        double max_target_overlap{0.1};
         double min_probability{0.5};
         uint64_t misassembly_check_bp{10'000'000};
         double misassembly_similarity{0.7};
@@ -43,9 +42,12 @@ public:
         const opt::ExtendOpts& extend,
         const opt::AlignOpts& align,
         const std::string& preset,
+        uint32_t max_occ,
         double min_match,
         double min_ali_ratio,
-        uint8_t min_mapq
+        uint8_t min_mapq,
+        double boundary_identity,
+        double boundary_coverage
     );
 
     size_t gapfill(const std::vector<GfaBubble::Bubble>& bubbles);
@@ -192,9 +194,12 @@ private:
         uint16_t k{25}, w{30};
         uint16_t best_n{5};
         int zdrop{5000};
+        uint32_t max_occ{10};
         double min_match{0.9};
         double min_ali_ratio{0.05};
         uint8_t min_mapq{30};
+        double boundary_identity{0.9};
+        double boundary_coverage{0.8};
         std::string preset{"asm5"};
     } mm2_;
     std::vector<Fragment> fragments_;
@@ -335,9 +340,8 @@ public:
         uint32_t sample_support{0};
         uint32_t informative_samples{0};
         uint32_t spanning_samples{0};
-        uint64_t left_anchor_bp{0}, right_anchor_bp{0};
+        uint64_t left_cut_bp{0}, right_cut_bp{0};
         uint64_t bridge_left_bp{0}, bridge_right_bp{0};
-        std::string left_anchor, right_anchor;
         std::string status;
     };
 
@@ -372,9 +376,15 @@ public:
     static void component(const std::string& sample, uint32_t component, size_t paths);
     static void overlap(const std::string& a, const std::string& b, uint64_t shared_bp, uint64_t overlap_bp, double similarity, double a_fraction, double b_fraction, const BoundarySupport& left, const BoundarySupport& right);
     static void search(const std::string& sample, size_t paths, uint64_t tested, uint64_t low_support, uint64_t wrong_group, uint64_t anchor_failed, size_t candidates);
-    static void candidate(const std::string& left, const std::string& right, const std::string& bridge, uint32_t component, const std::string& left_anchor, const std::string& right_anchor, double left_phase, double right_phase, uint64_t left_target_bp, uint64_t left_bridge_bp, uint64_t right_target_bp, uint64_t right_bridge_bp, double left_boundary, double right_boundary, bool phase_consistent, bool homolog_span, uint32_t sample_support, uint32_t informative_samples, uint32_t spanning_samples, double probability);
+    static void candidate(const std::string& left, const std::string& right, const std::string& bridge, uint32_t component, double left_phase, double right_phase, uint64_t left_target_bp, uint64_t left_bridge_bp, uint64_t right_target_bp, uint64_t right_bridge_bp, double left_boundary, double right_boundary, bool phase_consistent, bool homolog_span, uint32_t sample_support, uint32_t informative_samples, uint32_t spanning_samples, double probability);
     static void boundary_alignment(const std::string& left, const std::string& right, const std::string& bridge, const Alignment& left_alignment, const Alignment& right_alignment);
-    static void refined_boundary(const std::string& left, const std::string& right, const std::string& bridge, const std::string& left_anchor, const std::string& right_anchor, double left_similarity, double right_similarity);
+    static void refined_boundary(
+        const std::string& left, uint64_t left_cut,
+        const std::string& right, uint64_t right_cut, uint64_t right_length,
+        const std::string& bridge, uint64_t bridge_begin, uint64_t bridge_end,
+        const BoundarySupport& left_support, const BoundarySupport& right_support,
+        double left_alignment, double right_alignment
+    );
     static void selection(const std::string& left, const std::string& right, const std::string& bridge, const std::string& decision, double probability);
     static void assignment(const std::string& sample, uint32_t component, uint8_t hap, uint32_t hap1_votes, uint32_t hap2_votes, bool conflict);
     static void primary_candidate(uint32_t component, const std::string& sample, uint64_t component_bp, uint64_t hap1_ng50, uint64_t hap2_ng50);

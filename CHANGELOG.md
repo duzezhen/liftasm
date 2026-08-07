@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.3-r19 (2026-08-07)
+
+### Improved
+
+- Improved gap-fill boundary filtering, phasing, and debug output.
+- Simplified gap-fill options and overlap filtering.
+- Improved contig-mode collapse output and naming.
+
 ## v0.1.3-r18 (2026-08-06)
 
 ### Improved
