@@ -8,8 +8,8 @@ namespace program {
 
 inline constexpr const char* name        = "liftasm";
 inline constexpr const char* description = "Merge, de-overlap, and collapse hifiasm GFA assembly graphs.";
-inline constexpr const char* version     = "0.1.3-r17";
-inline constexpr const char* build_date  = "2026/08/04";
+inline constexpr const char* version     = "0.1.3-r18";
+inline constexpr const char* build_date  = "2026/08/06";
 inline constexpr const char* author      = "Zezhen Du";
 inline constexpr const char* email       = "dzz0539@gmail.com or zezhen.du@yale.edu";
 

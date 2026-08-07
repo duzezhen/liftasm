@@ -3,6 +3,7 @@
 #include "../include/ProgramMetadata.hpp"
 #include "../include/logger.hpp"
 #include "../include/get_time.hpp"
+#include "../include/GZ_chunk_reader.hpp"
 
 #include <getopt.h>
 #include <cerrno>
@@ -14,6 +15,21 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
+
+static bool gfa_has_sample_tags_(const std::string& filename) {
+    GzChunkReader reader(filename);
+    std::string line;
+    while (reader.readLine(line)) {
+        if (line.empty()) continue;
+        if (line[0] == 'H' && line.find("\tSP:Z:present") != std::string::npos) return true;
+        if (line[0] == 'S') return line.find("\tSN:Z:") != std::string::npos;
+    }
+    return false;
+}
+
+static bool all_gfas_have_sample_tags_(const std::vector<std::string>& filenames) {
+    return std::all_of(filenames.begin(), filenames.end(), gfa_has_sample_tags_);
+}
 
 
 static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
@@ -324,14 +340,12 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--anchor_only is only supported with --c1/--c2"
             );
             ensure(
-                cfg.collapse.hap1Files.empty() || cfg.collapse.gfaNames.empty() ||
-                    cfg.collapse.gfaNames.size() == cfg.collapse.hap1Files.size(),
-                "-n/--name must have the same number of values as --c1"
+                cfg.collapse.hap1Files.empty() || cfg.collapse.gfaNames.size() == cfg.collapse.hap1Files.size(),
+                "-n/--name is required for --c1/--c2 and must match the number of samples"
             );
             ensure(
-                !cfg.collapse.hap1Files.empty() || cfg.collapse.gfaNames.empty() ||
-                    cfg.collapse.gfaNames.size() == cfg.collapse.gfaFiles.size(),
-                "-n/--name must have the same number of values as -g/--gfa"
+                !cfg.collapse.hap1Files.empty() || cfg.collapse.gfaNames.size() == cfg.collapse.gfaFiles.size() || (cfg.collapse.gfaNames.empty() && all_gfas_have_sample_tags_(cfg.collapse.gfaFiles)),
+                "-n/--name is required for input GFA files without sample tags"
             );
             ensure(
                 !cfg.collapse.prefix.empty(), 
@@ -894,6 +908,14 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--misassembly_similarity must be in [0,1]"
             );
             ensure(
+                cfg.gapfill.dedup_similarity >= 0.0 && cfg.gapfill.dedup_similarity <= 1.0,
+                "--dedup_sim must be in [0,1]"
+            );
+            ensure(
+                cfg.gapfill.dedup_component > 0,
+                "--dedup_component must be > 0"
+            );
+            ensure(
                 cfg.gapfill.min_match >= 0.0 && cfg.gapfill.min_match <= 1.0,
                 "--min_match must be in [0,1]"
             );
@@ -1336,7 +1358,7 @@ void help_bubble(char** argv, bool advanced) {
 
     hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
-    hp.line("-n, --name", "STR ...", "sample name(s) to add as node tags; if omitted, the prefix of each GFA filename is used");
+    hp.line("-n, --name", "STR ...", "sample names; otherwise reuse liftasm tags or use filename prefixes");
     hp.line("-p, --prefix", "STR", "output prefix [" + BubbleOpts().out_prefix + "]");
     hp.note(" * <prefix>.bubbles.{gfa,noseq.gfa,vcf}");
     hp.line("--write_vcf", "", "also output bubbles in VCF format");
@@ -1623,7 +1645,7 @@ void help_deoverlap(char** argv, bool advanced) {
     
     hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
-    hp.line("-n, --name", "STR ...", "sample name(s) to add as node tags; if omitted, the prefix of each GFA filename is used");
+    hp.line("-n, --name", "STR ...", "sample names; otherwise reuse liftasm tags or use filename prefixes");
     hp.line("-p, --prefix", "STR", "output prefix [" + CollapseOpts().prefix + "]");
     hp.note(" * <prefix>.deoverlap.{gfa,noseq.gfa,map}");
 
@@ -1839,10 +1861,10 @@ void help_collapse(char** argv, bool advanced) {
     hp.line("--c1", "FILE ...", "haplotype-1 contig GFA file(s) with read A-lines");
     hp.line("--c2", "FILE ...", "haplotype-2 contig GFA file(s), paired with --c1");
     hp.line("-v, --vcf", "FILE ...", "VCF file(s) added during haplotype contig collapse");
-    hp.line("-n, --name", "STR ...", "sample name(s) to add as node tags; if omitted, the prefix of each GFA filename is used");
+    hp.line("-n, --name", "STR ...", "sample names; required for --c1/--c2 and GFA files without sample tags");
     hp.line("-p, --prefix", "STR", "output prefix [" + CollapseOpts().prefix + "]");
     hp.note(" * -g: <prefix>.iterN.collapse.{gfa,noseq.gfa,map}");
-    hp.note(" * --c1/--c2: <prefix>.<name>.collapse.{gfa,noseq.gfa,map} and <prefix>.iter0.collapse.{gfa,noseq.gfa,map}");
+    hp.note(" * --c1/--c2: <prefix>.<name>.collapse.{gfa,noseq.gfa,map} and <prefix>.iterN.collapse.{gfa,noseq.gfa,map}");
     hp.line("--paf", "", "write filtered and raw component alignments to <prefix>{,.all}.paf");
 
     hp.blank();
@@ -1891,7 +1913,7 @@ void help_collapse(char** argv, bool advanced) {
     
     hp.section("Bubble Detection Options");
     hp.line("--depth", "INT", "maximum DFS depth for path exploration inside a bubble [" + format_size_arg_(BubbleOpts().max_depth) + "]");
-    hp.line("--paths", "INT", "maximum number of DFS paths to explore per bubble [" + format_size_arg_(BubbleOpts().max_paths) + "]");
+    hp.line("--paths", "INT", "maximum DFS paths per bubble; 0 = max(20, twice the -g/--c1 input count) [0]");
     if (advanced) {
         hp.line("--DFS_guard", "INT", "max DFS states [" + format_size_arg_(BubbleOpts().DFS_guard) + "]");
     }
@@ -1941,6 +1963,7 @@ AppConfig main_collapse(int argc, char** argv) {
 
     AppConfig cfg;
     cfg.mode = ToolMode::collapse;
+    cfg.bubble.max_paths = 0;
 
     const struct option long_opts[] = {
         {"gfa",             required_argument, nullptr, 'g'},
@@ -2164,7 +2187,7 @@ AppConfig main_collapse(int argc, char** argv) {
                 break;
             }
             case 4002: {
-                cfg.bubble.max_paths = parse_size_arg_u32_(optarg, argc, argv, optind, "--paths");
+                cfg.bubble.max_paths = parse_size_arg_u16_(optarg, argc, argv, optind, "--paths");
                 break;
             }
             case 4003: {
@@ -2282,6 +2305,14 @@ AppConfig main_collapse(int argc, char** argv) {
                 std::exit(1);
             }
         }
+    }
+
+    if (cfg.bubble.max_paths == 0) {
+        const size_t input_count = cfg.collapse.hap1Files.empty() ? cfg.collapse.gfaFiles.size() : cfg.collapse.hap1Files.size();
+        const size_t automatic = std::max<size_t>(20, input_count * 2);
+        cfg.bubble.max_paths = static_cast<uint16_t>(
+            std::min<size_t>(automatic, std::numeric_limits<uint16_t>::max())
+        );
     }
     
     validate_and_print(argc, argv, cfg);
@@ -3177,7 +3208,7 @@ void help_split(char** argv) {
 
     hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
-    hp.line("-n, --name", "STR ...", "sample name(s) to add as node tags; if omitted, the prefix of each GFA filename is used");
+    hp.line("-n, --name", "STR ...", "sample names; otherwise reuse liftasm tags or use filename prefixes");
     hp.line("-p, --prefix", "STR", "output prefix [" + SplitOpts().prefix + "]");
     hp.note(" * <prefix>.compN.{gfa,noseq.gfa}");
     
@@ -3253,7 +3284,7 @@ void help_augment(char** argv, bool advanced) {
 
     hp.section("Input/Output");
     hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
-    hp.line("-n, --name", "STR ...", "sample name(s) to add as node tags; if omitted, the prefix of each GFA filename is used");
+    hp.line("-n, --name", "STR ...", "sample names; otherwise reuse liftasm tags or use filename prefixes");
     hp.line("-v, --vcf", "FILE ...", "input VCF or VCF.GZ file(s)");
     hp.line("-p, --prefix", "STR", "output prefix [" + AugmentOpts().prefix + "]");
     hp.note(" * <prefix>.augment.{gfa,noseq.gfa,map}");
@@ -3556,6 +3587,7 @@ void help_gapfill(char** argv) {
     hp.line("-p, --prefix", "STR", "output prefix [" + GapfillOpts().prefix + "]");
     hp.note(" * <prefix>.<sample>.hap{1,2}.gapfill.{gfa,noseq.gfa}");
     hp.note(" * <prefix>.primary.hap{1,2}.gapfill.{gfa,noseq.gfa}");
+    hp.note(" * <prefix>.primary.hap{1,2}.lowQ.gapfill.{gfa,noseq.gfa}");
     hp.note(" * <prefix>.gapfill.{tsv,relocations.tsv,html}");
 
     hp.blank();
@@ -3586,10 +3618,10 @@ void help_gapfill(char** argv) {
 
     hp.section("Phase options");
     hp.line("--phase_len", "INT", "maximum nodes in a bubble branch used for phase [" + format_size_arg_(GapfillOpts().phase_path_len) + "]");
-    hp.line("--phase_skip", "INT", "ignore this much sequence next to each boundary [" + format_size_arg_(GapfillOpts().phase_skip) + "]");
+    hp.line("--phase_skip", "INT", "replace this much unreliable sequence at each contig end [" + format_size_arg_(GapfillOpts().phase_skip) + "]");
     hp.line("--phase_win", "INT", "local phase window and extension step [" + format_size_arg_(GapfillOpts().phase_win) + "]");
     hp.line("--phase_min_bp", "INT", "minimum bubble bp required from both paths [" + format_size_arg_(GapfillOpts().phase_min_bp) + "]");
-    hp.note(" * Minimizer and bubble phase use the same skipped window; it grows until enough bubble evidence or a contig end.");
+    hp.note(" * Phase evidence extends inward from the trusted contig end until enough bubble sequence is found");
     
     hp.blank();
 
@@ -3599,10 +3631,16 @@ void help_gapfill(char** argv) {
     hp.line("--max_overlap", "FLOAT", "largest allowed overlap between the two target contigs [" + format_double_(GapfillOpts().max_overlap) + "]");
     hp.line("--min_overlap", "INT", "fill contig must overlap each target contig by at least this many bp [" + format_size_arg_(GapfillOpts().min_overlap) + "]");
     hp.line("--min_overlap_frac", "FLOAT", "required overlap fraction of the shorter contig [" + format_double_(GapfillOpts().min_overlap_fraction) + "]");
-    hp.line("--min_similarity", "FLOAT", "required shared graph-sequence fraction in each overlap [" + format_double_(GapfillOpts().min_similarity) + "]");
+    hp.line("--min_similarity", "FLOAT", "required similarity across an overlap or at its gap-facing boundary [" + format_double_(GapfillOpts().min_similarity) + "]");
     hp.line("--min_prob", "FLOAT", "required sample support unless the other haplotype spans the gap [" + format_double_(GapfillOpts().min_probability) + "]");
     hp.line("--misassembly_len", "INT", "check an unmatched contig end when it is at least this long [" + format_size_arg_(GapfillOpts().misassembly_len) + "]");
     hp.line("--misassembly_similarity", "FLOAT", "matching fraction needed to keep a long unmatched end at this gap [" + format_double_(GapfillOpts().misassembly_similarity) + "]");
+
+    hp.blank();
+
+    hp.section("Deduplication options");
+    hp.line("--dedup_sim", "FLOAT", "minimum aligned sequence fraction for removing redundant contigs or components [" + format_double_(GapfillOpts().dedup_similarity) + "]");
+    hp.line("--dedup_component", "INT", "largest primary component checked against larger contigs of the same haplotype [" + format_size_arg_(GapfillOpts().dedup_component) + "]");
     
     hp.blank();
 
@@ -3653,6 +3691,8 @@ AppConfig main_gapfill(int argc, char** argv) {
         {"min_prob",               required_argument, nullptr, 5007},
         {"misassembly_len",        required_argument, nullptr, 5008},
         {"misassembly_similarity", required_argument, nullptr, 5009},
+        {"dedup_sim",              required_argument, nullptr, 5010},
+        {"dedup_component",        required_argument, nullptr, 5011},
 
         {"threads",                required_argument, nullptr, 't'},
         {"debug",                  no_argument,       nullptr, 'd'},
@@ -3781,6 +3821,14 @@ AppConfig main_gapfill(int argc, char** argv) {
             }
             case 5009: {
                 cfg.gapfill.misassembly_similarity = std::stod(optarg);
+                break;
+            }
+            case 5010: {
+                cfg.gapfill.dedup_similarity = std::stod(optarg);
+                break;
+            }
+            case 5011: {
+                cfg.gapfill.dedup_component = parse_size_arg_u64_(optarg, argc, argv, optind, "--dedup_component");
                 break;
             }
 

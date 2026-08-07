@@ -118,7 +118,7 @@ struct CollapseOpts {
     double trim_max_overlap = 0.05;
 
     double ctg_anchor_coverage = 0.5;   // minimum contig span covered by shared-read anchor blocks
-    uint32_t ctg_short_len = 5'000'000; // short contigs can participate in only one selected contig pair
+    uint32_t ctg_short_len = 10'000'000; // short contigs can participate in only one selected contig pair
     uint32_t ctg_min_len = 2'000'000;   // ignore shorter input contigs in contig mode
     double ctg_min_coverage = 0.5;      // minimum contig span coverage for within- or cross-sample support
     double ctg_end_fraction = 0.01;     // terminal overhang fraction allowed for end-to-end component support
@@ -299,6 +299,10 @@ struct GapfillOpts {
     double min_probability = 0.5;
     uint64_t misassembly_len = 10'000'000;
     double misassembly_similarity = 0.7;
+
+    // output deduplication
+    double dedup_similarity = 0.95;
+    uint64_t dedup_component = 10'000'000;
 };
 
 enum class ToolMode {

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.3-r18 (2026-08-06)
+
+### Improved
+
+- Improved phase-aware gap selection and topology-guided local boundary alignment.
+- Added exact base-pair gap splicing with repeat-aware fallback to shared graph nodes.
+- Improved phased primary output and removal of redundant small components and contigs.
+
 ## v0.1.3-r17 (2026-08-04)
 
 ### Fixed

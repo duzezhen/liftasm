@@ -365,7 +365,7 @@ void GfaCtgCollapser::initialize_backbones_() {
         if (nodes_[sid].deleted || origins_[sid].hap == 0) continue;
         const SegmentOrigin& origin = origins_[sid];
         const std::string& sample = sample_names_[origin.sample];
-        backbones_.push_back({sample + ".hap" + std::to_string(origin.hap) + "." + nodes_[sid].name, sid});
+        backbones_.push_back({sample + "." + nodes_[sid].name, sid});
     }
 }
 

@@ -18,7 +18,20 @@ using namespace wfa; // WFAlignerGapAffine
 
 
 // ------------------------------------------------ Helper functions ------------------------------------------------
+static bool gfa_is_liftasm_output_(const std::string& path) {
+    GzChunkReader reader(path);
+    std::string line;
+    while (reader.readLine(line)) {
+        if (line.empty()) continue;
+        if (line[0] != 'H') break;
+        if (line.find("\tTS:Z:liftasm") != std::string::npos) return true;
+    }
+    return false;
+}
+
 static std::string gfa_sample_name_from_path_(const std::string& path) {
+    if (gfa_is_liftasm_output_(path)) return "";
+
     size_t p = path.find_last_of("/\\");
     std::string s = (p == std::string::npos) ? path : path.substr(p + 1);
 
@@ -36,8 +49,7 @@ static std::string gfa_sample_name_from_path_(const std::string& path) {
     }
 
     // If the file is a collapse or deoverlap graph, don't add anything tag to the nodes.
-    if (s.find(".collapse") != std::string::npos ||
-        s.find(".deoverlap") != std::string::npos) {
+    if (s.find(".collapse") != std::string::npos || s.find(".deoverlap") != std::string::npos) {
         return "";
     }
 

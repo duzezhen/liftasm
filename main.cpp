@@ -386,6 +386,8 @@ int main(int argc, char** argv) {
             cfg.gapfill.phase_skip,
             cfg.gapfill.phase_win,
             cfg.gapfill.phase_min_bp,
+            cfg.gapfill.dedup_similarity,
+            cfg.gapfill.dedup_component,
             static_cast<uint32_t>(cfg.global.threads),
             cfg.gapfill.prefix + ".gapfill.html"
         });
