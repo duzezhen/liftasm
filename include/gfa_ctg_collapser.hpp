@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class CtgCollapseDebugger;
@@ -46,6 +47,12 @@ public:
 
     void set_component_filter(double min_coverage, double end_fraction) noexcept;
     void rebuild_component_paths();
+
+    // Collapse uniquely placed standalone ms contigs into existing components.
+    std::unordered_set<std::string> collapse_misassemblies(
+        const std::unordered_map<std::string, uint32_t>& source_components,
+        const std::string& prefix
+    );
 
 private:
     friend class CtgCollapseDebugger;
@@ -97,6 +104,7 @@ private:
         std::vector<PathPiece> pieces;
         uint32_t id{0};
         uint32_t sample{0};
+        uint32_t component{UINT32_MAX};
     };
 
     struct ComponentHit {
@@ -159,7 +167,10 @@ private:
         uint32_t short_contig_len,
         const std::string& command_line
     );
-    std::vector<ComponentBackbone> component_backbones_(const std::vector<std::string>& sample_names) const;
+    std::vector<ComponentBackbone> component_backbones_(
+        const std::vector<std::string>& sample_names,
+        const std::unordered_map<std::string, uint32_t>* queries = nullptr
+    ) const;
     static uint32_t best_reference_sample_(
         const std::vector<ComponentBackbone>& backbones,
         uint64_t& reference_n50
@@ -168,13 +179,17 @@ private:
         const std::vector<ComponentBackbone>& backbones,
         const std::vector<std::string>& sample_names,
         const std::string& prefix,
-        uint32_t short_contig_len
+        uint32_t short_contig_len,
+        const std::unordered_map<std::string, uint32_t>* queries = nullptr,
+        std::unordered_set<std::string>* placed_queries = nullptr
     );
+    void apply_component_alignments_(const std::string& prefix);
     std::vector<std::vector<ComponentHit>> select_component_hits_(
         std::vector<std::vector<ComponentHit>> hits,
         const std::vector<ComponentBackbone>& backbones,
         uint32_t short_contig_len,
-        std::vector<uint32_t>& component_groups
+        std::vector<uint32_t>& component_groups,
+        bool place_queries
     ) const;
     std::vector<BubbleAlignment> split_component_alignment_(
         const ComponentBackbone& ref,

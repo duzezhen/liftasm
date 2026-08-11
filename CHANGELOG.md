@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.3-r20 (2026-08-11)
+
+### Improved
+
+- Improved phase-aware gap selection and exact boundary refinement.
+- Relocated terminal misassemblies before final gap filling.
+- Fixed oversized gap bridges and incomplete multi-haplotype splitting.
+
 ## v0.1.3-r19 (2026-08-07)
 
 ### Improved

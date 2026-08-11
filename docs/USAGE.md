@@ -91,9 +91,10 @@ With the default prefix, the report is `out.gapfill.tsv`. The command also write
 | `--min_contig INT` `[1Mb]` | Shortest contig considered as evidence. | Raise it to avoid noisy short contigs. |
 | `--max_overlap FLOAT` `[0.1]` | Largest allowed overlap between the two target contigs. | Lower it to reject heavily overlapping target pairs. |
 | `--min_overlap INT` `[1Mb]` | Required overlap between a fill path and each target contig. | Raise for stricter bridges. |
-| `--min_similarity FLOAT` `[0.7]` | Required shared-node similarity across an overlap; a matching local boundary may rescue it. | Raise for closer samples or stricter fills. |
-| `--min_prob FLOAT` `[0.5]` | Minimum sample support for a proposed fill. | Raise when many samples are available and conservatism is preferred. |
-| `--phase_len`, `--phase_skip`, `--phase_win`, `--phase_min_bp` | Amount and placement of bubble evidence used to establish phase. | Normally leave unchanged; adjust only when reviewing phase failures. |
+| `--min_similarity FLOAT` `[0.7]` | Required minimizer similarity in each local gap-boundary window. | Raise for closer samples or stricter fills. |
+| `--min_conf FLOAT` `[0.5]` | Minimum combined sample, local-phase, and alignment confidence. | Raise when many samples are available and conservatism is preferred. |
+| `--phase_len INT` `[10]` | Use only bubbles whose every internal path is at most this many bp. | Normally leave unchanged. |
+| `--phase_skip`, `--phase_win`, `--phase_min_bp` | Placement and minimum amount of local bubble evidence. | Adjust only when reviewing phase failures. |
 | `--dedup_sim FLOAT` `[0.95]` | Similarity threshold for removing redundant contigs/components. | Lower only if legitimate near-duplicate contigs must be retained. |
 
 ## `deoverlap`: create a standalone non-overlap graph

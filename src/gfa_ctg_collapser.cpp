@@ -36,6 +36,15 @@ bool is_global_component_path(const std::string& name) {
         });
 }
 
+bool is_component_path(const std::string& name) {
+    if (is_global_component_path(name)) return true;
+    const size_t marker = name.rfind(".component");
+    if (marker == std::string::npos || marker + 10 >= name.size()) return false;
+    return std::all_of(name.begin() + marker + 10, name.end(), [](unsigned char c) {
+        return std::isdigit(c);
+    });
+}
+
 struct CtgPathEdge {
     uint32_t next{UINT32_MAX};
     bool enabled{true};
@@ -1009,7 +1018,8 @@ void GfaCtgCollapser::rebuild_backbone_paths_(const SegReplace::Expander& expand
 }
 
 std::vector<GfaCtgCollapser::ComponentBackbone> GfaCtgCollapser::component_backbones_(
-    const std::vector<std::string>& sample_names
+    const std::vector<std::string>& sample_names,
+    const std::unordered_map<std::string, uint32_t>* queries
 ) const {
     std::vector<uint32_t> sample_ids(sample_names.size(), UINT32_MAX);
     for (size_t i = 0; i < sample_names.size(); ++i) {
@@ -1018,37 +1028,49 @@ std::vector<GfaCtgCollapser::ComponentBackbone> GfaCtgCollapser::component_backb
     }
 
     std::vector<ComponentBackbone> result;
+    const std::vector<uint32_t>& component_ids = get_nodes_connectivity_index();
     for (const GfaPath& path : paths_) {
+        const bool query_path = queries && queries->contains(path.name);
         bool component_path = is_global_component_path(path.name);
-        for (const std::string& sample_name : sample_names) {
-            component_path = component_path || path.name.starts_with(sample_name + ".component");
+        if (!queries) {
+            for (const std::string& sample_name : sample_names) {
+                component_path = component_path || path.name.starts_with(sample_name + ".component");
+            }
         }
-        if (!component_path || path.segments.empty()) continue;
+        if ((!component_path && !query_path) || path.segments.empty()) continue;
         const uint32_t first_sid = static_cast<uint32_t>(path.segments.front().node_id);
         if (first_sid >= nodes_.size()) continue;
 
         uint32_t sample = UINT32_MAX;
-        for (size_t i = 0; i < sample_names.size(); ++i) {
-            if (path.name.starts_with(sample_names[i] + ".component")) {
-                sample = static_cast<uint32_t>(i);
-                break;
-            }
-        }
-        if (sample == UINT32_MAX) {
-            for (uint32_t id : nodes_[first_sid].sample_ids) {
-                const auto found = std::find(sample_ids.begin(), sample_ids.end(), id);
-                if (found != sample_ids.end()) {
-                    sample = static_cast<uint32_t>(found - sample_ids.begin());
+        if (!queries) {
+            for (size_t i = 0; i < sample_names.size(); ++i) {
+                if (path.name.starts_with(sample_names[i] + ".component")) {
+                    sample = static_cast<uint32_t>(i);
                     break;
                 }
             }
+            if (sample == UINT32_MAX) {
+                for (uint32_t id : nodes_[first_sid].sample_ids) {
+                    const auto found = std::find(sample_ids.begin(), sample_ids.end(), id);
+                    if (found != sample_ids.end()) {
+                        sample = static_cast<uint32_t>(found - sample_ids.begin());
+                        break;
+                    }
+                }
+            }
+            if (sample == UINT32_MAX) continue;
         }
-        if (sample == UINT32_MAX) continue;
 
         ComponentBackbone backbone;
-        const std::string sample_prefix = sample_names[sample] + ".";
-        backbone.name = path.name.starts_with(sample_prefix) ? path.name : sample_prefix + path.name;
-        backbone.sample = sample;
+        if (queries) {
+            if (!query_path && (first_sid >= component_ids.size() || component_ids[first_sid] == UINT32_MAX)) continue;
+            backbone.name = path.name;
+            backbone.component = query_path ? queries->at(path.name) : component_ids[first_sid];
+        } else {
+            const std::string sample_prefix = sample_names[sample] + ".";
+            backbone.name = path.name.starts_with(sample_prefix) ? path.name : sample_prefix + path.name;
+            backbone.sample = sample;
+        }
         for (const PathSegment& segment : path.segments) {
             const uint32_t sid = static_cast<uint32_t>(segment.node_id);
             if (sid >= nodes_.size() || nodes_[sid].deleted) continue;
@@ -1292,7 +1314,8 @@ std::vector<std::vector<GfaCtgCollapser::ComponentHit>> GfaCtgCollapser::select_
     std::vector<std::vector<ComponentHit>> hits,
     const std::vector<ComponentBackbone>& backbones,
     uint32_t short_contig_len,
-    std::vector<uint32_t>& component_groups
+    std::vector<uint32_t>& component_groups,
+    bool place_queries
 ) const {
     struct PairGroup {
         uint32_t qid{0};
@@ -1320,8 +1343,8 @@ std::vector<std::vector<GfaCtgCollapser::ComponentHit>> GfaCtgCollapser::select_
             std::vector<ComponentHit>& candidates = item.second;
             const uint32_t rid = item.first.first;
             const uint64_t ref_len = backbones[rid].sequence.size();
-            const bool short_query = short_contig_len > 0 && query_len <= short_contig_len;
-            const bool short_reference = short_contig_len > 0 && ref_len <= short_contig_len;
+            const bool short_query = !place_queries && short_contig_len > 0 && query_len <= short_contig_len;
+            const bool short_reference = !place_queries && short_contig_len > 0 && ref_len <= short_contig_len;
 
             if (short_query || short_reference) {
                 std::vector<ComponentHit> eligible;
@@ -1431,11 +1454,23 @@ std::vector<std::vector<GfaCtgCollapser::ComponentHit>> GfaCtgCollapser::select_
             }
             group.span = support_span;
 
+            if (place_queries) {
+                // A standalone ms component may occupy only a small part of its target; cover the query, not the reference.
+                std::vector<std::pair<uint32_t, uint32_t>> intervals;
+                intervals.reserve(group.hits.size());
+                for (const ComponentHit& hit : group.hits) {
+                    intervals.emplace_back(hit.raw_query_beg, hit.raw_query_end);
+                }
+                group.span = interval_union_length(std::move(intervals));
+                group.strong = query_len > 0 &&
+                    static_cast<double>(group.span) / query_len >= MIN_JACCARD_FOR_ALIGN_;
+                if (group.strong) pairs.push_back(std::move(group));
+                continue;
+            }
+
             const uint64_t shorter = std::min<uint64_t>(query_len, backbones[group.rid].sequence.size());
-            const uint64_t query_tolerance = component_end_fraction_ > 0.0
-                ? std::max<uint64_t>(10'000, query_len * component_end_fraction_) : 0;
-            const uint64_t ref_tolerance = component_end_fraction_ > 0.0
-                ? std::max<uint64_t>(10'000, ref_len * component_end_fraction_) : 0;
+            const uint64_t query_tolerance = component_end_fraction_ > 0.0 ? std::max<uint64_t>(10'000, query_len * component_end_fraction_) : 0;
+            const uint64_t ref_tolerance = component_end_fraction_ > 0.0 ? std::max<uint64_t>(10'000, ref_len * component_end_fraction_) : 0;
             const bool opposite_ends = component_end_fraction_ > 0.0 && (
                 (group.query_beg <= query_tolerance && ref_len - group.ref_end <= ref_tolerance) ||
                 (query_len - group.query_end <= query_tolerance && group.ref_beg <= ref_tolerance)
@@ -1458,6 +1493,29 @@ std::vector<std::vector<GfaCtgCollapser::ComponentHit>> GfaCtgCollapser::select_
         if (a.matches != b.matches) return a.matches > b.matches;
         return std::tie(a.qid, a.rid) < std::tie(b.qid, b.rid);
     });
+
+    if (place_queries) {
+        // Relocate only when every complete placement agrees on one target component.
+        std::vector<std::vector<ComponentHit>> selected(backbones.size());
+        std::vector<uint32_t> target(backbones.size(), UINT32_MAX);
+        std::vector<uint8_t> ambiguous(backbones.size(), 0);
+        for (PairGroup& pair : pairs) {
+            if (!pair.strong) continue;
+            const uint32_t component = backbones[pair.rid].component;
+            if (target[pair.qid] == UINT32_MAX) {
+                target[pair.qid] = component;
+                selected[pair.qid] = std::move(pair.hits);
+            } else if (target[pair.qid] != component) {
+                ambiguous[pair.qid] = 1;
+            }
+        }
+        for (uint32_t qid = 0; qid < selected.size(); ++qid) {
+            if (!ambiguous[qid]) continue;
+            warning_stream() << "  ! Ambiguous ms placement: " << backbones[qid].name << '\n';
+            selected[qid].clear();
+        }
+        return selected;
+    }
 
     for (const PairGroup& pair : pairs) {
         if (pair.strong && !pair.short_component) {
@@ -1520,10 +1578,8 @@ std::vector<std::vector<GfaCtgCollapser::ComponentHit>> GfaCtgCollapser::select_
         if (!pair.strong || !pair.short_component) continue;
         const bool short_query = short_group[pair.qid] != UINT32_MAX;
         const bool short_reference = short_group[pair.rid] != UINT32_MAX;
-        if (short_query &&
-            component_root(component_groups, short_group[pair.qid]) != component_root(component_groups, pair.rid)) continue;
-        if (short_reference &&
-            component_root(component_groups, short_group[pair.rid]) != component_root(component_groups, pair.qid)) continue;
+        if (short_query && component_root(component_groups, short_group[pair.qid]) != component_root(component_groups, pair.rid)) continue;
+        if (short_reference && component_root(component_groups, short_group[pair.rid]) != component_root(component_groups, pair.qid)) continue;
         merge_component_groups(component_groups, pair.qid, pair.rid);
     }
 
@@ -1564,8 +1620,7 @@ std::vector<std::vector<GfaCtgCollapser::ComponentHit>> GfaCtgCollapser::select_
         if (component_root(component_groups, pair.qid) != component_root(component_groups, pair.rid)) continue;
         const uint64_t pair_key = (static_cast<uint64_t>(pair.qid) << 32) | pair.rid;
         for (ComponentHit& hit : pair.hits) {
-            if (!interval_free(query_occupied, pair_key, hit.raw_query_beg, hit.raw_query_end) ||
-                !interval_free(ref_occupied, pair_key, hit.ref_beg, hit.ref_end)) continue;
+            if (!interval_free(query_occupied, pair_key, hit.raw_query_beg, hit.raw_query_end) || !interval_free(ref_occupied, pair_key, hit.ref_beg, hit.ref_end)) continue;
             add_interval(query_occupied, pair_key, hit.raw_query_beg, hit.raw_query_end);
             add_interval(ref_occupied, pair_key, hit.ref_beg, hit.ref_end);
             selected[pair.qid].push_back(std::move(hit));
@@ -1624,9 +1679,12 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     const std::vector<ComponentBackbone>& backbones,
     const std::vector<std::string>& sample_names,
     const std::string& prefix,
-    uint32_t short_contig_len
+    uint32_t short_contig_len,
+    const std::unordered_map<std::string, uint32_t>* query_components,
+    std::unordered_set<std::string>* placed_queries
 ) {
     if (backbones.empty()) return {};
+    if (placed_queries) placed_queries->clear();
 
     mm_idxopt_t index_options;
     mm_mapopt_t map_options;
@@ -1645,35 +1703,49 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     SAVE paf_all(prefix + ".all.paf");
     std::vector<BubbleAlignment> alignments;
 
-    uint32_t max_sample = 0;
-    for (const ComponentBackbone& backbone : backbones) max_sample = std::max(max_sample, backbone.sample);
-    std::vector<std::vector<const ComponentBackbone*>> samples(max_sample + 1);
-    for (const ComponentBackbone& backbone : backbones) samples[backbone.sample].push_back(&backbone);
-
     std::vector<uint32_t> component_groups(backbones.size());
     for (uint32_t i = 0; i < component_groups.size(); ++i) component_groups[i] = i;
     std::vector<std::vector<ComponentHit>> all_hits(backbones.size());
     uint64_t component_hits = 0;
-    log_stream() << "Aligning sample component backbones ...\n";
+    log_stream() << (query_components ? "Aligning misassembly contigs to component backbones ...\n" : "Aligning sample component backbones ...\n");
 
     struct MapResult {
         std::vector<ComponentHit> hits;
     };
 
-    uint64_t reference_n50 = 0;
-    const uint32_t reference_sample = best_reference_sample_(backbones, reference_n50);
-    const std::vector<const ComponentBackbone*>& references = samples[reference_sample];
+    std::vector<const ComponentBackbone*> references;
     std::vector<const ComponentBackbone*> queries;
-    queries.reserve(backbones.size() - references.size());
-    for (uint32_t sample = 0; sample <= max_sample; ++sample) {
-        if (sample != reference_sample) {
-            queries.insert(queries.end(), samples[sample].begin(), samples[sample].end());
+    if (query_components) {
+        for (const ComponentBackbone& backbone : backbones) {
+            if (query_components->contains(backbone.name)) queries.push_back(&backbone);
+            else references.push_back(&backbone);
         }
+        log_stream() << "  - Component backbones: " << references.size() << '\n';
+        log_stream() << "  - Misassembly queries: " << queries.size() << '\n';
+    } else {
+        uint32_t max_sample = 0;
+        for (const ComponentBackbone& backbone : backbones) max_sample = std::max(max_sample, backbone.sample);
+        std::vector<std::vector<const ComponentBackbone*>> samples(max_sample + 1);
+        for (const ComponentBackbone& backbone : backbones) samples[backbone.sample].push_back(&backbone);
+
+        uint64_t reference_n50 = 0;
+        const uint32_t reference_sample = best_reference_sample_(backbones, reference_n50);
+        references = samples[reference_sample];
+        queries.reserve(backbones.size() - references.size());
+        for (uint32_t sample = 0; sample <= max_sample; ++sample) {
+            if (sample != reference_sample) {
+                queries.insert(queries.end(), samples[sample].begin(), samples[sample].end());
+            }
+        }
+        std::ostringstream n50_text;
+        n50_text << std::fixed << std::setprecision(2) << static_cast<double>(reference_n50) / 1'000'000.0;
+        const std::string reference_name = reference_sample < sample_names.size() ? sample_names[reference_sample] : "sample" + std::to_string(reference_sample + 1);
+        log_stream() << "  - Reference sample: " << reference_name << " (component N50: " << n50_text.str() << " Mb)\n";
     }
-    std::ostringstream n50_text;
-    n50_text << std::fixed << std::setprecision(2) << static_cast<double>(reference_n50) / 1'000'000.0;
-    const std::string reference_name = reference_sample < sample_names.size() ? sample_names[reference_sample] : "sample" + std::to_string(reference_sample + 1);
-    log_stream() << "  - Reference sample: " << reference_name << " (component N50: " << n50_text.str() << " Mb)\n";
+    if (references.empty() || queries.empty()) {
+        log_stream() << "  - Component alignments: 0\n  - Node alignments: 0\n\n";
+        return {};
+    }
 
     std::vector<const char*> ref_sequences, ref_names;
     ref_sequences.reserve(references.size());
@@ -1704,7 +1776,7 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     ProgressTracker progress(queries.size());
 
     for (const ComponentBackbone* query : queries) {
-        futures.push_back({query, pool.submit([this, index, round_options, &references, query, &progress]() mutable {
+        futures.push_back({query, pool.submit([this, index, round_options, &references, query, query_components, &progress]() mutable {
                 MapResult result;
                 mm_tbuf_t* buffer = mm_tbuf_init();
                 int count = 0;
@@ -1737,6 +1809,7 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
                     if (candidate.ops.empty() || CIGAR::match_ratio(candidate.cigar) < MIN_MATCH_RATIO_) continue;  // filter based on match ratio
 
                     const ComponentBackbone& ref = *references[candidate.rid];
+                    if (query_components && ref.component == query->component) continue;
                     const uint32_t span = std::max(
                         candidate.ref_end - candidate.ref_beg,
                         candidate.query_end - candidate.query_beg
@@ -1797,7 +1870,8 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     }
 
     std::vector<std::vector<ComponentHit>> selected = select_component_hits_(
-        std::move(all_hits), backbones, short_contig_len, component_groups
+        std::move(all_hits), backbones, short_contig_len,
+        component_groups, query_components != nullptr
     );
     for (uint32_t qid = 0; qid < selected.size(); ++qid) {
         const ComponentBackbone& query = backbones[qid];
@@ -1806,9 +1880,11 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
             std::vector<BubbleAlignment> split = split_component_alignment_(
                 ref, query, hit.reverse, hit.ref_beg, hit.query_beg, hit.mapq, hit.ops
             );
+            const bool usable = !split.empty();
             alignments.insert(
                 alignments.end(), std::make_move_iterator(split.begin()), std::make_move_iterator(split.end())
             );
+            if (usable && placed_queries) placed_queries->insert(query.name);
             ++component_hits;
             std::ostringstream line;
             line << query.name << '\t' << query.sequence.size() << '\t'
@@ -1823,6 +1899,99 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     log_stream() << "  - Component alignments: " << component_hits << "\n";
     log_stream() << "  - Node alignments: " << alignments.size() << "\n\n";
     return alignments;
+}
+
+void GfaCtgCollapser::apply_component_alignments_(const std::string& prefix) {
+    initialize_cuts_();
+    dedup_aligns_();
+    const auto groups = build_align_groups_();
+    build_propagate_prune_cuts_(groups);
+    build_rulemap_(groups);
+    SegReplace::Expander expander = build_SegReplace_();
+    GfaPathCycleGuard(*this).filter_path_rules(expander);
+    expander.save_map(prefix + ".collapse.map");
+    expand_and_rewire_edges_(expander);
+    rewrite_paths_(expander);
+    remove_unused_nodes_();
+    append_component_paths_();
+}
+
+std::unordered_set<std::string> GfaCtgCollapser::collapse_misassemblies(
+    const std::unordered_map<std::string, uint32_t>& source_components,
+    const std::string& prefix
+) {
+    bool have_component_paths = false;
+    for (const GfaPath& path : paths_) {
+        if (is_global_component_path(path.name)) {
+            have_component_paths = true;
+            break;
+        }
+    }
+    if (!have_component_paths) rebuild_component_paths();
+
+    const std::vector<uint32_t>& component_ids = get_nodes_connectivity_index();
+    std::unordered_map<uint32_t, std::string> component_paths;
+    for (const GfaPath& path : paths_) {
+        if (!is_global_component_path(path.name) || path.segments.empty()) continue;
+        const uint32_t sid = static_cast<uint32_t>(path.segments.front().node_id);
+        if (sid < component_ids.size()) component_paths[component_ids[sid]] = path.name;
+    }
+
+    std::unordered_map<std::string, uint32_t> query_components;
+    std::unordered_map<std::string, std::vector<std::string>> query_members;
+    for (const auto& source : source_components) {
+        const auto path = std::find_if(paths_.begin(), paths_.end(), [&](const GfaPath& item) {
+            return item.name == source.first;
+        });
+        if (path == paths_.end() || path->segments.empty()) continue;
+        const uint32_t sid = static_cast<uint32_t>(path->segments.front().node_id);
+        if (sid >= component_ids.size()) continue;
+        const auto component = component_paths.find(component_ids[sid]);
+        if (component == component_paths.end()) continue;
+        query_components[component->second] = source.second;
+        query_members[component->second].push_back(source.first);
+    }
+
+    std::unordered_set<std::string> placements;
+    const std::vector<ComponentBackbone> backbones = component_backbones_({}, &query_components);
+    bubble_aligns_ = align_component_backbones_(
+        backbones, {}, prefix, 0, &query_components, &placements
+    );
+
+    // Existing component paths were mapping references; rebuild them from rewritten sample paths.
+    paths_.erase(
+        std::remove_if(paths_.begin(), paths_.end(), [](const GfaPath& path) {
+            return is_component_path(path.name);
+        }),
+        paths_.end()
+    );
+    if (bubble_aligns_.empty()) {
+        append_component_paths_();
+        return {};
+    }
+    apply_component_alignments_(prefix);
+
+    std::unordered_set<std::string> integrated;
+    for (const std::string& component : placements) {
+        for (const std::string& name : query_members[component]) {
+            const auto path = std::find_if(paths_.begin(), paths_.end(), [&](const GfaPath& item) {
+                return item.name == name;
+            });
+            if (path == paths_.end()) continue;
+            for (const PathSegment& segment : path->segments) {
+                std::vector<std::string> roots;
+                gfaName::collect_roots_from_name(nodes_[segment.node_id].name, roots);
+                if (std::any_of(roots.begin(), roots.end(), [&](const std::string& root) {
+                    return root != name;
+                })) {
+                    integrated.insert(name);
+                    break;
+                }
+            }
+        }
+    }
+    log_stream() << "  - Misassembly contigs integrated: " << integrated.size() << "\n\n";
+    return integrated;
 }
 
 void GfaCtgCollapser::collapse_backbone_samples_(
@@ -1848,18 +2017,7 @@ void GfaCtgCollapser::collapse_backbone_samples_(
         return;
     }
 
-    initialize_cuts_();
-    dedup_aligns_();
-    const auto groups = build_align_groups_();
-    build_propagate_prune_cuts_(groups);
-    build_rulemap_(groups);
-    SegReplace::Expander expander = build_SegReplace_();
-    GfaPathCycleGuard(*this).filter_path_rules(expander);
-    expander.save_map(file_prefix + ".collapse.map");
-    expand_and_rewire_edges_(expander);
-    rewrite_paths_(expander);
-    remove_unused_nodes_();
-    append_component_paths_();
+    apply_component_alignments_(file_prefix);
     save_to_disk(file_prefix + ".collapse.gfa", true, false, true, command_line);
     save_to_disk(file_prefix + ".collapse.noseq.gfa", true, false, false, command_line);
 }

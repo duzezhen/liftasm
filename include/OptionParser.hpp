@@ -297,7 +297,7 @@ struct GapfillOpts {
     double boundary_identity = 0.9;
     double boundary_coverage = 0.8;
     double max_overlap = 0.1;
-    double min_probability = 0.5;
+    double min_confidence = 0.5;
 
     // misassembly detection
     uint64_t misassembly_len = 10'000'000;

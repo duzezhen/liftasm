@@ -864,7 +864,7 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--path_diff must be in [0,1]"
             );
             ensure(
-                cfg.gapfill.phase_path_len > 0, 
+                cfg.gapfill.phase_path_len > 0,
                 "--phase_len must be > 0"
             );
             ensure(
@@ -904,8 +904,8 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--max_overlap must be in [0,1]"
             );
             ensure(
-                cfg.gapfill.min_probability >= 0.5 && cfg.gapfill.min_probability <= 1.0,
-                "--min_prob must be in [0.5,1]"
+                cfg.gapfill.min_confidence >= 0.0 && cfg.gapfill.min_confidence <= 1.0,
+                "--min_conf must be in [0,1]"
             );
             ensure(
                 cfg.gapfill.misassembly_similarity >= 0.0 && cfg.gapfill.misassembly_similarity <= 1.0,
@@ -3616,7 +3616,7 @@ void help_gapfill(char** argv) {
     hp.blank();
 
     hp.section("Phase options");
-    hp.line("--phase_len", "INT", "maximum nodes in a bubble branch used for phase [" + format_size_arg_(GapfillOpts().phase_path_len) + "]");
+    hp.line("--phase_len", "INT", "use a bubble only when all internal paths are at most this many bp [" + std::to_string(GapfillOpts().phase_path_len) + "]");
     hp.line("--phase_skip", "INT", "replace this much unreliable sequence at each contig end [" + format_size_arg_(GapfillOpts().phase_skip) + "]");
     hp.line("--phase_win", "INT", "local phase window and extension step [" + format_size_arg_(GapfillOpts().phase_win) + "]");
     hp.line("--phase_min_bp", "INT", "minimum bubble bp required from both paths [" + format_size_arg_(GapfillOpts().phase_min_bp) + "]");
@@ -3629,10 +3629,10 @@ void help_gapfill(char** argv) {
     hp.line("--max_gap", "INT", "largest graph gap that may be filled [" + format_size_arg_(GapfillOpts().max_gap) + "]");
     hp.line("--max_overlap", "FLOAT", "largest allowed overlap between the two target contigs [" + format_double_(GapfillOpts().max_overlap) + "]");
     hp.line("--min_overlap", "INT", "fill contig must overlap each target contig by at least this many bp [" + format_size_arg_(GapfillOpts().min_overlap) + "]");
-    hp.line("--min_similarity", "FLOAT", "minimum shared-node similarity across an overlap; a matching local boundary may rescue it [" + format_double_(GapfillOpts().min_similarity) + "]");
+    hp.line("--min_similarity", "FLOAT", "minimum minimizer similarity in each local gap-boundary window [" + format_double_(GapfillOpts().min_similarity) + "]");
     hp.line("--boundary_identity", "FLOAT", "minimum identity for using an exact gap boundary [" + format_double_(GapfillOpts().boundary_identity) + "]");
     hp.line("--boundary_coverage", "FLOAT", "minimum query coverage for using an exact gap boundary [" + format_double_(GapfillOpts().boundary_coverage) + "]");
-    hp.line("--min_prob", "FLOAT", "required sample support unless the other haplotype spans the gap [" + format_double_(GapfillOpts().min_probability) + "]");
+    hp.line("--min_conf", "FLOAT", "minimum combined sample, phase, and alignment confidence [" + format_double_(GapfillOpts().min_confidence) + "]");
 
     hp.blank();
 
@@ -3694,7 +3694,7 @@ AppConfig main_gapfill(int argc, char** argv) {
         {"min_similarity",         required_argument, nullptr, 5005},
         {"boundary_identity",      required_argument, nullptr, 5006},
         {"boundary_coverage",      required_argument, nullptr, 5007},
-        {"min_prob",               required_argument, nullptr, 5008},
+        {"min_conf",               required_argument, nullptr, 5008},
 
         {"misassembly_len",        required_argument, nullptr, 6001},
         {"misassembly_similarity", required_argument, nullptr, 6002},
@@ -3827,7 +3827,7 @@ AppConfig main_gapfill(int argc, char** argv) {
                 break;
             }
             case 5008: {
-                cfg.gapfill.min_probability = std::stod(optarg);
+                cfg.gapfill.min_confidence = std::stod(optarg);
                 break;
             }
 
