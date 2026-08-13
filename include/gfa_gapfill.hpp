@@ -44,19 +44,19 @@ public:
     };
 
     struct Boundary {
-        uint32_t target_pos{0};          // Trusted shared-node index on the target.
-        uint32_t bridge_pos{0};          // Matching shared-node index on the bridge.
-        uint32_t junction_target_pos{0}; // Target junction before skipping its unreliable end.
-        uint32_t junction_bridge_pos{0}; // Bridge node paired with the original junction.
-        uint64_t target_cut_bp{0};       // Final target cut, initially a node-boundary fallback.
-        uint64_t bridge_cut_bp{0};       // Final bridge cut, initially a node-boundary fallback.
-        uint64_t target_begin{0}, target_end{0}; // Target minimap2 interval.
-        uint64_t bridge_begin{0}, bridge_end{0}; // Bridge minimap2 interval.
-        PhaseSupport phase;              // Local bubble-path phase evidence.
-        double minimizer{-1.0};          // Local target/bridge minimizer Jaccard.
-        double identity{-1.0};           // Boundary alignment identity; -1 if unavailable.
-        double coverage{-1.0};           // Boundary alignment coverage; -1 if unavailable.
-        bool alignable{false};           // Both cached alignment intervals are non-empty.
+        uint32_t target_pos{0}; // Shared node nearest the gap after skipping the phase_skip_bp end region, will be used for sequence extract and gap fill.
+        uint32_t bridge_pos{0}; // Same selected shared node in the bridge, will be used for sequence extract and gap fill.
+        uint32_t junction_target_pos{0}; // Outer edge node of the shared part in left/right contig, will be used for misassembly check.
+        uint32_t junction_bridge_pos{0}; // Matching outer edge node of the shared part in bridge, will be used for misassembly check.
+        uint64_t target_cut_bp{0}; // Base coordinate where left/right contig is cut.
+        uint64_t bridge_cut_bp{0}; // Base coordinate where bridge is cut on this side.
+        uint64_t target_begin{0}, target_end{0}; // Sequence range taken from left/right contig for alignment.
+        uint64_t bridge_begin{0}, bridge_end{0}; // Sequence range taken from bridge for alignment.
+        PhaseSupport phase; // Phase support around this boundary.
+        double minimizer{-1.0}; // Quick sequence similarity around this boundary.
+        double identity{-1.0}; // Matching rate from local alignment.
+        double coverage{-1.0}; // Fraction of the target range covered by alignment.
+        bool alignable{false}; // Both sequence ranges are available for alignment.
     };
 
     explicit GfaGapfillBoundary(const GfaGapfill& gapfill) : gapfill_(gapfill) {}
@@ -67,7 +67,7 @@ public:
     bool spans(uint32_t left, uint32_t right, uint32_t bridge) const;
     // Inspect one known overlap boundary for debug output.
     Boundary inspect(uint32_t target, uint32_t target_pos, uint32_t bridge, uint32_t bridge_pos, bool before, bool expand_minimizer = false) const;
-    // Refine cached node cuts to base-pair cuts when minimap2 passes both filters.
+    // Refine cached node cuts to base-pair cuts when mm2 passes both filters.
     bool refine(uint32_t left, uint32_t right, uint32_t bridge, Boundary& left_boundary, Boundary& right_boundary) const;
 
 private:
@@ -75,8 +75,8 @@ private:
 
     // Anchor discovery and graph-order validation.
     bool find_anchors_(uint32_t left, uint32_t right, uint32_t bridge, Boundary& left_boundary, Boundary& right_boundary) const;
-    bool expand_anchors_(uint32_t left, uint32_t right, uint32_t bridge, const std::vector<std::pair<uint32_t, uint32_t>>& left_matches, const std::vector<std::pair<uint32_t, uint32_t>>& right_matches, Boundary& left_boundary, Boundary& right_boundary) const;
-    bool path_unique_(uint32_t left, uint32_t right, uint32_t bridge, const Boundary& left_boundary, const Boundary& right_boundary) const;
+    bool adjust_boundaries_(uint32_t left, uint32_t right, uint32_t bridge, const std::vector<std::pair<uint32_t, uint32_t>>& left_matches, const std::vector<std::pair<uint32_t, uint32_t>>& right_matches, Boundary& left_boundary, Boundary& right_boundary) const;
+    bool is_cycle_free_(uint32_t left, uint32_t right, uint32_t bridge, const Boundary& left_boundary, const Boundary& right_boundary) const;
 
     // Local phase and minimizer evidence inside trusted boundary sequence.
     uint64_t phase_available_(uint32_t fragment, uint32_t pos, bool before) const;
@@ -141,16 +141,9 @@ public:
         double boundary_coverage
     );
 
-    // Run candidate discovery, refinement, selection, relocation and chain construction.
     size_t gapfill(const std::vector<GfaBubble::Bubble>& bubbles);
-    // Detect suspect terminal sequence and split each interval into one standalone ms segment/path.
     std::vector<MisassemblyContig> prepare_misassemblies(const std::vector<GfaBubble::Bubble>& bubbles);
-    // Restore first-pass relocation metadata after the recollapsed graph is loaded.
-    void set_misassemblies(
-        const std::vector<MisassemblyContig>& records,
-        const std::unordered_set<std::string>& relocated
-    );
-    // Write per-sample, primary and low-quality GFA files plus TSV reports.
+    void set_misassemblies(const std::vector<MisassemblyContig>& records, const std::unordered_set<std::string>& relocated);
     void save_samples(const std::string& prefix, const std::string& command_line);
 
 private:
@@ -274,19 +267,20 @@ private:
 
     // Final sample contig assembled from target fragments and bridge intervals.
     struct Chain {
+        // One sequence piece copied from a fragment or a bridge.
         struct Part {
-            uint32_t fragment{UINT32_MAX};
-            uint64_t begin{0}, end{0};
-            bool filled{false};
+            uint32_t fragment{UINT32_MAX}; // source fragment
+            uint64_t begin{0}, end{0}; // bp range on the fragment
+            bool filled{false}; // copied from a gap bridge
         };
-        std::string sample;
-        uint8_t hap{0};
-        uint32_t component{UINT32_MAX};
-        std::vector<uint32_t> vertices;
-        std::vector<uint32_t> source_fragments;
-        std::vector<Part> parts;
-        std::vector<Candidate> gaps;
-        std::array<uint64_t, 2> hap_bp{0, 0};
+        std::string sample; // sample name
+        uint8_t hap{0}; // assigned haplotype
+        uint32_t component{UINT32_MAX}; // graph component
+        std::vector<uint32_t> vertices; // assembled graph path
+        std::vector<uint32_t> source_fragments; // fragments used by this chain
+        std::vector<Part> parts; // bp pieces used for output
+        std::vector<Candidate> gaps; // gap connections in this chain
+        std::array<uint64_t, 2> hap_bp{0, 0}; // bp votes from hap1/hap2 fragments
     };
     using ChainRefs = std::array<std::vector<const Chain*>, 2>;
     struct PrimarySelection {
@@ -308,9 +302,10 @@ private:
         double boundary_coverage{0.8};
         std::string preset{"asm5"};
     } mm2_;
+
     std::vector<uint8_t> bubble_nodes_;
     std::vector<Fragment> fragments_;
-    std::map<std::string, std::array<std::vector<Chain>, 2>> sample_chains_;
+    std::map<std::string, std::array<std::vector<Chain>, 2>> sample_chains_;  // sample -> haplotype -> chains
     std::vector<GapRecord> records_;
     std::vector<RelocationRecord> relocations_;
     std::vector<MisassemblyContig> misassemblies_;
@@ -319,10 +314,10 @@ private:
     std::vector<Candidate> prepared_candidates_, prepared_selected_;
     bool candidates_prepared_{false};
 
-    // Pipeline.
+    // ================================================= Clear state =================================================
     void clear_state_();
 
-    // Contig preparation and graph layout.
+    // ================================================= Contig preparation and graph layout =================================================
     void index_bubble_nodes_(const std::vector<GfaBubble::Bubble>& bubbles);
     void build_fragments_();
     void build_graph_order_();
@@ -330,42 +325,47 @@ private:
     void rebuild_fragment_index_(Fragment& fragment) const;
     static void place_contigs_(std::vector<LayoutContig>& contigs);
 
-    // Shared-node candidate evidence.
+    // ================================================= Shared-node candidate evidence =================================================
     std::vector<Candidate> build_candidates_(bool include_long_gaps = false) const;
     CandidateBatch build_sample_candidates_(const std::vector<uint32_t>& sample_fragments, const OverlapIndex& overlaps, const std::vector<std::string>& group_keys, bool include_long_gaps) const;
     bool ordered_pair_(const Fragment& left, const Fragment& right, bool include_long_gaps) const;
     OverlapSupport overlap_support_(const Fragment& a, const Fragment& b, const PathOverlap& overlap) const;
     bool homolog_spans_(uint32_t left, uint32_t right, const OverlapIndex& overlaps) const;
-    void update_sample_support_(std::vector<Candidate>& evidence) const;
     static double raw_phase_score_(const Candidate& candidate);
+    void update_sample_support_(std::vector<Candidate>& evidence) const;
 
-    // Refine left/bridge and bridge/right cut positions with local alignment.
-    void refine_boundaries_(std::vector<Candidate>& selected, std::vector<Candidate>& candidates) const;
-    static void update_confidence_(Candidate& candidate);
-
-    // Candidate selection.
+    // ================================================= Candidate selection =================================================
     std::vector<Candidate> select_candidates_(std::vector<Candidate>& candidates);
     static bool candidate_better_(const Candidate& a, const Candidate& b);
     static bool connection_better_(const Candidate& a, const Candidate& b);
 
-    // Misassembly detection and relocation.
+    // ================================================= Refine left/bridge and bridge/right cut positions with local alignment =================================================
+    void refine_boundaries_(std::vector<Candidate>& selected, std::vector<Candidate>& candidates) const;
+    static void update_confidence_(Candidate& candidate);
+
+    // ================================================= Misassembly detection and relocation =================================================
     void check_unplaced_sequence_(std::vector<Candidate>& candidates) const;
-    void check_unplaced_candidate_(Candidate& candidate, bool left, bool right) const;
     std::vector<MisassemblyContig> split_misassemblies_(const std::vector<Candidate>& candidates);
     void mark_used_relocations_(const std::vector<Candidate>& selected);
 
-    // Deduplication
+    // ================================================= Assign haplotypes =================================================
+    void build_sample_chains_(const std::vector<Candidate>& selected);
+    Chain build_chain_(uint32_t start, const std::vector<int32_t>& incoming, const std::vector<int32_t>& outgoing, const std::vector<Candidate>& selected) const;
+
+    // ================================================= Deduplication =================================================
     void mark_redundant_fragments_(const std::vector<Candidate>& selected);
     double mm2_similarity_(const std::string& reference, const std::string& query) const;
 
-    // Sequence, chain, and output helpers.
-    Chain build_chain_(uint32_t start, const std::vector<int32_t>& incoming, const std::vector<int32_t>& outgoing, const std::vector<Candidate>& selected) const;
-    void build_sample_chains_(const std::vector<Candidate>& selected);
-    void print_summary_(size_t selected) const;
-    void write_html_(const std::vector<Candidate>& candidates) const;
+    // ================================================= Select the primary chains =================================================
     PrimarySelection select_primary_chains_() const;
     ChainRefs unmatched_small_primary_chains_(const std::map<uint32_t, ChainRefs>& components, const std::unordered_map<const Chain*, uint64_t>& chain_lengths) const;
+
+    // ================================================= Sequence, chain, and output helpers =================================================
+    void print_summary_(size_t selected) const;
+    void write_html_(const std::vector<Candidate>& candidates) const;
     void save_haplotype_(const std::string& label, uint8_t hap, const std::vector<const Chain*>& chains, const std::string& prefix, const std::string& command_line, bool primary = false, const char* primary_kind = "pr");
+    
+    // ================================================= helpers =================================================
     std::string fragment_sequence_(const Fragment& fragment, uint32_t begin, uint32_t end) const;
     std::string fragment_subsequence_(const Fragment& fragment, uint64_t begin, uint64_t end) const;
     uint64_t chain_length_(const Chain& chain) const;

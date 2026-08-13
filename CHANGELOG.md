@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.3-r21 (2026-08-12)
+
+### Fixed
+
+- Improved overlapping-contig cleanup when some contigs covered by filled gaps were not removed.
+
 ## v0.1.3-r20 (2026-08-11)
 
 ### Improved
