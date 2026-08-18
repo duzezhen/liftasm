@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.3-r22 (2026-08-16)
+
+### Improved
+
+- Improved gap-fill boundary alignment, overlap splicing, and coordinate reporting.
+
 ## v0.1.3-r21 (2026-08-12)
 
 ### Fixed

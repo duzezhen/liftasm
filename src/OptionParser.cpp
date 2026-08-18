@@ -892,10 +892,6 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--min_similarity must be in [0,1]"
             );
             ensure(
-                cfg.gapfill.boundary_identity >= 0.0 && cfg.gapfill.boundary_identity <= 1.0,
-                "--boundary_identity must be in [0,1]"
-            );
-            ensure(
                 cfg.gapfill.boundary_coverage >= 0.0 && cfg.gapfill.boundary_coverage <= 1.0,
                 "--boundary_coverage must be in [0,1]"
             );
@@ -3617,21 +3613,20 @@ void help_gapfill(char** argv) {
 
     hp.section("Phase options");
     hp.line("--phase_len", "INT", "use a bubble only when all internal paths are at most this many bp [" + std::to_string(GapfillOpts().phase_path_len) + "]");
-    hp.line("--phase_skip", "INT", "replace this much unreliable sequence at each contig end [" + format_size_arg_(GapfillOpts().phase_skip) + "]");
     hp.line("--phase_win", "INT", "local phase window and extension step [" + format_size_arg_(GapfillOpts().phase_win) + "]");
     hp.line("--phase_min_bp", "INT", "minimum bubble bp required from both paths [" + format_size_arg_(GapfillOpts().phase_min_bp) + "]");
-    hp.note(" * Phase evidence extends inward from the trusted contig end until enough bubble sequence is found");
+    hp.note(" * Phase evidence extends inward from the --end_skip boundary until enough bubble sequence is found");
     
     hp.blank();
 
     hp.section("Gap options");
+    hp.line("--end_skip", "INT", "skip this much terminal sequence when choosing trusted graph anchors [" + format_size_arg_(GapfillOpts().end_skip) + "]");
     hp.line("--min_contig", "INT", "do not use contigs shorter than this [" + format_size_arg_(GapfillOpts().min_contig) + "]");
     hp.line("--max_gap", "INT", "largest graph gap that may be filled [" + format_size_arg_(GapfillOpts().max_gap) + "]");
     hp.line("--max_overlap", "FLOAT", "largest allowed overlap between the two target contigs [" + format_double_(GapfillOpts().max_overlap) + "]");
     hp.line("--min_overlap", "INT", "fill contig must overlap each target contig by at least this many bp [" + format_size_arg_(GapfillOpts().min_overlap) + "]");
     hp.line("--min_similarity", "FLOAT", "minimum minimizer similarity in each local gap-boundary window [" + format_double_(GapfillOpts().min_similarity) + "]");
-    hp.line("--boundary_identity", "FLOAT", "minimum identity for using an exact gap boundary [" + format_double_(GapfillOpts().boundary_identity) + "]");
-    hp.line("--boundary_coverage", "FLOAT", "minimum query coverage for using an exact gap boundary [" + format_double_(GapfillOpts().boundary_coverage) + "]");
+    hp.line("--boundary_coverage", "FLOAT", "minimum chained-hit coverage for using an exact gap boundary [" + format_double_(GapfillOpts().boundary_coverage) + "]");
     hp.line("--min_conf", "FLOAT", "minimum combined sample, phase, and alignment confidence [" + format_double_(GapfillOpts().min_confidence) + "]");
 
     hp.blank();
@@ -3683,16 +3678,15 @@ AppConfig main_gapfill(int argc, char** argv) {
         {"stall_rounds",           required_argument, nullptr, 3005},
 
         {"phase_len",              required_argument, nullptr, 4001},
-        {"phase_skip",             required_argument, nullptr, 4002},
-        {"phase_win",              required_argument, nullptr, 4003},
-        {"phase_min_bp",           required_argument, nullptr, 4004},
+        {"phase_win",              required_argument, nullptr, 4002},
+        {"phase_min_bp",           required_argument, nullptr, 4003},
 
-        {"min_contig",             required_argument, nullptr, 5001},
-        {"max_gap",                required_argument, nullptr, 5002},
-        {"max_overlap",            required_argument, nullptr, 5003},
-        {"min_overlap",            required_argument, nullptr, 5004},
-        {"min_similarity",         required_argument, nullptr, 5005},
-        {"boundary_identity",      required_argument, nullptr, 5006},
+        {"end_skip",               required_argument, nullptr, 5001},
+        {"min_contig",             required_argument, nullptr, 5002},
+        {"max_gap",                required_argument, nullptr, 5003},
+        {"max_overlap",            required_argument, nullptr, 5004},
+        {"min_overlap",            required_argument, nullptr, 5005},
+        {"min_similarity",         required_argument, nullptr, 5006},
         {"boundary_coverage",      required_argument, nullptr, 5007},
         {"min_conf",               required_argument, nullptr, 5008},
 
@@ -3786,40 +3780,36 @@ AppConfig main_gapfill(int argc, char** argv) {
                 break;
             }
             case 4002: {
-                cfg.gapfill.phase_skip = parse_size_arg_u64_(optarg, argc, argv, optind, "--phase_skip");
-                break;
-            }
-            case 4003: {
                 cfg.gapfill.phase_win = parse_size_arg_u64_(optarg, argc, argv, optind, "--phase_win");
                 break;
             }
-            case 4004: {
+            case 4003: {
                 cfg.gapfill.phase_min_bp = parse_size_arg_u64_(optarg, argc, argv, optind, "--phase_min_bp");
                 break;
             }
 
             case 5001: {
-                cfg.gapfill.min_contig = parse_size_arg_u64_(optarg, argc, argv, optind, "--min_contig");
+                cfg.gapfill.end_skip = parse_size_arg_u64_(optarg, argc, argv, optind, "--end_skip");
                 break;
             }
             case 5002: {
-                cfg.gapfill.max_gap = parse_size_arg_u64_(optarg, argc, argv, optind, "--max_gap");
+                cfg.gapfill.min_contig = parse_size_arg_u64_(optarg, argc, argv, optind, "--min_contig");
                 break;
             }
             case 5003: {
-                cfg.gapfill.max_overlap = std::stod(optarg);
+                cfg.gapfill.max_gap = parse_size_arg_u64_(optarg, argc, argv, optind, "--max_gap");
                 break;
             }
             case 5004: {
-                cfg.gapfill.min_overlap = parse_size_arg_u64_(optarg, argc, argv, optind, "--min_overlap");
+                cfg.gapfill.max_overlap = std::stod(optarg);
                 break;
             }
             case 5005: {
-                cfg.gapfill.min_similarity = std::stod(optarg);
+                cfg.gapfill.min_overlap = parse_size_arg_u64_(optarg, argc, argv, optind, "--min_overlap");
                 break;
             }
             case 5006: {
-                cfg.gapfill.boundary_identity = std::stod(optarg);
+                cfg.gapfill.min_similarity = std::stod(optarg);
                 break;
             }
             case 5007: {

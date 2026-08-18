@@ -49,7 +49,7 @@ void GfaGapfill::write_html_(const std::vector<Candidate>& candidates) const {
         if (!fragment.eligible) continue;
         contigs.push_back({
             i, fragment.component, fragment.hap, fragment.length,
-            fragment.layout_start, false,
+            fragment.layout_start, fragment.reverse,
             paths_[fragment.path_id].name, fragment.sample,
             nodes_[Vertex::get_segment_id(fragment.vertices.front())].name +
                 (Vertex::get_is_reverse(fragment.vertices.front()) ? "-" : "+"),
@@ -205,13 +205,14 @@ function visible(e){const status=filter.value==='all'||(filter.value==='keep'&&e
 function fmt(n){return n.toLocaleString()}
 function val(n){return n<0?'NA':n.toFixed(2)}
 function esc(s){return s.replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function sourceInterval(n,begin,end){if(n.rv){const old=begin;begin=n.b-end;end=n.b-old}return esc(n.n)+'@'+fmt(begin)+'-'+fmt(end)+(n.rv?'-':'+')}
 function tipText(e){return byId.get(e.l).n+' → '+byId.get(e.r).n+'\nvia '+byId.get(e.b).n+'\nphase '+val(e.pl)+' / '+val(e.prh)+' · support '+e.ss+'/'+e.sp+' · confidence '+e.cf.toFixed(2)}
 function bindTip(mark,e){mark.onpointermove=function(event){tooltip.style.display='block';tooltip.style.left=Math.min(innerWidth-430,event.clientX+14)+'px';tooltip.style.top=Math.min(innerHeight-80,event.clientY+14)+'px';tooltip.textContent=tipText(e)};mark.onpointerleave=function(){tooltip.style.display='none'}}
-function describe(e){const l=byId.get(e.l),r=byId.get(e.r),b=byId.get(e.b);return '<div><b>Status:</b> '+esc(e.st)+' &nbsp; <b>Component:</b> '+e.c+'</div><div class="coordinates"><b>Left:</b> '+esc(l.n)+':0-'+fmt(e.lp)+'<br><b>Right:</b> '+esc(r.n)+':'+fmt(e.rp)+'-'+fmt(r.b)+'<br><b>Bridge:</b> '+esc(b.n)+':'+fmt(e.bl)+'-'+fmt(e.br)+'</div><table class="evidence"><thead><tr><th>Boundary</th><th>Phase</th><th>Bubble bp</th><th>Minimizer</th><th>Identity</th><th>Coverage</th></tr></thead><tbody><tr><th>Left</th><td>'+val(e.pl)+'</td><td>'+fmt(e.plt)+'/'+fmt(e.plb)+'</td><td>'+val(e.ml)+'</td><td>'+val(e.il)+'</td><td>'+val(e.cl)+'</td></tr><tr><th>Right</th><td>'+val(e.prh)+'</td><td>'+fmt(e.prt)+'/'+fmt(e.prb)+'</td><td>'+val(e.mr)+'</td><td>'+val(e.ir)+'</td><td>'+val(e.cr)+'</td></tr></tbody></table><div class="support">Other hap spans gap: '+(e.hs?'yes':'no')+'<br>Sample support: '+e.ss+' / '+e.sp+'<br>Evidence: sample '+e.sscore.toFixed(2)+' · phase '+e.qscore.toFixed(2)+' · alignment '+e.ascore.toFixed(2)+'<br><b>Confidence: '+e.cf.toFixed(2)+'</b></div>'}
+function describe(e){const l=byId.get(e.l),r=byId.get(e.r),b=byId.get(e.b);return '<div><b>Status:</b> '+esc(e.st)+' &nbsp; <b>Component:</b> '+e.c+'</div><div class="coordinates"><b>Left:</b> '+sourceInterval(l,0,e.lp)+'<br><b>Right:</b> '+sourceInterval(r,e.rp,r.b)+'<br><b>Bridge:</b> '+sourceInterval(b,e.bl,e.br)+'</div><table class="evidence"><thead><tr><th>Boundary</th><th>Phase</th><th>Bubble bp</th><th>Minimizer</th><th>Identity</th><th>Coverage</th></tr></thead><tbody><tr><th>Left</th><td>'+val(e.pl)+'</td><td>'+fmt(e.plt)+'/'+fmt(e.plb)+'</td><td>'+val(e.ml)+'</td><td>'+val(e.il)+'</td><td>'+val(e.cl)+'</td></tr><tr><th>Right</th><td>'+val(e.prh)+'</td><td>'+fmt(e.prt)+'/'+fmt(e.prb)+'</td><td>'+val(e.mr)+'</td><td>'+val(e.ir)+'</td><td>'+val(e.cr)+'</td></tr></tbody></table><div class="support">Other hap spans gap: '+(e.hs?'yes':'no')+'<br>Sample support: '+e.ss+' / '+e.sp+'<br>Evidence: sample '+e.sscore.toFixed(2)+' · phase '+e.qscore.toFixed(2)+' · alignment '+e.ascore.toFixed(2)+'<br><b>Confidence: '+e.cf.toFixed(2)+'</b></div>'}
 let selectedEdge=null;
 function centerEdge(id){const marks=svg.querySelectorAll('[data-e="'+id+'"]');let left=Infinity,right=-Infinity,top=Infinity,bottom=-Infinity;marks.forEach(function(mark){const box=mark.getBBox();left=Math.min(left,box.x);right=Math.max(right,box.x+box.width);top=Math.min(top,box.y);bottom=Math.max(bottom,box.y+box.height)});if(left!==Infinity)view.scrollTo({left:Math.max(0,(left+right-view.clientWidth)/2),top:Math.max(0,(top+bottom-view.clientHeight)/2),behavior:'smooth'})}
 function selectEdge(id){selectedEdge=selectedEdge===id?null:id;render();if(selectedEdge!==null)requestAnimationFrame(function(){centerEdge(id)})}
-function anchorPosition(n,offset){return n.x+(n.rv?n.b-offset:offset)}
+function anchorPosition(n,offset){return n.x+offset}
 function anchorX(n,offset,scale,left,origin){return left+(anchorPosition(n,offset)-origin)*scale}
 function render(){
   const cid=Number(comp.value),allNodes=N.filter(function(n){return n.c===cid}),allEdges=E.filter(function(e){return e.c===cid&&visible(e)}),focus=selectedEdge===null?null:E[selectedEdge];

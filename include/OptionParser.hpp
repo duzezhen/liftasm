@@ -285,18 +285,17 @@ struct GapfillOpts {
 
     // phasing
     uint32_t phase_path_len = 10;
-    uint64_t phase_skip = 500'000;
     uint64_t phase_win = 500'000;
     uint64_t phase_min_bp = 1'000;
 
     // gap detection, selection, and replacement
-    uint64_t min_overlap = 1'000'000;
+    uint64_t end_skip = 500'000;
     uint64_t min_contig = 1'000'000;
     uint64_t max_gap = 10'000'000;
-    double min_similarity = 0.7;
-    double boundary_identity = 0.9;
-    double boundary_coverage = 0.8;
     double max_overlap = 0.1;
+    uint64_t min_overlap = 1'000'000;
+    double min_similarity = 0.7;
+    double boundary_coverage = 0.8;
     double min_confidence = 0.5;
 
     // misassembly detection

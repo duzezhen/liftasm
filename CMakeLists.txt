@@ -22,6 +22,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(LIFTASM_ENABLE_NATIVE "Enable -march=native" OFF)
 option(LIFTASM_ENABLE_O3     "Enable -O3"           ON)
+option(LIFTASM_ENABLE_CURL   "Enable HTSlib remote URL support when libcurl is available" ON)
 
 if (LIFTASM_ENABLE_O3)
   add_compile_options($<$<COMPILE_LANGUAGE:C>:-O3>  $<$<COMPILE_LANGUAGE:CXX>:-O3>)
@@ -31,7 +32,34 @@ if (LIFTASM_ENABLE_NATIVE)
   add_compile_options($<$<COMPILE_LANGUAGE:C>:-march=native>  $<$<COMPILE_LANGUAGE:CXX>:-march=native>)
 endif()
 
-find_package(OpenMP REQUIRED)
+find_package(ZLIB REQUIRED)
+find_package(BZip2 REQUIRED)
+find_package(LibLZMA REQUIRED)
+find_package(Threads REQUIRED)
+
+set(LIFTASM_HAVE_CURL OFF)
+if (LIFTASM_ENABLE_CURL)
+  find_package(CURL QUIET)
+  if (CURL_FOUND)
+    set(LIFTASM_HAVE_CURL ON)
+  endif()
+endif()
+
+if (LIFTASM_HAVE_CURL)
+  set(HTS_CURL_MODE "curl")
+  set(HTS_CURL_OBJECTS "hfile_libcurl.o")
+  set(HTS_DEFAULT_LIBS "-lz -lm -lbz2 -llzma -lcurl")
+  message(STATUS "HTSlib remote URL support: enabled")
+else()
+  set(HTS_CURL_MODE "no-curl")
+  set(HTS_CURL_OBJECTS "")
+  set(HTS_DEFAULT_LIBS "-lz -lm -lbz2 -llzma")
+  if (LIFTASM_ENABLE_CURL)
+    message(STATUS "HTSlib remote URL support: disabled (libcurl not found)")
+  else()
+    message(STATUS "HTSlib remote URL support: disabled")
+  endif()
+endif()
 
 # sources
 file(GLOB LIFTASM_SRC CONFIGURE_DEPENDS
@@ -49,8 +77,6 @@ target_include_directories(liftasm PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/external/minimap2"
   "${CMAKE_CURRENT_SOURCE_DIR}/external/htslib"
 )
-
-target_link_libraries(liftasm PRIVATE OpenMP::OpenMP_CXX)
 
 # submodules
 set(EXTERNAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external")
@@ -73,13 +99,6 @@ if(DEFINED ENV{LIFTASM_JOBS})
   set(LIFTASM_JOBS "$ENV{LIFTASM_JOBS}")
 else()
   set(LIFTASM_JOBS "${LIFTASM_JOBS_DEFAULT}")
-endif()
-
-# detect libcurl
-find_package(CURL QUIET)
-set(LIFTASM_HAVE_CURL OFF)
-if (CURL_FOUND)
-  set(LIFTASM_HAVE_CURL ON)
 endif()
 
 # 1) minimap2 -> libminimap2.a
@@ -131,25 +150,31 @@ set_target_properties(wfa2_static PROPERTIES
 )
 add_dependencies(wfa2_static ext_wfa2)
 
-# 3) htslib -> custom build libhts.a (disable libcurl if not found)
+# 3) htslib -> custom build libhts.a
 set(HTS_SRC "${EXTERNAL_DIR}/htslib")
-set(HTS_LIB "${HTS_SRC}/libhts.a")
+set(HTS_BUILD "${EXTERNAL_BUILD_DIR}/htslib-${HTS_CURL_MODE}")
+set(HTS_LIB "${HTS_BUILD}/libhts.a")
 
-if (LIFTASM_HAVE_CURL)
-  set(HTS_MAKE_EXTRA "")
-else()
-  set(HTS_MAKE_EXTRA "HTS_DISABLE_LIBCURL=1")
+set(HTS_CURL_CONFIG_COMMAND)
+if (NOT LIFTASM_HAVE_CURL)
+  list(APPEND HTS_CURL_CONFIG_COMMAND
+    COMMAND /bin/sh -c "sed -i '/^#define HAVE_LIBCURL 1$/d' '${HTS_BUILD}/config.h'"
+  )
 endif()
 
 add_custom_command(
   OUTPUT "${HTS_LIB}"
-  COMMAND /bin/sh -c
-    "set -e; cd '${HTS_SRC}'; \
-     (${CMAKE_MAKE_PROGRAM} -j ${LIFTASM_JOBS} libhts.a ${HTS_MAKE_EXTRA}) || \
-     (${CMAKE_MAKE_PROGRAM} -j ${LIFTASM_JOBS} ${HTS_MAKE_EXTRA} && ${CMAKE_MAKE_PROGRAM} -j ${LIFTASM_JOBS} libhts.a ${HTS_MAKE_EXTRA})"
-  BYPRODUCTS "${HTS_LIB}"
-  WORKING_DIRECTORY "${HTS_SRC}"
-  COMMENT "Building htslib (libhts.a) in ${HTS_SRC} (curl: ${LIFTASM_HAVE_CURL})"
+  COMMAND ${CMAKE_COMMAND} -E remove_directory "${HTS_BUILD}"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${HTS_SRC}" "${HTS_BUILD}"
+  COMMAND ${CMAKE_COMMAND} -E rm -f "${HTS_BUILD}/.git" "${HTS_BUILD}/htscodecs/.git"
+  COMMAND ${CMAKE_MAKE_PROGRAM} -C "${HTS_BUILD}" distclean
+  COMMAND ${CMAKE_MAKE_PROGRAM} -C "${HTS_BUILD}" config.h
+  ${HTS_CURL_CONFIG_COMMAND}
+  COMMAND ${CMAKE_MAKE_PROGRAM} -C "${HTS_BUILD}" -j ${LIFTASM_JOBS}
+    "NONCONFIGURE_OBJS=${HTS_CURL_OBJECTS}"
+    "htslib_default_libs=${HTS_DEFAULT_LIBS}"
+    libhts.a
+  COMMENT "Building htslib (libhts.a, ${HTS_CURL_MODE})"
   VERBATIM
 )
 
@@ -168,20 +193,14 @@ target_link_libraries(liftasm PRIVATE
   wfa2cpp_static
   wfa2_static
   hts_static
-  z bz2 lzma crypto ssl pthread dl
+  ZLIB::ZLIB
+  BZip2::BZip2
+  LibLZMA::LibLZMA
+  Threads::Threads
 )
 
 if (LIFTASM_HAVE_CURL)
   target_link_libraries(liftasm PRIVATE CURL::libcurl)
-endif()
-
-include(CheckCXXSourceCompiles)
-check_cxx_source_compiles("
-  #include <filesystem>
-  int main(){ std::filesystem::path p{\".\"}; return 0; }
-" HAVE_STD_FILESYSTEM)
-if (NOT HAVE_STD_FILESYSTEM)
-  target_link_libraries(liftasm PRIVATE stdc++fs)
 endif()
 
 add_dependencies(liftasm ext_minimap2 ext_wfa2 htslib_build)

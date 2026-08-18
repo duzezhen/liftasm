@@ -11,7 +11,7 @@ liftasm also writes coordinate maps that can be used for `liftover` and `mapq_bo
 
 ## Installation
 
-liftasm requires Linux, GCC 12.2 or newer, CMake 3.20 or newer, OpenMP, zlib, bzip2, liblzma, OpenSSL, and pthreads. `libcurl` is optional.
+liftasm requires Linux, GCC 12.2 or newer, CMake 3.20 or newer, zlib, bzip2, liblzma, and POSIX threads. `libcurl` is optional.
 
 ```bash
 git clone https://github.com/duzezhen/liftasm.git
@@ -22,6 +22,7 @@ cmake --build build -j 8
 ```
 
 The executable is `build/liftasm`. On a dedicated machine, add `-DLIFTASM_ENABLE_NATIVE=ON` to the CMake command to enable CPU-specific optimization.
+Use `-DLIFTASM_ENABLE_CURL=OFF` to disable HTSlib remote URL access explicitly.
 
 ### Bash completion
 

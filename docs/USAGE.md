@@ -87,14 +87,19 @@ With the default prefix, the report is `out.gapfill.tsv`. The command also write
 
 | Option | What it controls | When to change it |
 | --- | --- | --- |
-| `--max_gap INT` `[10Mb]` | Largest graph gap eligible for filling. | Lower it when only short joins are trusted. |
+| `--min_match FLOAT` `[0.9]` | Minimum matching-base fraction required from each boundary hit. | Raise it for more conservative boundary placement. |
+| `--min_ali_ratio FLOAT` `[0.05]` | Minimum aligned fraction required from each boundary hit. | Raise it to ignore short local hits. |
+| `--min_mapq INT` `[30]` | Minimum mapping quality required from each boundary hit. | Raise it when repeats create ambiguous hits. |
+| `--end_skip INT` `[500kb]` | Terminal sequence skipped when choosing trusted graph anchors. | Reduce it when contig ends are known to be accurate. |
 | `--min_contig INT` `[1Mb]` | Shortest contig considered as evidence. | Raise it to avoid noisy short contigs. |
+| `--max_gap INT` `[10Mb]` | Largest graph gap eligible for filling. | Lower it when only short joins are trusted. |
 | `--max_overlap FLOAT` `[0.1]` | Largest allowed overlap between the two target contigs. | Lower it to reject heavily overlapping target pairs. |
 | `--min_overlap INT` `[1Mb]` | Required overlap between a fill path and each target contig. | Raise for stricter bridges. |
 | `--min_similarity FLOAT` `[0.7]` | Required minimizer similarity in each local gap-boundary window. | Raise for closer samples or stricter fills. |
+| `--boundary_coverage FLOAT` `[0.8]` | Minimum query coverage of the retained collinear hit chain. | Lower it only when real boundaries are highly fragmented. |
 | `--min_conf FLOAT` `[0.5]` | Minimum combined sample, local-phase, and alignment confidence. | Raise when many samples are available and conservatism is preferred. |
 | `--phase_len INT` `[10]` | Use only bubbles whose every internal path is at most this many bp. | Normally leave unchanged. |
-| `--phase_skip`, `--phase_win`, `--phase_min_bp` | Placement and minimum amount of local bubble evidence. | Adjust only when reviewing phase failures. |
+| `--phase_win`, `--phase_min_bp` | Window step and minimum amount of local bubble evidence. | Adjust only when reviewing phase failures. |
 | `--dedup_sim FLOAT` `[0.95]` | Similarity threshold for removing redundant contigs/components. | Lower only if legitimate near-duplicate contigs must be retained. |
 
 ## `deoverlap`: create a standalone non-overlap graph

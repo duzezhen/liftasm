@@ -1,5 +1,3 @@
-// g++ main.cpp src/*.cpp -o liftasm -std=c++20 -march=native -O3 -fopenmp -I /home/zd233/zd233/00-software/00-project/liftasm/minimap2 /home/zd233/zd233/00-software/00-project/liftasm/minimap2/libminimap2.a /home/zd233/zd233/00-software/WFA2-lib/build/libwfa2cpp.a /home/zd233/zd233/00-software/WFA2-lib/build/libwfa2.a /home/zd233/zd233/00-software/htslib-1.22.1/build/libhts.a -lz -lbz2 -lcrypto -lssl -lpthread -ldl -lstdc++fs
-
 #include <iostream>
 #include <string>
 #include <iomanip>
@@ -374,17 +372,17 @@ int main(int argc, char** argv) {
     } else if (sub == "gapfill") {
         AppConfig cfg = main_gapfill(argc, argv);
         const GfaGapfill::Params gapfill_params{
-            cfg.gapfill.min_overlap,
+            cfg.gapfill.end_skip,
             cfg.gapfill.min_contig,
             cfg.gapfill.max_gap,
-            cfg.gapfill.min_similarity,
             cfg.gapfill.max_overlap,
+            cfg.gapfill.min_overlap,
+            cfg.gapfill.min_similarity,
             cfg.gapfill.min_confidence,
             cfg.gapfill.misassembly_len,
             cfg.gapfill.misassembly_similarity,
             cfg.gapfill.path_diff,
             cfg.gapfill.phase_path_len,
-            cfg.gapfill.phase_skip,
             cfg.gapfill.phase_win,
             cfg.gapfill.phase_min_bp,
             cfg.gapfill.dedup_similarity,
@@ -398,7 +396,7 @@ int main(int argc, char** argv) {
                 cfg.map.chainOpts, cfg.map.anchorOpts, cfg.map.extendOpts, cfg.map.alignOpts,
                 cfg.collapse.mm2_preset, cfg.gapfill.max_occ,
                 cfg.gapfill.min_match, cfg.gapfill.min_ali_ratio, cfg.gapfill.min_mapq,
-                cfg.gapfill.boundary_identity, cfg.gapfill.boundary_coverage
+                cfg.gapfill.boundary_coverage
             );
         };
         auto find_gapfill_bubbles = [&cfg](const GfaGraph& graph) {

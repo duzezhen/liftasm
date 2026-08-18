@@ -14,6 +14,22 @@ std::string metric(double value) {
     return out.str();
 }
 
+std::string source_interval(
+    const GfaGapfillDebugger::Source& source,
+    uint64_t begin,
+    uint64_t end
+) {
+    if (source.reverse) {
+        const uint64_t oriented_begin = begin;
+        begin = source.length - end;
+        end = source.length - oriented_begin;
+    }
+    std::ostringstream out;
+    out << source.name << '@' << begin << '-' << end
+        << (source.reverse ? '-' : '+');
+    return out.str();
+}
+
 std::string boundary_table_header() {
     std::ostringstream out;
     out << "  - " << std::left << std::setw(9) << "Boundary"
@@ -172,9 +188,9 @@ void GfaGapfillDebugger::candidate(
 }
 
 void GfaGapfillDebugger::refined_boundary(
-    const std::string& left, uint64_t left_cut,
-    const std::string& right, uint64_t right_cut, uint64_t right_length,
-    const std::string& bridge, uint64_t bridge_begin, uint64_t bridge_end,
+    const Source& left, uint64_t left_cut,
+    const Source& right, uint64_t right_cut,
+    const Source& bridge, uint64_t bridge_begin, uint64_t bridge_end,
     const BoundarySupport& left_support,
     const BoundarySupport& right_support,
     double left_alignment,
@@ -182,38 +198,44 @@ void GfaGapfillDebugger::refined_boundary(
 ) {
     if (!DEBUG_ENABLED) return;
     debug_stream() << "Final gap boundary:\n";
-    debug_stream() << "  - Left: " << left << ":0-" << left_cut << '\n';
-    debug_stream() << "  - Right: " << right << ':' << right_cut << '-' << right_length << '\n';
-    debug_stream() << "  - Bridge: " << bridge << ':' << bridge_begin << '-' << bridge_end << '\n';
+    debug_stream() << "  - Left: " << source_interval(left, 0, left_cut) << '\n';
+    debug_stream() << "  - Right: " << source_interval(right, right_cut, right.length) << '\n';
+    debug_stream() << "  - Bridge: " << source_interval(bridge, bridge_begin, bridge_end) << '\n';
     debug_stream() << boundary_table_header() << '\n';
     debug_stream() << boundary_table_row("Left", left_support, left_alignment) << '\n';
     debug_stream() << boundary_table_row("Right", right_support, right_alignment) << '\n';
 }
 
 void GfaGapfillDebugger::boundary_alignment(
-    const std::string& left,
-    const std::string& right,
-    const std::string& bridge,
+    const Source& left,
+    const Source& right,
+    const Source& bridge,
     const Alignment& left_alignment,
     const Alignment& right_alignment
 ) {
     if (!DEBUG_ENABLED) return;
 
-    debug_stream() << "Boundary alignment: " << left << " -> " << right << " via " << bridge << '\n';
+    debug_stream() << "Boundary alignment: " << left.name << " -> " << right.name
+                   << " via " << bridge.name << '\n';
     const Alignment* alignments[2] = {&left_alignment, &right_alignment};
     const char* labels[2] = {"Left", "Right"};
-    const std::string* names[2] = {&left, &right};
+    const Source* targets[2] = {&left, &right};
     for (uint32_t side = 0; side < 2; ++side) {
         const Alignment& alignment = *alignments[side];
-        debug_stream() << "  - " << labels[side] << ": " << *names[side] << ':'
-                       << alignment.target_begin << '-' << alignment.target_end
-                       << " vs " << bridge << ':' << alignment.bridge_begin
-                       << '-' << alignment.bridge_end
-                       << " query=" << alignment.target_begin + alignment.query_begin
-                       << '-' << alignment.target_begin + alignment.query_end
-                       << " ref=" << alignment.bridge_begin + alignment.reference_begin
-                       << '-' << alignment.bridge_begin + alignment.reference_end
-                       << (alignment.reverse ? '-' : '+')
+        const Source& target = *targets[side];
+        debug_stream() << "  - " << labels[side] << ": "
+                       << source_interval(target, alignment.target_begin, alignment.target_end)
+                       << " vs " << source_interval(bridge, alignment.bridge_begin, alignment.bridge_end)
+                       << " query=" << source_interval(
+                              target,
+                              alignment.target_begin + alignment.query_begin,
+                              alignment.target_begin + alignment.query_end
+                          )
+                       << " ref=" << source_interval(
+                              bridge,
+                              alignment.bridge_begin + alignment.reference_begin,
+                              alignment.bridge_begin + alignment.reference_end
+                          )
                        << " hits=" << alignment.hits
                        << " mapq=" << static_cast<uint32_t>(alignment.mapq)
                        << " identity=" << std::fixed << std::setprecision(3) << alignment.identity

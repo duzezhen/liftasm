@@ -4,10 +4,12 @@
 #include "gfa_bubble_types.hpp"
 #include "options.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <map>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -30,21 +32,25 @@ public:
     };
 
     struct Alignment {
+        struct MatchBlock {
+            uint32_t query_begin{0}, reference_begin{0}, length{0}; // One retained CIGAR M block.
+        };
         uint64_t reference_cut{0}; // Cut relative to the bridge window.
         uint64_t query_cut{0};     // Cut relative to the target window.
-        uint32_t query_begin{0}, query_end{0};         // Aligned target interval.
-        uint32_t reference_begin{0}, reference_end{0}; // Aligned bridge interval.
-        uint32_t hits{0};          // Number of minimap2 hits.
-        uint8_t mapq{0};           // Mapping quality of the reported hit.
-        double identity{0.0};      // Matching bases / alignment block length.
-        double coverage{0.0};      // Aligned target bases / target window length.
-        bool accepted{false};      // Identity, coverage and cut mapping passed.
-        bool reverse{false};       // Reported hit is reverse-complemented.
-        bool cut_mapped{false};    // A match operation defines an exact cut.
+        uint32_t query_begin{0}, query_end{0};         // Outer target interval of the retained hit chain.
+        uint32_t reference_begin{0}, reference_end{0}; // Outer bridge interval of the retained hit chain.
+        uint32_t hits{0};          // Number of retained minimap2 hits.
+        uint8_t mapq{0};           // Lowest mapping quality in the retained hit chain.
+        double identity{0.0};      // Matching bases / alignment columns across the retained hits.
+        double coverage{0.0};      // Target bases covered by the retained hit chain.
+        bool accepted{false};      // Chain coverage and M cut passed.
+        bool reverse{false};       // Retained hits are reverse-complemented.
+        bool cut_mapped{false};    // A CIGAR M operation defines the cut.
+        std::vector<MatchBlock> matches; // M blocks used to map an overlap splice to both targets.
     };
 
     struct Boundary {
-        uint32_t target_pos{0}; // Shared node nearest the gap after skipping the phase_skip_bp end region, will be used for sequence extract and gap fill.
+        uint32_t target_pos{0}; // Shared node nearest the gap after skipping the end_skip_bp region, used for sequence extraction and gap filling.
         uint32_t bridge_pos{0}; // Same selected shared node in the bridge, will be used for sequence extract and gap fill.
         uint32_t junction_target_pos{0}; // Outer edge node of the shared part in left/right contig, will be used for misassembly check.
         uint32_t junction_bridge_pos{0}; // Matching outer edge node of the shared part in bridge, will be used for misassembly check.
@@ -67,10 +73,35 @@ public:
     bool spans(uint32_t left, uint32_t right, uint32_t bridge) const;
     // Inspect one known overlap boundary for debug output.
     Boundary inspect(uint32_t target, uint32_t target_pos, uint32_t bridge, uint32_t bridge_pos, bool before, bool expand_minimizer = false) const;
-    // Refine cached node cuts to base-pair cuts when mm2 passes both filters.
+    // Refine cached node cuts when the filtered mm2 hits form a sufficiently covered collinear chain.
     bool refine(uint32_t left, uint32_t right, uint32_t bridge, Boundary& left_boundary, Boundary& right_boundary) const;
 
 private:
+    // One raw mm2 hit and the CIGAR evidence used for local chaining.
+    struct AlignmentHit {
+        const uint32_t* cigar{nullptr};
+        uint32_t cigar_size{0};
+        uint32_t query_begin{0}, query_end{0};
+        uint32_t reference_begin{0}, reference_end{0};
+        uint64_t matches{0}, columns{0};
+        uint8_t mapq{0};
+        bool reverse{false};
+
+        bool operator<(const AlignmentHit& other) const {
+            const uint32_t span = std::min(
+                query_end - query_begin, reference_end - reference_begin
+            );
+            const uint32_t other_span = std::min(
+                other.query_end - other.query_begin,
+                other.reference_end - other.reference_begin
+            );
+            if (span != other_span) return span > other_span;
+            if (matches != other.matches) return matches > other.matches;
+            if (mapq != other.mapq) return mapq > other.mapq;
+            return std::tie(query_begin, reference_begin, query_end, reference_end) < std::tie(other.query_begin, other.reference_begin, other.query_end, other.reference_end);
+        }
+    };
+
     const GfaGapfill& gapfill_;
 
     // Anchor discovery and graph-order validation.
@@ -88,6 +119,8 @@ private:
     bool shared_anchor_(uint32_t target, uint32_t bridge, const Boundary& left_boundary, const Boundary& right_boundary, uint32_t target_pos, bool before, uint32_t& bridge_pos) const;
     bool prepare_alignment_window_(uint32_t target, uint32_t bridge, const Boundary& left_boundary, const Boundary& right_boundary, bool before, Boundary& boundary) const;
     bool align_(const std::string& reference, const std::string& query, bool before, Alignment& alignment) const;
+    double filter_and_chain_hits_(std::vector<AlignmentHit>& hits, uint64_t query_length, uint64_t reference_length, bool before, Alignment& alignment) const;
+    bool splice_overlap_(const Alignment& left, const Alignment& right, const Boundary& left_boundary, const Boundary& right_boundary, uint64_t& left_cut, uint64_t& right_cut, uint64_t& bridge_left_cut, uint64_t& bridge_right_cut) const;
     uint32_t find_position_(uint32_t fragment, uint32_t vertex) const;
 };
 /* =================================================================================================================
@@ -104,17 +137,17 @@ public:
     };
 
     struct Params {
-        uint64_t min_overlap_bp{1'000'000};
+        uint64_t end_skip_bp{500'000};
         uint64_t min_contig_bp{1'000'000};
         uint64_t max_gap_bp{10'000'000};
-        double min_similarity{0.7};
         double max_target_overlap{0.1};
+        uint64_t min_overlap_bp{1'000'000};
+        double min_similarity{0.7};
         double min_confidence{0.5};
         uint64_t misassembly_check_bp{10'000'000};
         double misassembly_similarity{0.7};
         double path_difference{0.05};
         uint32_t phase_path_len{10};
-        uint64_t phase_skip_bp{500'000};
         uint64_t phase_window_bp{500'000};
         uint64_t phase_min_bp{1'000};
         double dedup_similarity{0.95};
@@ -137,7 +170,6 @@ public:
         double min_match,
         double min_ali_ratio,
         uint8_t min_mapq,
-        double boundary_identity,
         double boundary_coverage
     );
 
@@ -298,7 +330,6 @@ private:
         double min_match{0.9};
         double min_ali_ratio{0.05};
         uint8_t min_mapq{30};
-        double boundary_identity{0.9};
         double boundary_coverage{0.8};
         std::string preset{"asm5"};
     } mm2_;

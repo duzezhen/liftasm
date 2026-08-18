@@ -131,37 +131,6 @@ std::string output_contig_name(const std::string& name, const std::string& sampl
         compact.substr(prefix.size()) : compact;
 }
 
-// Recover the closest usable boundary cut from a minimap2 CIGAR.
-bool closest_match_cut(
-    const mm_reg1_t& hit,
-    bool left_boundary,
-    uint64_t& query_cut,
-    uint64_t& reference_cut
-) {
-    if (!hit.p || hit.p->n_cigar == 0) return false;
-
-    uint64_t query = hit.qs;
-    uint64_t reference = hit.rs;
-    bool found = false;
-    for (uint32_t i = 0; i < hit.p->n_cigar; ++i) {
-        const uint32_t length = hit.p->cigar[i] >> 4;
-        const uint32_t operation = hit.p->cigar[i] & 0xf;
-        if (operation == MM_CIGAR_MATCH) {
-            if (!left_boundary) {
-                query_cut = query;
-                reference_cut = reference;
-                return true;
-            }
-            query_cut = query + length;
-            reference_cut = reference + length;
-            found = true;
-        }
-        if (operation == MM_CIGAR_MATCH || operation == MM_CIGAR_INS) query += length;
-        if (operation == MM_CIGAR_MATCH || operation == MM_CIGAR_DEL || operation == MM_CIGAR_N_SKIP) reference += length;
-    }
-    return found;
-}
-
 // Shared nodes of a contig pair
 struct PlotRelation {
     uint32_t a{0}, b{0};   // contig indexes
@@ -198,7 +167,6 @@ void GfaGapfill::set_alignment_options(
     double min_match,
     double min_ali_ratio,
     uint8_t min_mapq,
-    double boundary_identity,
     double boundary_coverage
 ) {
     mm2_.k = chain.k;
@@ -210,7 +178,6 @@ void GfaGapfill::set_alignment_options(
     mm2_.min_match = min_match;
     mm2_.min_ali_ratio = min_ali_ratio;
     mm2_.min_mapq = min_mapq;
-    mm2_.boundary_identity = boundary_identity;
     mm2_.boundary_coverage = boundary_coverage;
     params_.threads = std::max<uint32_t>(1, align.threads);
 }
@@ -1315,12 +1282,15 @@ void GfaGapfill::refine_boundaries_(
     // Refresh scores and write the cached evidence once.
     for (Candidate& candidate : selected) {
         update_confidence_(candidate);
+        const Fragment& left = fragments_[candidate.left];
+        const Fragment& right = fragments_[candidate.right];
+        const Fragment& bridge = fragments_[candidate.bridge];
         GfaGapfillDebugger::refined_boundary(
-            paths_[fragments_[candidate.left].path_id].name,
+            {paths_[left.path_id].name, left.length, left.reverse},
             candidate.left_boundary.target_cut_bp,
-            paths_[fragments_[candidate.right].path_id].name,
-            candidate.right_boundary.target_cut_bp, fragments_[candidate.right].length,
-            paths_[fragments_[candidate.bridge].path_id].name,
+            {paths_[right.path_id].name, right.length, right.reverse},
+            candidate.right_boundary.target_cut_bp,
+            {paths_[bridge.path_id].name, bridge.length, bridge.reverse},
             candidate.left_boundary.bridge_cut_bp,
             candidate.right_boundary.bridge_cut_bp,
             {candidate.left_boundary.minimizer,
@@ -1676,8 +1646,8 @@ std::vector<GfaGapfill::MisassemblyContig> GfaGapfill::split_misassemblies_(
 
             const uint64_t prefix_bp = fragment.path_bp[first];
             const uint64_t suffix_bp = fragment.length - fragment.path_bp[last + 1];
-            const bool prefix = prefix_bp <= params_.phase_skip_bp;
-            const bool suffix = suffix_bp <= params_.phase_skip_bp;
+            const bool prefix = prefix_bp <= params_.end_skip_bp;
+            const bool suffix = suffix_bp <= params_.end_skip_bp;
             if (!prefix && !suffix) continue;
             const uint64_t fragment_key = static_cast<uint64_t>(fragment_id) << SPLIT_END_BITS;
             const uint64_t right_end_key = fragment_key | SPLIT_RIGHT_END;
@@ -2073,14 +2043,16 @@ GfaGapfill::Chain GfaGapfill::build_chain_(
 
         const Candidate& edge = selected[outgoing[current]];
         const Fragment& bridge = fragments_[edge.bridge];
-        if (edge.left_boundary.bridge_cut_bp < edge.right_boundary.bridge_cut_bp) {
+        if (edge.left_boundary.bridge_cut_bp <= edge.right_boundary.bridge_cut_bp) {
             chain.parts.push_back({
                 edge.bridge, edge.left_boundary.bridge_cut_bp,
                 edge.right_boundary.bridge_cut_bp, true
             });
         }
-        for (uint32_t i = edge.left_boundary.bridge_pos + 1; i < edge.right_boundary.bridge_pos; ++i) {
-            chain.vertices.push_back(bridge.vertices[i]);
+        if (edge.left_boundary.bridge_cut_bp < edge.right_boundary.bridge_cut_bp) {
+            for (uint32_t i = edge.left_boundary.bridge_pos + 1; i < edge.right_boundary.bridge_pos; ++i) {
+                chain.vertices.push_back(bridge.vertices[i]);
+            }
         }
         chain.gaps.push_back(edge);
         current = edge.right;
@@ -2672,8 +2644,8 @@ void GfaGapfill::save_haplotype_(
     header += "H\tCO:Z:  SN:Z   node source/sample name\n";
     header += "H\tCO:Z:  CP:i   graph component\n";
     header += "H\tCO:Z:  GF:Z   gap-filled intervals (0-based, half-open)\n";
-    header += "H\tCO:Z:  SC:Z   target contigs in assembly order (+/- orientation)\n";
-    header += "H\tCO:Z:  GS:Z   gap-source contigs in GF interval order (+/- orientation)\n";
+    header += "H\tCO:Z:  SC:Z   target pieces as contig@start-end+/- (source coordinates; 0-based, half-open)\n";
+    header += "H\tCO:Z:  GS:Z   gap-source pieces in GF order, using the same coordinate format\n";
     header += "H\tCO:Z:  MS:Z   source contig of an unused misassembly\n";
     header += "H\tCO:Z:  ME:Z   source end of an unused misassembly\n";
     header += "H\tCO:Z:  MR:Z   reason the misassembly was not used\n";
@@ -2726,32 +2698,29 @@ void GfaGapfill::save_haplotype_(
         uint64_t assembled_length = 0;
         bool sequence_available = true;
         std::string sequence;
-        bool in_gap = false;
-        uint64_t gap_begin = 0;
         std::vector<std::pair<uint64_t, uint64_t>> intervals;
 
         // ------------------------------------------------ Build chain sequence ------------------------------------------------
         if (gap_filled) {
             sequence.reserve(chain_length_(chain));
             for (const Chain::Part& chain_part : chain.parts) {
-                if (chain_part.filled && !in_gap) {
-                    gap_begin = assembled_length;
-                    in_gap = true;
-                } else if (!chain_part.filled && in_gap) {
-                    intervals.emplace_back(gap_begin, assembled_length);
-                    in_gap = false;
+                const uint64_t part_length = chain_part.end - chain_part.begin;
+                if (chain_part.filled) {
+                    intervals.emplace_back(assembled_length, assembled_length + part_length);
                 }
-                std::string part = fragment_subsequence_(
-                    fragments_[chain_part.fragment], chain_part.begin, chain_part.end
-                );
-                if (part.empty()) sequence_available = false;
-                for (char& base : part) {
-                    base = chain_part.filled ?
-                        static_cast<char>(std::tolower(static_cast<unsigned char>(base))) :
-                        static_cast<char>(std::toupper(static_cast<unsigned char>(base)));
+                if (chain_part.begin < chain_part.end) {
+                    std::string part = fragment_subsequence_(
+                        fragments_[chain_part.fragment], chain_part.begin, chain_part.end
+                    );
+                    if (part.empty()) sequence_available = false;
+                    for (char& base : part) {
+                        base = chain_part.filled ?
+                            static_cast<char>(std::tolower(static_cast<unsigned char>(base))) :
+                            static_cast<char>(std::toupper(static_cast<unsigned char>(base)));
+                    }
+                    if (sequence_available) sequence += part;
                 }
-                if (sequence_available) sequence += part;
-                assembled_length += chain_part.end - chain_part.begin;
+                assembled_length += part_length;
             }
         } else {
             // ------------------------------------------------ Build unchanged sequence ------------------------------------------------
@@ -2770,7 +2739,6 @@ void GfaGapfill::save_haplotype_(
             }
         }
         if (!sequence_available) sequence.clear();
-        if (in_gap) intervals.emplace_back(gap_begin, assembled_length);
 
         // ------------------------------------------------ Build segment tags ------------------------------------------------
         std::ostringstream tags;
@@ -2785,16 +2753,34 @@ void GfaGapfill::save_haplotype_(
         }
         if (gap_filled) {
             tags << "\tSC:Z:";
-            for (size_t i = 0; i < chain.source_fragments.size(); ++i) {
-                if (i) tags << ',';
-                const Fragment& source = fragments_[chain.source_fragments[i]];
-                tags << output_contig_name(paths_[source.path_id].name, chain.sample) << (source.reverse ? '-' : '+');
+            bool first = true;
+            for (const Chain::Part& part : chain.parts) {
+                if (part.filled) continue;
+                if (!first) tags << ',';
+                first = false;
+                const Fragment& source = fragments_[part.fragment];
+                uint64_t begin = part.begin, end = part.end;
+                if (source.reverse) {
+                    begin = source.length - part.end;
+                    end = source.length - part.begin;
+                }
+                tags << output_contig_name(paths_[source.path_id].name, chain.sample)
+                     << '@' << begin << '-' << end << (source.reverse ? '-' : '+');
             }
             tags << "\tGS:Z:";
-            for (size_t i = 0; i < chain.gaps.size(); ++i) {
-                if (i) tags << ',';
-                const Fragment& source = fragments_[chain.gaps[i].bridge];
-                tags << paths_[source.path_id].name << (source.reverse ? '-' : '+');
+            first = true;
+            for (const Chain::Part& part : chain.parts) {
+                if (!part.filled) continue;
+                if (!first) tags << ',';
+                first = false;
+                const Fragment& source = fragments_[part.fragment];
+                uint64_t begin = part.begin, end = part.end;
+                if (source.reverse) {
+                    begin = source.length - part.end;
+                    end = source.length - part.begin;
+                }
+                tags << paths_[source.path_id].name
+                     << '@' << begin << '-' << end << (source.reverse ? '-' : '+');
             }
         }
 
@@ -3043,9 +3029,9 @@ bool GfaGapfillBoundary::refine(
         alignments[1].accepted, alignments[1].reverse
     };
     GfaGapfillDebugger::boundary_alignment(
-        gapfill_.paths_[left.path_id].name,
-        gapfill_.paths_[right.path_id].name,
-        gapfill_.paths_[bridge.path_id].name,
+        {gapfill_.paths_[left.path_id].name, left.length, left.reverse},
+        {gapfill_.paths_[right.path_id].name, right.length, right.reverse},
+        {gapfill_.paths_[bridge.path_id].name, bridge.length, bridge.reverse},
         left_result,
         right_result
     );
@@ -3071,7 +3057,12 @@ bool GfaGapfillBoundary::refine(
         bridge_right_cut = right_boundary.bridge_begin + alignments[1].reference_cut;
         right_cut = right_boundary.target_begin + alignments[1].query_cut;
     }
-    if (bridge_left_cut >= bridge_right_cut) return false;
+    if (bridge_left_cut > bridge_right_cut) {
+        if (!mapped_left || !mapped_right || !splice_overlap_(
+                alignments[0], alignments[1], left_boundary, right_boundary,
+                left_cut, right_cut, bridge_left_cut, bridge_right_cut
+            )) return false;
+    }
     left_boundary.target_cut_bp = left_cut;
     left_boundary.bridge_cut_bp = bridge_left_cut;
     right_boundary.bridge_cut_bp = bridge_right_cut;
@@ -3244,7 +3235,7 @@ bool GfaGapfillBoundary::adjust_boundaries_(
     const GfaGapfill::Fragment& bridge = gapfill_.fragments_[bridge_id];
     // Move each junction past the unreliable contig end to the nearest shared node.
     const uint64_t left_junction = left.path_bp[left_boundary.junction_target_pos + 1];
-    const uint64_t left_trusted_end = left.length > gapfill_.params_.phase_skip_bp ? left.length - gapfill_.params_.phase_skip_bp : 0;
+    const uint64_t left_trusted_end = left.length > gapfill_.params_.end_skip_bp ? left.length - gapfill_.params_.end_skip_bp : 0;
     const uint64_t left_goal = std::min(left_junction, left_trusted_end);
     uint64_t best_left_distance = UINT64_MAX;
     uint32_t best_left_bridge = left_boundary.junction_bridge_pos;
@@ -3265,7 +3256,7 @@ bool GfaGapfillBoundary::adjust_boundaries_(
     }
 
     const uint64_t right_junction = right.path_bp[right_boundary.junction_target_pos];
-    const uint64_t right_goal = std::max(right_junction, gapfill_.params_.phase_skip_bp);
+    const uint64_t right_goal = std::max(right_junction, gapfill_.params_.end_skip_bp);
     uint64_t best_right_distance = UINT64_MAX;
     uint32_t best_right_bridge = right_boundary.junction_bridge_pos;
     uint32_t best_right_pos = right_boundary.junction_target_pos;
@@ -3320,9 +3311,9 @@ uint64_t GfaGapfillBoundary::phase_available_(
 ) const {
     const GfaGapfill::Fragment& fragment = gapfill_.fragments_[fragment_id];
     if (before) {
-        return std::min(fragment.path_bp[pos + 1], fragment.length > gapfill_.params_.phase_skip_bp ? fragment.length - gapfill_.params_.phase_skip_bp : 0);
+        return std::min(fragment.path_bp[pos + 1], fragment.length > gapfill_.params_.end_skip_bp ? fragment.length - gapfill_.params_.end_skip_bp : 0);
     }
-    const uint64_t begin = std::min(std::max(fragment.path_bp[pos], gapfill_.params_.phase_skip_bp), fragment.length);
+    const uint64_t begin = std::min(std::max(fragment.path_bp[pos], gapfill_.params_.end_skip_bp), fragment.length);
     return fragment.length - begin;
 }
 
@@ -3342,11 +3333,11 @@ std::pair<uint32_t, uint32_t> GfaGapfillBoundary::phase_region_(
     if (before) {
         end_bp = std::min(
             fragment.path_bp[pos + 1],
-            fragment.length > gapfill_.params_.phase_skip_bp ? fragment.length - gapfill_.params_.phase_skip_bp : 0
+            fragment.length > gapfill_.params_.end_skip_bp ? fragment.length - gapfill_.params_.end_skip_bp : 0
         );
         begin_bp = end_bp - span;
     } else {
-        begin_bp = std::max(fragment.path_bp[pos], gapfill_.params_.phase_skip_bp);
+        begin_bp = std::max(fragment.path_bp[pos], gapfill_.params_.end_skip_bp);
         begin_bp = std::min(begin_bp, fragment.length);
         end_bp = begin_bp + span;
     }
@@ -3483,23 +3474,23 @@ bool GfaGapfillBoundary::prepare_alignment_window_(
     const GfaGapfill::Fragment& target = gapfill_.fragments_[target_id];
     const GfaGapfill::Fragment& bridge = gapfill_.fragments_[bridge_id];
     if (target.vertices.empty() || bridge.vertices.empty()) return false;
-    uint64_t interval_begin = 0;
-    uint64_t interval_end = 0;
+    uint64_t anchor_begin = 0;
+    uint64_t anchor_end = 0;
     if (before) {
-        interval_end = target.length > gapfill_.params_.phase_skip_bp ? target.length - gapfill_.params_.phase_skip_bp : 0;
-        interval_begin = interval_end > gapfill_.params_.phase_window_bp ? interval_end - gapfill_.params_.phase_window_bp : 0;
+        anchor_end = target.length > gapfill_.params_.end_skip_bp ? target.length - gapfill_.params_.end_skip_bp : 0;
+        anchor_begin = anchor_end > gapfill_.params_.phase_window_bp ? anchor_end - gapfill_.params_.phase_window_bp : 0;
     } else {
-        interval_begin = std::min(target.length, gapfill_.params_.phase_skip_bp);
-        interval_end = interval_begin + std::min(gapfill_.params_.phase_window_bp, target.length - interval_begin);
+        anchor_begin = std::min(target.length, gapfill_.params_.end_skip_bp);
+        anchor_end = anchor_begin + std::min(gapfill_.params_.phase_window_bp, target.length - anchor_begin);
     }
-    if (interval_begin >= interval_end) return false;
+    if (anchor_begin >= anchor_end) return false;
 
     const uint32_t first = std::min(
-        static_cast<uint32_t>(std::upper_bound(target.path_bp.begin(), target.path_bp.end(), interval_begin) - target.path_bp.begin() - 1),
+        static_cast<uint32_t>(std::upper_bound(target.path_bp.begin(), target.path_bp.end(), anchor_begin) - target.path_bp.begin() - 1),
         static_cast<uint32_t>(target.vertices.size() - 1)
     );
     const uint32_t last = std::min(
-        static_cast<uint32_t>(std::lower_bound(target.path_bp.begin(), target.path_bp.end(), interval_end) - target.path_bp.begin()),
+        static_cast<uint32_t>(std::lower_bound(target.path_bp.begin(), target.path_bp.end(), anchor_end) - target.path_bp.begin()),
         static_cast<uint32_t>(target.vertices.size() - 1)
     );
     // Anchor the outer edge of the target phase window on the same bridge rank.
@@ -3531,15 +3522,16 @@ bool GfaGapfillBoundary::prepare_alignment_window_(
     }
     if (target_anchor == UINT32_MAX) return false;
 
+    // Anchor in trusted sequence, but include the complete contig end in the alignment.
     if (before) {
         boundary.target_begin = target.path_bp[target_anchor];
-        boundary.target_end = interval_end;
+        boundary.target_end = target.length;
         boundary.bridge_begin = bridge.path_bp[bridge_anchor];
         const uint64_t query_length = boundary.target_end - boundary.target_begin;
         const uint64_t reference_length = query_length + (query_length + 9) / 10;
         boundary.bridge_end = boundary.bridge_begin + std::min(reference_length, bridge.length - boundary.bridge_begin);
     } else {
-        boundary.target_begin = interval_begin;
+        boundary.target_begin = 0;
         boundary.target_end = target.path_bp[target_anchor + 1];
         boundary.bridge_end = bridge.path_bp[bridge_anchor + 1];
         const uint64_t query_length = boundary.target_end - boundary.target_begin;
@@ -3581,10 +3573,11 @@ bool GfaGapfillBoundary::align_(
     if (mm_set_opt(gapfill_.mm2_.preset.c_str(), &index_options, &map_options) < 0) return false;
     index_options.k = static_cast<short>(gapfill_.mm2_.k);
     index_options.w = static_cast<short>(gapfill_.mm2_.w);
-    map_options.best_n = 1;
+    map_options.best_n = static_cast<short>(gapfill_.mm2_.best_n);
     map_options.mid_occ = static_cast<int32_t>(gapfill_.mm2_.max_occ);
     map_options.zdrop = gapfill_.mm2_.zdrop;
     map_options.flag |= MM_F_CIGAR;
+    map_options.flag &= ~MM_F_EQX;
 
     const char* reference_sequence = reference.c_str();
     const char* reference_name = "bridge";
@@ -3607,48 +3600,29 @@ bool GfaGapfillBoundary::align_(
         index, static_cast<int>(query.size()), query.c_str(),
         &count, buffer, &map_options, "boundary"
     );
-    alignment.hits = static_cast<uint32_t>(count);
-    const mm_reg1_t* best = nullptr;
-    const mm_reg1_t* raw_best = nullptr;
-    uint64_t best_distance = UINT64_MAX;
+    std::vector<AlignmentHit> candidates;
+    candidates.reserve(count);
     for (int i = 0; i < count; ++i) {
         const mm_reg1_t& hit = hits[i];
-        if (hit.blen <= 0 || hit.parent != hit.id) continue;
-        if (!raw_best || hit.mlen > raw_best->mlen) raw_best = &hit;
-        if (hit.rev) continue;
-        const double identity = static_cast<double>(hit.mlen) / hit.blen;
-        const double coverage = static_cast<double>(hit.qe - hit.qs) / query.size();
-        if (identity < gapfill_.mm2_.boundary_identity || coverage < gapfill_.mm2_.boundary_coverage) continue;
-
-        const uint64_t distance = before ? static_cast<uint64_t>(hit.qs) + hit.rs : query.size() - hit.qe + reference.size() - hit.re;
-        if (!best || distance < best_distance || (distance == best_distance && hit.mlen > best->mlen)) {
-            best = &hit;
-            best_distance = distance;
+        AlignmentHit candidate;
+        if (hit.p) {
+            candidate.cigar = hit.p->cigar;
+            candidate.cigar_size = hit.p->n_cigar;
         }
+        candidate.query_begin = hit.qs;
+        candidate.query_end = hit.qe;
+        candidate.reference_begin = hit.rs;
+        candidate.reference_end = hit.re;
+        candidate.matches = hit.mlen > 0 ? static_cast<uint64_t>(hit.mlen) : 0;
+        candidate.columns = hit.blen > 0 ? static_cast<uint64_t>(hit.blen) : 0;
+        candidate.mapq = hit.mapq;
+        candidate.reverse = hit.rev;
+        candidates.push_back(candidate);
     }
-
-    const mm_reg1_t* reported = best ? best : raw_best;
-    if (reported) {
-        alignment.query_begin = reported->qs;
-        alignment.query_end = reported->qe;
-        alignment.reference_begin = reported->rs;
-        alignment.reference_end = reported->re;
-        alignment.mapq = reported->mapq;
-        alignment.identity = static_cast<double>(reported->mlen) / reported->blen;
-        alignment.coverage = static_cast<double>(reported->qe - reported->qs) / query.size();
-        alignment.reverse = reported->rev;
-        if (!reported->rev) {
-            closest_match_cut(
-                *reported, before, alignment.query_cut, alignment.reference_cut
-            );
-        }
-    }
-    if (best) {
-        alignment.cut_mapped = closest_match_cut(
-            *best, before, alignment.query_cut, alignment.reference_cut
-        );
-        alignment.accepted = alignment.cut_mapped;
-    }
+    const double coverage = filter_and_chain_hits_(
+        candidates, query.size(), reference.size(), before, alignment
+    );
+    alignment.accepted = alignment.cut_mapped && coverage >= gapfill_.mm2_.boundary_coverage;
     if (hits) {
         for (int i = 0; i < count; ++i) std::free(hits[i].p);
         std::free(hits);
@@ -3656,6 +3630,178 @@ bool GfaGapfillBoundary::align_(
     mm_tbuf_destroy(buffer);
     mm_idx_destroy(index);
     return alignment.accepted;
+}
+
+double GfaGapfillBoundary::filter_and_chain_hits_(
+    std::vector<AlignmentHit>& hits,
+    uint64_t query_length,
+    uint64_t reference_length,
+    bool before,
+    Alignment& alignment
+) const {
+    const uint64_t shorter_length = std::min(query_length, reference_length);
+    if (shorter_length == 0) return -1.0;
+
+    // Filter each independent hit before rebuilding one forward collinear chain.
+    size_t retained = 0;
+    for (AlignmentHit& hit : hits) {
+        if (!hit.cigar || hit.cigar_size == 0 || hit.reverse || hit.mapq < gapfill_.mm2_.min_mapq || hit.query_begin >= hit.query_end || hit.reference_begin >= hit.reference_end) continue;
+
+        const double match_ratio = hit.columns == 0 ? 0.0 : static_cast<double>(hit.matches) / hit.columns;
+        const uint64_t aligned_span = std::min(
+            hit.query_end - hit.query_begin,
+            hit.reference_end - hit.reference_begin
+        );
+        const double alignment_ratio = static_cast<double>(aligned_span) / shorter_length;
+        if (match_ratio < gapfill_.mm2_.min_match || alignment_ratio < gapfill_.mm2_.min_ali_ratio) continue;
+        hits[retained++] = hit;
+    }
+    hits.resize(retained);
+    std::sort(hits.begin(), hits.end());
+
+    // The longest hit is the anchor; add only non-overlapping collinear hits.
+    std::map<uint32_t, const AlignmentHit*> chain;
+    for (const AlignmentHit& hit : hits) {
+        const auto next = chain.lower_bound(hit.query_begin);
+        if (next != chain.end() && (hit.query_end > next->second->query_begin || hit.reference_end > next->second->reference_begin)) continue;
+        if (next != chain.begin()) {
+            const AlignmentHit& previous = *std::prev(next)->second;
+            if (previous.query_end > hit.query_begin || previous.reference_end > hit.reference_begin) continue;
+        }
+        chain.emplace(hit.query_begin, &hit);
+    }
+    if (chain.empty()) return -1.0;
+
+    uint64_t matches = 0;
+    uint64_t columns = 0;
+    uint64_t covered = 0;
+    alignment.mapq = UINT8_MAX;
+    for (const auto& item : chain) {
+        const AlignmentHit& hit = *item.second;
+        matches += hit.matches;
+        columns += hit.columns;
+        covered += hit.query_end - hit.query_begin;
+        alignment.mapq = std::min(alignment.mapq, hit.mapq);
+
+        uint64_t query = hit.query_begin;
+        uint64_t reference = hit.reference_begin;
+        for (uint32_t i = 0; i < hit.cigar_size; ++i) {
+            const uint32_t length = hit.cigar[i] >> 4;
+            const uint32_t operation = hit.cigar[i] & 0xf;
+            if (operation == MM_CIGAR_MATCH) {
+                alignment.matches.push_back({
+                    static_cast<uint32_t>(query), static_cast<uint32_t>(reference), length
+                });
+                if (before || !alignment.cut_mapped) {
+                    alignment.query_cut = before ? query + length : query;
+                    alignment.reference_cut = before ? reference + length : reference;
+                    alignment.cut_mapped = true;
+                }
+            }
+            if (operation == MM_CIGAR_MATCH || operation == MM_CIGAR_INS) query += length;
+            if (operation == MM_CIGAR_MATCH || operation == MM_CIGAR_DEL || operation == MM_CIGAR_N_SKIP) reference += length;
+        }
+    }
+    const AlignmentHit& first = *chain.begin()->second;
+    const AlignmentHit& last = *chain.rbegin()->second;
+    alignment.query_begin = first.query_begin;
+    alignment.query_end = last.query_end;
+    alignment.reference_begin = first.reference_begin;
+    alignment.reference_end = last.reference_end;
+    alignment.hits = static_cast<uint32_t>(chain.size());
+    alignment.identity = columns == 0 ? 0.0 : static_cast<double>(matches) / columns;
+    alignment.coverage = std::min(1.0, static_cast<double>(covered) / query_length);
+    return alignment.coverage;
+}
+
+bool GfaGapfillBoundary::splice_overlap_(
+    const Alignment& left,
+    const Alignment& right,
+    const Boundary& left_boundary,
+    const Boundary& right_boundary,
+    uint64_t& left_cut,
+    uint64_t& right_cut,
+    uint64_t& bridge_left_cut,
+    uint64_t& bridge_right_cut
+) const {
+    const uint64_t overlap_begin = right_boundary.bridge_begin + right.reference_cut;
+    const uint64_t overlap_end = left_boundary.bridge_begin + left.reference_cut;
+    if (overlap_begin >= overlap_end || left.matches.empty() || right.matches.empty()) return false;
+
+    // Find the longest reference interval covered by M blocks from both targets.
+    size_t i = 0, j = 0;
+    uint64_t best_span = 0;
+    const Alignment::MatchBlock* best_left = nullptr;
+    const Alignment::MatchBlock* best_right = nullptr;
+    uint64_t best_begin = 0, best_end = 0;
+    while (i < left.matches.size() && j < right.matches.size()) {
+        const Alignment::MatchBlock& a = left.matches[i];
+        const Alignment::MatchBlock& b = right.matches[j];
+        const uint64_t a_begin = left_boundary.bridge_begin + a.reference_begin;
+        const uint64_t b_begin = right_boundary.bridge_begin + b.reference_begin;
+        const uint64_t a_end = a_begin + a.length;
+        const uint64_t b_end = b_begin + b.length;
+        const uint64_t begin = std::max({a_begin, b_begin, overlap_begin});
+        const uint64_t end = std::min({a_end, b_end, overlap_end});
+        if (begin < end && (!best_left || end - begin > best_span)) {
+            best_span = end - begin;
+            best_left = &a;
+            best_right = &b;
+            best_begin = begin;
+            best_end = end;
+        }
+        if (a_end <= b_end) ++i;
+        if (b_end <= a_end) ++j;
+    }
+    if (best_left) {
+        bridge_left_cut = best_begin + (best_end - best_begin) / 2;
+        bridge_right_cut = bridge_left_cut;
+        left_cut = left_boundary.target_begin + best_left->query_begin + bridge_left_cut - (left_boundary.bridge_begin + best_left->reference_begin);
+        right_cut = right_boundary.target_begin + best_right->query_begin + bridge_right_cut - (right_boundary.bridge_begin + best_right->reference_begin);
+        return left_cut <= left_boundary.target_end && right_cut <= right_boundary.target_end;
+    }
+
+    // No common M: use the nearest ordered M ends and fill their interval from the bridge.
+    size_t left_index = 0;
+    const Alignment::MatchBlock* nearest_left = nullptr;
+    const Alignment::MatchBlock* nearest_right = nullptr;
+    const Alignment::MatchBlock* latest_left = nullptr;
+    uint64_t nearest_distance = UINT64_MAX;
+    uint64_t nearest_loss = UINT64_MAX;
+    uint64_t nearest_left_end = 0, nearest_right_begin = 0, latest_left_end = 0;
+    for (const Alignment::MatchBlock& b : right.matches) {
+        const uint64_t b_begin = right_boundary.bridge_begin + b.reference_begin;
+        while (left_index < left.matches.size()) {
+            const Alignment::MatchBlock& a = left.matches[left_index];
+            const uint64_t a_end = left_boundary.bridge_begin + a.reference_begin + a.length;
+            if (a_end > b_begin) break;
+            if (!latest_left || a_end > latest_left_end) {
+                latest_left = &a;
+                latest_left_end = a_end;
+            }
+            ++left_index;
+        }
+        if (!latest_left) continue;
+        const uint64_t distance = b_begin - latest_left_end;
+        const uint64_t left_query_end = latest_left->query_begin + latest_left->length;
+        const uint64_t loss = (left.query_cut > left_query_end ? left.query_cut - left_query_end : 0) + (b.query_begin > right.query_cut ? b.query_begin - right.query_cut : 0);
+        if (distance < nearest_distance || (distance == nearest_distance && loss < nearest_loss)) {
+            nearest_distance = distance;
+            nearest_loss = loss;
+            nearest_left = latest_left;
+            nearest_right = &b;
+            nearest_left_end = latest_left_end;
+            nearest_right_begin = b_begin;
+        }
+    }
+    if (!nearest_left) return false;
+    if (nearest_right_begin - nearest_left_end > gapfill_.params_.max_gap_bp) return false;
+
+    bridge_left_cut = nearest_left_end;
+    bridge_right_cut = nearest_right_begin;
+    left_cut = left_boundary.target_begin + nearest_left->query_begin + nearest_left->length;
+    right_cut = right_boundary.target_begin + nearest_right->query_begin;
+    return left_cut <= left_boundary.target_end && right_cut <= right_boundary.target_end;
 }
 
 uint32_t GfaGapfillBoundary::find_position_(
