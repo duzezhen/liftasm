@@ -49,7 +49,14 @@ public:
     void filter_nested_bubbles();
     const std::vector<Bubble>& get_bubbles() const noexcept { return bubbles_; }
     void save_bubble_as_gfa(const std::string& output_file, const uint32_t min_len, const uint32_t min_num, bool write_seq = true, const std::string& command_line = "") const;
-    void save_bubble_as_vcf(const std::string& output_prefix, const std::string& paf_file, const std::string& ref_file, uint32_t min_mapq, uint32_t min_aln_len) const;
+    void save_bubble_as_vcf(
+        const std::string& output_prefix,
+        const std::string& paf_file,
+        const std::string& ref_file,
+        uint32_t min_mapq,
+        uint32_t min_aln_len,
+        const std::vector<ReferencePath>* reference_paths = nullptr
+    ) const;
     void print_bubbles() const;
 
     void find_forks();
@@ -460,7 +467,8 @@ public:
         const std::string& paf_file,
         const std::string& ref_file,
         uint32_t min_mapq,
-        uint32_t min_aln_len
+        uint32_t min_aln_len,
+        const std::vector<ReferencePath>* reference_paths = nullptr
     ) const;
 
 private:
@@ -490,6 +498,10 @@ private:
     std::string path_root_(const std::string& path_name) const;
     std::vector<uint32_t> path_sample_ids_(const std::vector<uint32_t>& path, uint32_t src_seg, uint32_t sink_seg) const;
     std::vector<std::string> sample_gt_tokens_(const std::vector<std::string>& path_gt_tokens, const std::vector<std::vector<uint32_t>>& path_sample_ids) const;
+    static bool same_vcf_allele_(const VcfRecord& a, const VcfRecord& b);
+    static std::string merge_genotypes_(std::string_view a, std::string_view b);
+    static void merge_sample_genotypes_(VcfRecord& target, const VcfRecord& duplicate);
+    static std::string vcf_info_text_(std::string_view value, bool replace_comma = true);
     static std::string vcf_record_string_(const VcfRecord& record);
     void normalize_vcf_record_(std::vector<VcfRecord>& records, size_t index) const;
 

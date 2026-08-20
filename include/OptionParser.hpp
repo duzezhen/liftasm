@@ -270,8 +270,7 @@ struct GapfillOpts {
     std::string gfa_file;
     std::string prefix = "out";
 
-    // minimap2 index and alignment filters
-    uint32_t max_occ = 10;
+    // minimap2 alignment filters
     double min_match = 0.9;
     double min_ali_ratio = 0.05;
     uint8_t min_mapq = 30;
@@ -284,19 +283,16 @@ struct GapfillOpts {
     uint32_t stall_round_limit = BubbleOpts().stall_round_limit;
 
     // phasing
+    std::vector<std::string> full_phase_samples;
     uint32_t phase_path_len = 10;
     uint64_t phase_win = 500'000;
-    uint64_t phase_min_bp = 1'000;
 
     // gap detection, selection, and replacement
-    uint64_t end_skip = 500'000;
     uint64_t min_contig = 1'000'000;
     uint64_t max_gap = 10'000'000;
     double max_overlap = 0.1;
     uint64_t min_overlap = 1'000'000;
     double min_similarity = 0.7;
-    double boundary_coverage = 0.8;
-    double min_confidence = 0.5;
 
     // misassembly detection
     uint64_t misassembly_len = 10'000'000;

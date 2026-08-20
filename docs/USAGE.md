@@ -15,7 +15,7 @@ Graph commands take more than filenames because liftasm needs to know which samp
 | --- | --- | --- |
 | One or more hifiasm `p_utg` GFAs | `collapse -g` | UTG mode: directly collapses homologous graph sequence. Overlap is handled internally when needed. |
 | Paired hap1/hap2 `p_ctg` GFAs from different tissues or samples | `collapse --c1 --c2` | CTG mode: compares paired contigs and builds a combined graph. |
-| Final graph from CTG mode | `gapfill -g` | Uses supported paths from other tissues or samples to fill conservative, phased contig gaps. |
+| Final graph from CTG mode | `gapfill -g` | Uses spanning-contig evidence and source-aware graph walks to fill conservative contig gaps. |
 | BED coordinates plus graph/assembly relationships | `liftover -m -b` | Transfers BED intervals through one or more coordinate maps. |
 | SAM/BAM with low MAPQ in known homologous regions | `mapq_boost -m` | Removes homology-only ambiguity from MAPQ decisions. |
 | A standalone non-overlap graph is needed | `deoverlap -g` | Converts an overlap GFA and writes a map. |
@@ -73,9 +73,9 @@ This command first writes collapsed GFAs for each tissue, then writes the combin
 
 For difficult repetitive graphs, `--repeat_mask MIN_LEN,MAX_PERIOD,MAX_MISMATCH` masks short tandem repeats during alignment, and `--no_cx` disables complex-region filtering. Both are advanced choices: the former costs time; the latter can permit unreliable complex-graph merges.
 
-## `gapfill`: use cross-tissue paths to close contig gaps
+## `gapfill`: use source-aware node walks to close contig gaps
 
-`gapfill` takes the final output of CTG-mode `collapse`, not the original `p_ctg` GFAs. It searches for a bridge that is compatible with phase and supported by overlaps on both sides of a gap. Ambiguous bridges are intentionally rejected.
+`gapfill` takes the final output of CTG-mode `collapse`, not the original `p_ctg` GFAs. A real spanning contig must support both sides of a gap and establish trusted shared-node boundaries. The sequence between those anchors is then selected by a source-aware graph walk: it prefers one sample/haplotype source and softly avoids nodes already used by the other haplotype, while shared homologous nodes remain available. Ambiguous connections are rejected.
 
 ```bash
 liftasm gapfill \
@@ -83,23 +83,25 @@ liftasm gapfill \
   -g out.iter3.collapse.gfa
 ```
 
-With the default prefix, the report is `out.gapfill.tsv`. The command also writes a relocation report and an HTML report, plus per-tissue, primary, and low-quality haplotype GFAs.
+With the default prefix, the report is `out.gapfill.tsv`. The command also writes a relocation report and an HTML report, plus per-tissue, primary, and low-quality haplotype GFAs. Bubbles that map unambiguously to the final primary node paths are written separately as `out.primary.hap1.gapfill.bubbles.vcf` and `out.primary.hap2.gapfill.bubbles.vcf`; each file uses its own primary haplotype as the reference coordinate system and standard 1-based VCF coordinates.
+
+`--full_phase` accepts one or more base sample names (the names supplied to `collapse -n`). Full-phase targets may exchange haplotype contigs according to local bubble-phase evidence, and only listed full-phase samples may supply their bridges. Samples not listed are joined within the original haplotype.
 
 | Option | What it controls | When to change it |
 | --- | --- | --- |
-| `--min_match FLOAT` `[0.9]` | Minimum matching-base fraction required from each boundary hit. | Raise it for more conservative boundary placement. |
-| `--min_ali_ratio FLOAT` `[0.05]` | Minimum aligned fraction required from each boundary hit. | Raise it to ignore short local hits. |
-| `--min_mapq INT` `[30]` | Minimum mapping quality required from each boundary hit. | Raise it when repeats create ambiguous hits. |
-| `--end_skip INT` `[500kb]` | Terminal sequence skipped when choosing trusted graph anchors. | Reduce it when contig ends are known to be accurate. |
+| `--full_phase STR ...` | Samples assembled with chromosome-scale phase information. | List Hi-C, Pore-C, or trio-phased samples; omit ordinary locally phased assemblies. |
+| `--depth INT` `[100k]` | Maximum graph distance searched for one bubble or gap walk. | Increase only when a valid walk exceeds the default node depth. |
+| `--DFS_guard INT` `[1M]` | Maximum visited states for one bubble or gap walk. | Increase when a complex but valid region reaches the search limit. |
+| `--min_match FLOAT` `[0.9]` | Minimum matching-base fraction in relocation and deduplication alignments. | Raise it for more conservative sequence checks. |
+| `--min_ali_ratio FLOAT` `[0.05]` | Minimum aligned fraction in relocation and deduplication alignments. | Raise it to ignore short local hits. |
+| `--min_mapq INT` `[30]` | Minimum mapping quality in relocation and deduplication alignments. | Raise it when repeats create ambiguous hits. |
 | `--min_contig INT` `[1Mb]` | Shortest contig considered as evidence. | Raise it to avoid noisy short contigs. |
 | `--max_gap INT` `[10Mb]` | Largest graph gap eligible for filling. | Lower it when only short joins are trusted. |
 | `--max_overlap FLOAT` `[0.1]` | Largest allowed overlap between the two target contigs. | Lower it to reject heavily overlapping target pairs. |
-| `--min_overlap INT` `[1Mb]` | Required overlap between a fill path and each target contig. | Raise for stricter bridges. |
-| `--min_similarity FLOAT` `[0.7]` | Required minimizer similarity in each local gap-boundary window. | Raise for closer samples or stricter fills. |
-| `--boundary_coverage FLOAT` `[0.8]` | Minimum query coverage of the retained collinear hit chain. | Lower it only when real boundaries are highly fragmented. |
-| `--min_conf FLOAT` `[0.5]` | Minimum combined sample, local-phase, and alignment confidence. | Raise when many samples are available and conservatism is preferred. |
+| `--min_overlap INT` `[1Mb]` | Required shared-node overlap between a bridge and each target contig. | Raise for stricter connection evidence. |
+| `--min_similarity FLOAT` `[0.7]` | Required shared-node similarity for homologous spanning evidence. | Raise for closer samples or stricter sibling-path evidence. |
 | `--phase_len INT` `[10]` | Use only bubbles whose every internal path is at most this many bp. | Normally leave unchanged. |
-| `--phase_win`, `--phase_min_bp` | Window step and minimum amount of local bubble evidence. | Adjust only when reviewing phase failures. |
+| `--phase_win` | Local window used once for bubble phase evidence. | Defaults to 500 kb; a boundary with no bubble evidence is reported as `.`. |
 | `--dedup_sim FLOAT` `[0.95]` | Similarity threshold for removing redundant contigs/components. | Lower only if legitimate near-duplicate contigs must be retained. |
 
 ## `deoverlap`: create a standalone non-overlap graph

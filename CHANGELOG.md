@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.1.3-r23 (2026-08-19)
+
+### Added
+
+- Added source-aware node-level gap walks with sample-haplotype soft masking.
+- Added `--full_phase` for phase-supported haplotype exchange at overlapping diploid gaps.
+- Added separate haplotype-1 and haplotype-2 bubble VCFs on the final primary contig coordinates.
+
+### Changed
+
+- Use spanning contigs only to prove connections and choose shared-node boundaries; fill sequence now comes from the graph walk.
+
 ## v0.1.3-r22 (2026-08-16)
 
 ### Improved

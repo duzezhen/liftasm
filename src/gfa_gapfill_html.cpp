@@ -72,35 +72,24 @@ void GfaGapfill::write_html_(const std::vector<Candidate>& candidates) const {
         connection.phase_left_bridge_bp = candidate.left_boundary.phase.bridge_bp;
         connection.phase_right_target_bp = candidate.right_boundary.phase.target_bp;
         connection.phase_right_bridge_bp = candidate.right_boundary.phase.bridge_bp;
-        connection.boundary_left = candidate.left_boundary.minimizer;
-        connection.boundary_right = candidate.right_boundary.minimizer;
-        connection.identity_left = candidate.left_boundary.identity;
-        connection.coverage_left = candidate.left_boundary.coverage;
-        connection.identity_right = candidate.right_boundary.identity;
-        connection.coverage_right = candidate.right_boundary.coverage;
-        connection.sample_score = candidate.sample_score;
         connection.phase_score = candidate.phase_score;
-        connection.alignment_score = candidate.alignment_score;
-        connection.confidence = candidate.confidence;
         connection.homolog_span = candidate.homolog_span;
-        connection.sample_support = candidate.sample_support;
-        connection.spanning_samples = candidate.spanning_samples;
 
-        const bool selected = candidate.status == Candidate::KEPT;
-        connection.left_cut_bp = selected ? candidate.left_boundary.target_cut_bp :
-            fragments_[candidate.left].path_bp[candidate.left_boundary.target_pos + 1];
-        connection.right_cut_bp = selected ? candidate.right_boundary.target_cut_bp :
-            fragments_[candidate.right].path_bp[candidate.right_boundary.target_pos];
-        connection.bridge_left_bp = selected ? candidate.left_boundary.bridge_cut_bp :
-            fragments_[candidate.bridge].path_bp[candidate.left_boundary.bridge_pos + 1];
-        connection.bridge_right_bp = selected ? candidate.right_boundary.bridge_cut_bp :
-            fragments_[candidate.bridge].path_bp[candidate.right_boundary.bridge_pos];
+        connection.left_cut_bp = candidate.left_boundary.target_cut_bp;
+        connection.right_cut_bp = candidate.right_boundary.target_cut_bp;
+        connection.bridge_left_bp = candidate.left_boundary.bridge_cut_bp;
+        connection.bridge_right_bp = candidate.right_boundary.bridge_cut_bp;
+        if (candidate.fill) {
+            connection.walk_length = candidate.fill->length;
+            connection.walk_left_cut_bp = candidate.fill->left_cut;
+            connection.walk_right_cut_bp = candidate.fill->right_cut;
+        }
 
         switch (candidate.status) {
             case Candidate::KEPT: connection.status = "keep"; break;
-            case Candidate::LOW_CONFIDENCE: connection.status = "drop:low-confidence"; break;
+            case Candidate::NO_PATH: connection.status = "drop:no-path"; break;
+            case Candidate::PAIR_CONFLICT: connection.status = "drop:pair-conflict"; break;
             case Candidate::USED_END: connection.status = "drop:used-end"; break;
-            case Candidate::PHASE_CONFLICT: connection.status = "drop:phase-conflict"; break;
             case Candidate::COORDINATE_CONFLICT: connection.status = "drop:coordinate-conflict"; break;
             case Candidate::CYCLE: connection.status = "drop:cycle"; break;
             default: connection.status = "pending"; break;
@@ -132,11 +121,11 @@ select,input[type=search]{width:100%;padding:7px;margin-bottom:12px;border:1px s
 .coordinates{margin-top:9px}.evidence{width:100%;margin:10px 0 8px;border-collapse:collapse;font-size:11px;white-space:nowrap}.evidence th,.evidence td{padding:5px 4px;border-bottom:1px solid #e7eaf0;text-align:right}.evidence th:first-child{text-align:left}.evidence thead th{color:#607087;font-weight:700}.support{color:#536174;font-size:12px}
 #candidatePanel{min-height:0;flex:1;overflow:auto;padding:11px 16px 14px}#summary{margin:0 0 10px;color:#536174}.tools{display:flex;gap:7px;margin:-4px 0 7px}.tool{padding:6px 11px;border:1px solid #bcc6d4;border-radius:6px;background:#fff;color:#34435a;cursor:pointer}.tool:hover{background:#edf4ff}
 .candidate{width:100%;padding:10px 11px;margin:0 0 8px;text-align:left;border:1px solid #dde3ec;border-left:4px solid #aab4c3;border-radius:8px;background:white;cursor:pointer;transition:background .14s,border-color .14s,box-shadow .14s,transform .14s}.candidate.keep{border-left-color:#159447}.candidate:hover{background:#edf4ff;transform:translateY(-1px);box-shadow:0 4px 10px #1b35551a}.candidate.active{border-color:#e4572e;border-left:7px solid #e4572e;background:linear-gradient(110deg,#fff0e9,#fff);box-shadow:0 0 0 2px #e4572e26,0 7px 18px #b83f1e24;transform:none}.candidate.active .route{color:#b53618}.route{display:block;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.via,.metrics{display:block;margin-top:3px;color:#657286;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#view{overflow:auto;position:relative;background:#fff;scroll-behavior:smooth}svg{min-height:100%;background:#fff}.lane{fill:#f8faff}.lane.alt{fill:#fff}.row{stroke:#e2e7ef;stroke-width:1}.axis{font-size:10px;fill:#77859a}.sample{font-size:12px;font-weight:700;fill:#34435a}.edge{fill:none;stroke:#9aa5b5;stroke-width:1.5;opacity:.20;cursor:pointer;transition:opacity .18s,stroke-width .18s}.edge.keep{stroke:#159447;stroke-width:2.5;opacity:.82}.edge.related{opacity:.42}.edge.active{stroke:#e4572e;stroke-width:4;opacity:1}.edge.dim{opacity:.025}.bridge-span{stroke-width:7;stroke-linecap:round;opacity:.32}.bridge-span.keep{opacity:.9}.anchor{stroke:white;stroke-width:1.5;fill:#7d8999;opacity:.7}.anchor.keep{fill:#159447;opacity:1}.anchor.active{fill:#e4572e}
+#view{overflow:auto;position:relative;background:#fff;scroll-behavior:smooth}svg{min-height:100%;background:#fff}.lane{fill:#f8faff}.lane.alt{fill:#fff}.row{stroke:#e2e7ef;stroke-width:1}.axis{font-size:10px;fill:#77859a}.sample{font-size:12px;font-weight:700;fill:#34435a}.edge{fill:none;stroke:#9aa5b5;stroke-width:1.5;opacity:.20;cursor:pointer;transition:opacity .18s,stroke-width .18s}.edge.keep{stroke:#159447;stroke-width:2.5;opacity:.82}.edge.active{stroke:#e4572e;stroke-width:4;opacity:1}.bridge-span{stroke-width:7;stroke-linecap:round;opacity:.32}.bridge-span.keep{opacity:.9}.anchor{stroke:white;stroke-width:1.5;fill:#7d8999;opacity:.7}.anchor.keep{fill:#159447;opacity:1}.anchor.active{fill:#e4572e}
 .node{transition:opacity .18s}.node rect{fill:#edf2f8;fill-opacity:.82;stroke:#8492a6;stroke-width:1}.node.h1 rect{fill:#d9eaff;stroke:#3274c5}.node.h2 rect{fill:#ffe2e5;stroke:#d25763}.node.active rect{fill-opacity:1;stroke:#e4572e;stroke-width:3;filter:drop-shadow(0 3px 5px #e4572e55)}.node text{font-size:10px;pointer-events:none;fill:#1d2a3d}
 .legend{display:flex;gap:12px;margin:2px 0 12px;color:#536174}.dot:before{content:'';display:inline-block;width:12px;height:3px;margin-right:5px;vertical-align:middle;background:#9aa5b5}.dot.keep:before{background:#159447}
 #tooltip{position:fixed;display:none;max-width:420px;padding:7px 9px;border-radius:5px;background:#17243a;color:white;font-size:12px;line-height:1.4;white-space:pre-line;pointer-events:none;z-index:5;box-shadow:0 3px 12px #10182855}
-</style></head><body><header>liftasm gap-fill <small>contig → bridge interval → contig</small></header><main><aside><div class="controls">
+</style></head><body><header>liftasm gap-fill <small>spanning evidence + node-level walk</small></header><main><aside><div class="controls">
 <label for="component">Component</label><select id="component"></select>
 <label for="status">Connections</label><select id="status"><option value="all">All candidates</option><option value="keep">Kept only</option><option value="drop">Rejected only</option></select>
 <label for="query">Find candidate</label><input id="query" type="search" placeholder="contig or sample">
@@ -177,23 +166,15 @@ const N=)HTML");
              << ",plb:" << connection.phase_left_bridge_bp
              << ",prt:" << connection.phase_right_target_bp
              << ",prb:" << connection.phase_right_bridge_bp
-             << ",ml:" << connection.boundary_left
-             << ",mr:" << connection.boundary_right
-             << ",il:" << connection.identity_left
-             << ",cl:" << connection.coverage_left
-             << ",ir:" << connection.identity_right
-             << ",cr:" << connection.coverage_right
-             << ",sscore:" << connection.sample_score
              << ",qscore:" << connection.phase_score
-             << ",ascore:" << connection.alignment_score
-             << ",cf:" << connection.confidence
-             << ",ss:" << connection.sample_support
-             << ",sp:" << connection.spanning_samples
              << ",hs:" << (connection.homolog_span ? 1 : 0)
              << ",lp:" << connection.left_cut_bp
              << ",rp:" << connection.right_cut_bp
              << ",bl:" << connection.bridge_left_bp
              << ",br:" << connection.bridge_right_bp
+             << ",wl:" << connection.walk_length
+             << ",wlc:" << connection.walk_left_cut_bp
+             << ",wrc:" << connection.walk_right_cut_bp
              << ",st:" << json_string(connection.status) << "}";
         out.save(line.str());
     }
@@ -205,10 +186,10 @@ function visible(e){const status=filter.value==='all'||(filter.value==='keep'&&e
 function fmt(n){return n.toLocaleString()}
 function val(n){return n<0?'NA':n.toFixed(2)}
 function esc(s){return s.replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
-function sourceInterval(n,begin,end){if(n.rv){const old=begin;begin=n.b-end;end=n.b-old}return esc(n.n)+'@'+fmt(begin)+'-'+fmt(end)+(n.rv?'-':'+')}
-function tipText(e){return byId.get(e.l).n+' → '+byId.get(e.r).n+'\nvia '+byId.get(e.b).n+'\nphase '+val(e.pl)+' / '+val(e.prh)+' · support '+e.ss+'/'+e.sp+' · confidence '+e.cf.toFixed(2)}
+function sourceInterval(n,begin,end){if(n.rv){const old=begin;begin=n.b-end;end=n.b-old}return esc(n.n)+':'+fmt(begin)+'-'+fmt(end)+(n.rv?'-':'+')}
+function tipText(e){return byId.get(e.l).n+' → '+byId.get(e.r).n+'\nbridge '+byId.get(e.b).n+'\nwalk '+fmt(e.wl)+' bp · cuts '+fmt(e.wlc)+'/'+fmt(e.wrc)+'\nphase '+val(e.pl)+' / '+val(e.prh)}
 function bindTip(mark,e){mark.onpointermove=function(event){tooltip.style.display='block';tooltip.style.left=Math.min(innerWidth-430,event.clientX+14)+'px';tooltip.style.top=Math.min(innerHeight-80,event.clientY+14)+'px';tooltip.textContent=tipText(e)};mark.onpointerleave=function(){tooltip.style.display='none'}}
-function describe(e){const l=byId.get(e.l),r=byId.get(e.r),b=byId.get(e.b);return '<div><b>Status:</b> '+esc(e.st)+' &nbsp; <b>Component:</b> '+e.c+'</div><div class="coordinates"><b>Left:</b> '+sourceInterval(l,0,e.lp)+'<br><b>Right:</b> '+sourceInterval(r,e.rp,r.b)+'<br><b>Bridge:</b> '+sourceInterval(b,e.bl,e.br)+'</div><table class="evidence"><thead><tr><th>Boundary</th><th>Phase</th><th>Bubble bp</th><th>Minimizer</th><th>Identity</th><th>Coverage</th></tr></thead><tbody><tr><th>Left</th><td>'+val(e.pl)+'</td><td>'+fmt(e.plt)+'/'+fmt(e.plb)+'</td><td>'+val(e.ml)+'</td><td>'+val(e.il)+'</td><td>'+val(e.cl)+'</td></tr><tr><th>Right</th><td>'+val(e.prh)+'</td><td>'+fmt(e.prt)+'/'+fmt(e.prb)+'</td><td>'+val(e.mr)+'</td><td>'+val(e.ir)+'</td><td>'+val(e.cr)+'</td></tr></tbody></table><div class="support">Other hap spans gap: '+(e.hs?'yes':'no')+'<br>Sample support: '+e.ss+' / '+e.sp+'<br>Evidence: sample '+e.sscore.toFixed(2)+' · phase '+e.qscore.toFixed(2)+' · alignment '+e.ascore.toFixed(2)+'<br><b>Confidence: '+e.cf.toFixed(2)+'</b></div>'}
+function describe(e){const l=byId.get(e.l),r=byId.get(e.r),b=byId.get(e.b);return '<div><b>Status:</b> '+esc(e.st)+' &nbsp; <b>Component:</b> '+e.c+'</div><div class="coordinates"><b>Left:</b> '+sourceInterval(l,0,e.lp)+'<br><b>Right:</b> '+sourceInterval(r,e.rp,r.b)+'<br><b>Bridge:</b> '+sourceInterval(b,e.bl,e.br)+'<br><b>Node walk:</b> '+fmt(e.wl)+' bp, cuts '+fmt(e.wlc)+'/'+fmt(e.wrc)+'</div><table class="evidence"><thead><tr><th>Boundary</th><th>Phase</th><th>Bubble bp</th></tr></thead><tbody><tr><th>Left</th><td>'+val(e.pl)+'</td><td>'+fmt(e.plt)+'/'+fmt(e.plb)+'</td></tr><tr><th>Right</th><td>'+val(e.prh)+'</td><td>'+fmt(e.prt)+'/'+fmt(e.prb)+'</td></tr></tbody></table><div class="support">Other hap spans gap: '+(e.hs?'yes':'no')+'<br>Phase score: '+e.qscore.toFixed(2)+'</div>'}
 let selectedEdge=null;
 function centerEdge(id){const marks=svg.querySelectorAll('[data-e="'+id+'"]');let left=Infinity,right=-Infinity,top=Infinity,bottom=-Infinity;marks.forEach(function(mark){const box=mark.getBBox();left=Math.min(left,box.x);right=Math.max(right,box.x+box.width);top=Math.min(top,box.y);bottom=Math.max(bottom,box.y+box.height)});if(left!==Infinity)view.scrollTo({left:Math.max(0,(left+right-view.clientWidth)/2),top:Math.max(0,(top+bottom-view.clientHeight)/2),behavior:'smooth'})}
 function selectEdge(id){selectedEdge=selectedEdge===id?null:id;render();if(selectedEdge!==null)requestAnimationFrame(function(){centerEdge(id)})}
@@ -231,7 +212,7 @@ function render(){
   edges.forEach(function(e){const a=byId.get(e.l),m=byId.get(e.b),z=byId.get(e.r),active=focused?' active':'';if(!a||!m||!z)return;const points=[{x:anchorX(a,e.lp,scale,left,origin),y:pos.get(a.s+'\t'+a.h)},{x:anchorX(m,e.bl,scale,left,origin),y:pos.get(m.s+'\t'+m.h)},{x:anchorX(m,e.br,scale,left,origin),y:pos.get(m.s+'\t'+m.h)},{x:anchorX(z,e.rp,scale,left,origin),y:pos.get(z.s+'\t'+z.h)}];[[points[0],points[1]],[points[2],points[3]]].forEach(function(pair){const middle=(pair[0].y+pair[1].y)/2,path=S('path',{d:'M'+pair[0].x+','+pair[0].y+' C'+pair[0].x+','+middle+' '+pair[1].x+','+middle+' '+pair[1].x+','+pair[1].y,class:'edge '+(e.st==='keep'?'keep':'')+active,'data-e':e.i});path.onclick=function(){selectEdge(e.i)};bindTip(path,e);svg.appendChild(path)})});
   nodes.sort(function(a,b){return a.s.localeCompare(b.s)||a.h-b.h||a.x-b.x}).forEach(function(n){const y=pos.get(n.s+'\t'+n.h),nodeBegin=Math.max(n.x,origin),nodeEnd=Math.min(n.x+n.b,origin+span);if(nodeEnd<=nodeBegin)return;const x=left+(nodeBegin-origin)*scale,w=Math.max(1,(nodeEnd-nodeBegin)*scale),g=S('g',{class:'node h'+n.h+(focused?' active':''),'data-n':n.i});g.appendChild(S('rect',{x:x,y:y-(focused?16:11),width:w,height:focused?32:22,rx:3}));if(w>55)g.appendChild(S('text',{x:x+w/2,y:y+4,'text-anchor':'middle'},n.n.length>34?n.n.slice(0,31)+'...':n.n));g.appendChild(S('title',{},n.n+'\ncomponent: '+(n.x/1000000).toFixed(3)+'-'+((n.x+n.b)/1000000).toFixed(3)+' Mb\nlength: '+fmt(n.b)+' bp\norientation: '+(n.rv?'reverse':'forward')+'\n'+n.a+' -> '+n.z));g.onclick=function(event){event.stopPropagation();const edge=edges.find(function(e){return e.l===n.i||e.r===n.i||e.b===n.i});if(edge)selectEdge(edge.i)};svg.appendChild(g)});
   edges.forEach(function(e){const m=byId.get(e.b),y=pos.get(m.s+'\t'+m.h),x1=anchorX(m,e.bl,scale,left,origin),x2=anchorX(m,e.br,scale,left,origin),kind=(e.st==='keep'?'keep ':'')+(focused?'active':'');const bridgeMark=S('line',{x1:x1,y1:y,x2:x2,y2:y,class:'edge bridge-span '+kind,'data-e':e.i});bridgeMark.onclick=function(){selectEdge(e.i)};bindTip(bridgeMark,e);svg.appendChild(bridgeMark);[x1,x2].forEach(function(x){const dot=S('circle',{cx:x,cy:y,r:focused?6:4,class:'edge anchor '+kind,'data-e':e.i});dot.onclick=function(){selectEdge(e.i)};bindTip(dot,e);svg.appendChild(dot)})});
-  list.replaceChildren();edges.slice().sort(function(a,b){return(a.st==='keep'?0:1)-(b.st==='keep'?0:1)||byId.get(a.l).x-byId.get(b.l).x}).forEach(function(e){const button=document.createElement('button'),route=document.createElement('span'),via=document.createElement('span'),metrics=document.createElement('span');button.className='candidate '+(e.st==='keep'?'keep ':'')+(focused?'active':'');button.dataset.e=e.i;route.className='route';route.textContent=byId.get(e.l).n+' → '+byId.get(e.r).n;via.className='via';via.textContent='via '+byId.get(e.b).n;metrics.className='metrics';metrics.textContent=e.st+' · confidence '+e.cf.toFixed(2)+' · support '+e.ss+'/'+e.sp;button.append(route,via,metrics);button.onclick=function(){selectEdge(e.i)};list.appendChild(button)});
+  list.replaceChildren();edges.slice().sort(function(a,b){return(a.st==='keep'?0:1)-(b.st==='keep'?0:1)||byId.get(a.l).x-byId.get(b.l).x}).forEach(function(e){const button=document.createElement('button'),route=document.createElement('span'),via=document.createElement('span'),metrics=document.createElement('span');button.className='candidate '+(e.st==='keep'?'keep ':'')+(focused?'active':'');button.dataset.e=e.i;route.className='route';route.textContent=byId.get(e.l).n+' → '+byId.get(e.r).n;via.className='via';via.textContent='bridge '+byId.get(e.b).n+' · walk '+fmt(e.wl)+' bp';metrics.className='metrics';metrics.textContent=e.st+' · phase '+e.qscore.toFixed(2);button.append(route,via,metrics);button.onclick=function(){selectEdge(e.i)};list.appendChild(button)});
   selection.classList.toggle('focused',focused);if(focused)detail.innerHTML=describe(focus);else detail.textContent='Click a connection or candidate.';const kept=edges.filter(function(e){return e.st==='keep'}).length;summary.textContent=focused?'Focused connection · '+nodes.length+' contigs':nodes.length+' contigs · '+kept+' kept · '+(edges.length-kept)+' rejected';view.scrollTo({left:0,top:0})
 }
 [...new Set(N.map(function(n){return n.c}))].sort(function(a,b){return a-b}).forEach(function(c){const o=document.createElement('option');o.value=c;o.textContent='component '+c;comp.appendChild(o)});comp.onchange=function(){selectedEdge=null;render()};filter.onchange=function(){selectedEdge=null;render()};query.oninput=function(){selectedEdge=null;render()};$('fit').onclick=function(){zoom.value=1;render()};$('clear').onclick=function(){selectedEdge=null;render()};let zoomFrame=0;zoom.oninput=function(){cancelAnimationFrame(zoomFrame);zoomFrame=requestAnimationFrame(render)};svg.onclick=function(event){if(!event.target.closest('[data-e],[data-n]')){selectedEdge=null;render()}};document.onkeydown=function(event){if(event.key==='Escape')$('clear').click()};render();

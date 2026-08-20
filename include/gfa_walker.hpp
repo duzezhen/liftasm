@@ -145,3 +145,40 @@ private:
 /* ================================================================================================================
  *                                            GFA WALKER END
  * ================================================================================================================ */
+
+
+/* ================================================================================================================
+ *                                       SOURCE-AWARE WALKER START
+ * ================================================================================================================ */
+class GfaSourceWalker {
+public:
+    struct Options {
+        // Sample IDs come from GfaGraph::getSampleNames(); source_scope excludes non-haplotype SN labels.
+        uint32_t preferred_source{UINT32_MAX};
+        const std::unordered_set<uint32_t>* source_scope{nullptr};
+        const std::unordered_map<uint64_t, std::vector<uint32_t>>* transition_sources{nullptr}; // oriented P-path edge -> source IDs
+        const std::vector<uint8_t>* soft_blocked{nullptr};  // dense bit flags indexed by unoriented segment ID
+        uint8_t soft_block_mask{1};
+        uint32_t max_depth{4096};
+        uint64_t max_bp{UINT64_MAX}, max_states{1000000};
+        bool skip_comp{false};
+    };
+
+    struct Result {
+        std::vector<uint32_t> vertices;  // source and sink included
+        uint64_t states{0};
+        bool truncated{false};
+
+        explicit operator bool() const { return !vertices.empty(); }
+    };
+
+    explicit GfaSourceWalker(const GfaGraph& graph);
+    Result walk(uint32_t source, uint32_t sink, const Options& options) const;
+    Result walk(uint32_t source, uint32_t sink) const { return walk(source, sink, Options{}); }
+
+private:
+    const GfaGraph& graph_;
+};
+/* ================================================================================================================
+ *                                        SOURCE-AWARE WALKER END
+ * ================================================================================================================ */

@@ -4,6 +4,7 @@
 
 #include <iomanip>
 #include <numeric>
+#include <optional>
 #include <type_traits>
 
 namespace GfaBubble {
@@ -760,10 +761,11 @@ void GfaBubbleFinder::save_bubble_as_vcf(
     const std::string& paf_file,
     const std::string& ref_file,
     uint32_t min_mapq,
-    uint32_t min_aln_len
+    uint32_t min_aln_len,
+    const std::vector<ReferencePath>* reference_paths
 ) const {
     BubbleWriter(graph_, bubbles_, homologous_paths_).save_vcf(
-        output_prefix, paf_file, ref_file, min_mapq, min_aln_len
+        output_prefix, paf_file, ref_file, min_mapq, min_aln_len, reference_paths
     );
 }
 
@@ -3839,27 +3841,235 @@ void BubbleWriter::save_gfa(
     log_stream() << "  - Total records written: " << nb + nh << "\n\n";
 }
 
+// ------------------------------------------------ Primary path coordinate index ------------------------------------------------
+namespace {
+
+class PrimaryPathIndex {
+public:
+    struct Match {
+        uint32_t path_id{UINT32_MAX};
+        uint32_t allele_id{UINT32_MAX};
+        uint32_t begin{0};
+        uint32_t end{0};
+        uint64_t source_pos{0};
+        uint64_t sink_pos{0};
+        bool reverse{false};
+    };
+
+    PrimaryPathIndex(
+        const GfaGraph& graph,
+        const std::vector<ReferencePath>& reference_paths,
+        const std::vector<Bubble>& bubbles
+    )
+        : graph_(graph)
+    {
+        anchor_vertices_.reserve(bubbles.size() * 2);
+        for (const Bubble& bubble : bubbles) {
+            if (bubble.get_source() == UINT32_MAX || bubble.get_sink() == UINT32_MAX) continue;
+            anchor_vertices_.insert(bubble.get_source());
+            anchor_vertices_.insert(bubble.get_sink() ^ 1u);
+        }
+        occurrences_.reserve(anchor_vertices_.size());
+        paths_.reserve(reference_paths.size());
+        for (const ReferencePath& path : reference_paths) add_path_(path);
+    }
+
+    const std::string& name(uint32_t path_id) const { return paths_[path_id].path->name; }
+    uint64_t length(uint32_t path_id) const { return paths_[path_id].length; }
+    size_t size() const { return paths_.size(); }
+
+    bool find_unique(const Bubble& bubble, Match& match, bool& multiple) const
+    {
+        match = {};
+        multiple = false;
+        bool found = false;
+
+        const auto record = [&](const Occurrence& occurrence, uint32_t allele_id, uint32_t path_size, bool reverse) {
+            const IndexedPath& path = paths_[occurrence.path_id];
+            const uint32_t last = occurrence.position + path_size - 1;
+
+            Match candidate;
+            candidate.path_id = occurrence.path_id;
+            candidate.allele_id = allele_id;
+            candidate.begin = occurrence.position;
+            candidate.end = last;
+            candidate.reverse = reverse;
+
+            if (!reverse) {
+                candidate.source_pos = path.begins[occurrence.position]
+                    + graph_.getNodeLength(Vertex::get_segment_id(path.path->vertices[occurrence.position])) - 1;
+                candidate.sink_pos = path.begins[last];
+            } else {
+                candidate.sink_pos = path.begins[occurrence.position]
+                    + graph_.getNodeLength(Vertex::get_segment_id(path.path->vertices[occurrence.position])) - 1;
+                candidate.source_pos = path.begins[last];
+            }
+
+            if (!found) {
+                match = candidate;
+                found = true;
+                return true;
+            }
+
+            // Multiple identical alleles at the same primary interval are one placement.
+            if (match.path_id == candidate.path_id && match.begin == candidate.begin && match.end == candidate.end) return true;
+            multiple = true;
+            return false;
+        };
+
+        const auto& alleles = bubble.get_paths();
+        for (uint32_t allele_id = 0; allele_id < alleles.size() && !multiple; ++allele_id) {
+            const std::vector<uint32_t>& allele = alleles[allele_id];
+            if (allele.empty() || allele.front() != bubble.get_source() || allele.back() != bubble.get_sink()) continue;
+
+            find_matches_(allele, false, [&](const Occurrence& occurrence) {
+                return record(occurrence, allele_id, static_cast<uint32_t>(allele.size()), false);
+            });
+            if (multiple) break;
+
+            find_matches_(allele, true, [&](const Occurrence& occurrence) {
+                return record(occurrence, allele_id, static_cast<uint32_t>(allele.size()), true);
+            });
+        }
+        return found && !multiple;
+    }
+
+private:
+    static constexpr uint64_t HASH_BASE_ = 0x9e3779b185ebca87ULL;
+
+    struct Occurrence {
+        uint32_t path_id{0};
+        uint32_t position{0};
+    };
+
+    struct IndexedPath {
+        const ReferencePath* path{nullptr};
+        std::vector<uint64_t> begins;
+        std::vector<uint64_t> hash;
+        uint64_t length{0};
+    };
+
+    void add_path_(const ReferencePath& path)
+    {
+        IndexedPath indexed;
+        indexed.path = &path;
+        indexed.begins.resize(path.vertices.size());
+        indexed.hash.resize(path.vertices.size() + 1, 0);
+
+        const uint64_t vertex_count = graph_.getNumNodes() * 2;
+        for (uint32_t vertex : path.vertices) {
+            const uint32_t segment = Vertex::get_segment_id(vertex);
+            if (vertex >= vertex_count || graph_.getNodeDeleted(segment) || graph_.getNodeLength(segment) == 0) {
+                return;
+            }
+        }
+
+        const std::vector<uint32_t> overlaps = graph_.get_path_overlaps(path.vertices);
+        uint64_t assembled = 0;
+
+        for (size_t i = 0; i < path.vertices.size(); ++i) {
+            const uint32_t vertex = path.vertices[i];
+            const uint64_t node_length = graph_.getNodeLength(Vertex::get_segment_id(vertex));
+            const uint64_t overlap = i == 0 ? 0 : std::min<uint64_t>(overlaps[i - 1], node_length);
+            if (overlap > assembled) return;
+
+            indexed.begins[i] = assembled - overlap;
+            indexed.hash[i + 1] = indexed.hash[i] * HASH_BASE_ + uint64_t(vertex) + 1;
+            assembled = indexed.begins[i] + node_length;
+        }
+        indexed.length = assembled;
+
+        const uint32_t path_id = static_cast<uint32_t>(paths_.size());
+        paths_.push_back(std::move(indexed));
+        for (uint32_t position = 0; position < path.vertices.size(); ++position) {
+            const uint32_t vertex = path.vertices[position];
+            if (anchor_vertices_.contains(vertex)) occurrences_[vertex].push_back({path_id, position});
+        }
+    }
+
+    template<class Callback>
+    void find_matches_(const std::vector<uint32_t>& allele, bool reverse, Callback&& callback) const
+    {
+        const uint32_t first = reverse ? (allele.back() ^ 1u) : allele.front();
+        const auto occurrence_it = occurrences_.find(first);
+        if (occurrence_it == occurrences_.end()) return;
+
+        uint64_t expected_hash = 0;
+        uint64_t hash_power = 1;
+        if (!reverse) {
+            for (uint32_t vertex : allele) {
+                expected_hash = expected_hash * HASH_BASE_ + uint64_t(vertex) + 1;
+                hash_power *= HASH_BASE_;
+            }
+        } else {
+            for (auto it = allele.rbegin(); it != allele.rend(); ++it) {
+                expected_hash = expected_hash * HASH_BASE_ + uint64_t(*it ^ 1u) + 1;
+                hash_power *= HASH_BASE_;
+            }
+        }
+
+        const size_t size = allele.size();
+        for (const Occurrence& occurrence : occurrence_it->second) {
+            const IndexedPath& path = paths_[occurrence.path_id];
+            if (size > path.path->vertices.size() - occurrence.position) continue;
+
+            const uint64_t observed_hash = path.hash[occurrence.position + size]
+                - path.hash[occurrence.position] * hash_power;
+            if (observed_hash != expected_hash) continue;
+
+            bool equal = true;
+            for (size_t i = 0; i < size; ++i) {
+                const uint32_t expected = reverse ? (allele[size - i - 1] ^ 1u) : allele[i];
+                if (path.path->vertices[occurrence.position + i] != expected) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal && !callback(occurrence)) return;
+        }
+    }
+
+    const GfaGraph& graph_;
+    std::vector<IndexedPath> paths_;
+    std::unordered_set<uint32_t> anchor_vertices_;
+    std::unordered_map<uint32_t, std::vector<Occurrence>> occurrences_;
+};
+
+} // namespace
+
 void BubbleWriter::save_vcf(
     const std::string& output_prefix,
     const std::string& paf_file,
     const std::string& ref_file,
     uint32_t min_mapq,
-    uint32_t min_aln_len
+    uint32_t min_aln_len,
+    const std::vector<ReferencePath>* reference_paths
 ) const
 {
     // ------------------------------------------------ Initialization ------------------------------------------------
-    const bool use_liftover = !paf_file.empty();
+    const bool use_primary_paths = reference_paths != nullptr;
+    const bool use_liftover = !use_primary_paths && !paf_file.empty();
     const bool use_ref = !ref_file.empty();
-    const bool use_ref_sequence = use_liftover && use_ref;
+    const bool use_external_ref_sequence = use_liftover && use_ref;
+    const bool use_ref_sequence = use_primary_paths || use_external_ref_sequence;
+
+    std::optional<PrimaryPathIndex> primary_index;
+    if (use_primary_paths) primary_index.emplace(graph_, *reference_paths, bubbles_);
 
     log_stream() << "Writing bubble VCF to " << output_prefix << ".bubbles.vcf ...\n";
-    if (!use_liftover) {
+    if (use_primary_paths) {
+        log_stream() << "  - Using " << primary_index->size() << " primary contig paths as reference\n";
+        if (primary_index->size() != reference_paths->size()) {
+            warning_stream() << "  ! Skipped " << reference_paths->size() - primary_index->size()
+                             << " invalid primary contig path(s)\n";
+        }
+    } else if (!use_liftover) {
         log_stream() << "  - No PAF provided; using bubble positions from GFA\n";
     }
-    if (!use_ref) {
+    if (!use_primary_paths && !use_ref) {
         log_stream() << "  - No reference provided; REF will not be extracted\n";
     }
-    if (!use_liftover && use_ref) {
+    if (!use_primary_paths && !use_liftover && use_ref) {
         log_stream() << "  - No PAF provided; REF will not be extracted\n";
     }
 
@@ -3871,7 +4081,7 @@ void BubbleWriter::save_vcf(
     }
 
     liftover::SeqDB db;
-    if (use_ref_sequence && !db.load(ref_file)) {
+    if (use_external_ref_sequence && !db.load(ref_file)) {
         error_stream() << "Load ref failed: " << ref_file << "\n";
         std::exit(1);
     }
@@ -3883,20 +4093,27 @@ void BubbleWriter::save_vcf(
 
 
     // ------------------------------------------------ VCF Output ------------------------------------------------
-    oss << "##fileformat=VCFv4.2\n";
+    oss << "##fileformat=VCFv4.3\n";
     oss << "##source=liftasm bubble\n";
-    for (const auto& name : db.names) {
-        const std::string* seq = db.get(name);
-        if (!seq) continue;
-        oss << "##contig=<ID=" << name << ",length=" << seq->size() << ">\n";
+    if (use_primary_paths) {
+        for (uint32_t path_id = 0; path_id < primary_index->size(); ++path_id) {
+            oss << "##contig=<ID=" << primary_index->name(path_id)
+                << ",length=" << primary_index->length(path_id) << ">\n";
+        }
+    } else {
+        for (const auto& name : db.names) {
+            const std::string* seq = db.get(name);
+            if (!seq) continue;
+            oss << "##contig=<ID=" << name << ",length=" << seq->size() << ">\n";
+        }
     }
-    oss << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position\">\n";
-    oss << "##INFO=<ID=SRC,Number=1,Type=String,Description=\"Source node\">\n";
-    oss << "##INFO=<ID=SNK,Number=1,Type=String,Description=\"Sink node\">\n";
+    oss << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position (1-based, inclusive)\">\n";
+    oss << "##INFO=<ID=SRC,Number=1,Type=String,Description=\"Source node; reserved label separators are shown as |\">\n";
+    oss << "##INFO=<ID=SNK,Number=1,Type=String,Description=\"Sink node; reserved label separators are shown as |\">\n";
     oss << "##INFO=<ID=NS,Number=1,Type=Integer,Description=\"Number of paths\">\n";
     oss << "##INFO=<ID=LN,Number=1,Type=Integer,Description=\"Total inner bp\">\n";
     oss << "##INFO=<ID=NC,Number=1,Type=Integer,Description=\"Number of inner nodes\">\n";
-    oss << "##INFO=<ID=PN,Number=.,Type=String,Description=\"Path names in genotype order\">\n";
+    oss << "##INFO=<ID=PN,Number=.,Type=String,Description=\"Path names in genotype order; reserved label separators are shown as |\">\n";
     oss << "##INFO=<ID=VT,Number=.,Type=String,Description=\"Variant categories from bubble nodes\">\n";
     oss << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n";
     oss << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT";
@@ -3911,6 +4128,8 @@ void BubbleWriter::save_vcf(
 
     std::vector<VcfRecord> vcf_records;
     vcf_records.reserve(bubbles_.size());
+    uint64_t primary_unmatched = 0;
+    uint64_t primary_ambiguous = 0;
 
     for (const Bubble& bb : bubbles_) {
         if (bb.get_type() != "Normal") continue;
@@ -3947,21 +4166,37 @@ void BubbleWriter::save_vcf(
         }
         const std::string variant_types = collect_variant_types_(inner_segs);
 
-        BoundaryWindow src_bw, sink_bw;
-        if (!boundary_window_(src_name, true, src_len, src_bw)) continue;
-        if (!boundary_window_(sink_name, false, sink_len, sink_bw)) continue;
-
         std::string chrom;
         uint32_t ref_src_pos = 0;
         uint32_t ref_sink_pos = 0;
         bool bubble_need_rc_to_ref = false;
+        uint32_t primary_allele = UINT32_MAX;
 
-        if (!use_liftover) {
+        BoundaryWindow src_bw, sink_bw;
+        if (use_primary_paths) {
+            PrimaryPathIndex::Match match;
+            bool multiple = false;
+            if (!primary_index->find_unique(bb, match, multiple)) {
+                multiple ? ++primary_ambiguous : ++primary_unmatched;
+                continue;
+            }
+            if (match.source_pos > UINT32_MAX || match.sink_pos > UINT32_MAX) continue;
+
+            chrom = primary_index->name(match.path_id);
+            ref_src_pos = static_cast<uint32_t>(match.source_pos);
+            ref_sink_pos = static_cast<uint32_t>(match.sink_pos);
+            bubble_need_rc_to_ref = match.reverse;
+            primary_allele = match.allele_id;
+        } else if (!use_liftover) {
+            if (!boundary_window_(src_name, true, src_len, src_bw)) continue;
+            if (!boundary_window_(sink_name, false, sink_len, sink_bw)) continue;
             chrom = src_bw.chrom;
             ref_src_pos = src_bw.boundary;
             ref_sink_pos = sink_bw.boundary;
             bubble_need_rc_to_ref = (ref_src_pos > ref_sink_pos);
         } else {
+            if (!boundary_window_(src_name, true, src_len, src_bw)) continue;
+            if (!boundary_window_(sink_name, false, sink_len, sink_bw)) continue;
             std::vector<liftover::LIFTresult> src_hits = paf_liftover(
                 pafs, paf_ends, paf_idx_ends, src_bw.chrom, src_bw.win_beg, src_bw.win_end
             );
@@ -4020,17 +4255,21 @@ void BubbleWriter::save_vcf(
         std::vector<std::string> allele_seqs;   // sequence or ""
         std::vector<uint8_t> has_allele_seq;    // 1 = real sequence, 0 = missing
         std::vector<std::vector<uint32_t>> path_sample_ids;
+        std::vector<uint32_t> bubble_path_ids;
 
         path_names.reserve(bb.get_paths().size());
         allele_seqs.reserve(bb.get_paths().size());
         has_allele_seq.reserve(bb.get_paths().size());
         path_sample_ids.reserve(bb.get_paths().size());
+        bubble_path_ids.reserve(bb.get_paths().size());
 
-        for (const auto& p : bb.get_paths()) {
+        for (uint32_t path_id = 0; path_id < bb.get_paths().size(); ++path_id) {
+            const auto& p = bb.get_paths()[path_id];
             if (p.empty()) continue;
 
             path_names.push_back(path_name_u32_(p, src_seg, sink_seg));
             path_sample_ids.push_back(path_sample_ids_(p, src_seg, sink_seg));
+            bubble_path_ids.push_back(path_id);
 
             if (!use_ref_sequence) {
                 std::vector<uint32_t> inner_path;
@@ -4149,10 +4388,6 @@ void BubbleWriter::save_vcf(
             continue;
         }
 
-        const std::string* ref_ptr = db.get(chrom);
-        if (!ref_ptr) continue;
-        if (end > ref_ptr->size()) continue;
-
         VcfRecord rec;
         rec.chrom = chrom;
         rec.pos = beg + 1;
@@ -4174,7 +4409,21 @@ void BubbleWriter::save_vcf(
             continue;
         }
 
-        std::string ref_seq = ref_ptr->substr(beg, end - beg);
+        const std::string* ref_ptr = nullptr;
+        std::string ref_seq;
+
+        if (use_primary_paths) {
+            const auto selected = std::find(bubble_path_ids.begin(), bubble_path_ids.end(), primary_allele);
+            if (selected == bubble_path_ids.end()) continue;
+
+            const size_t selected_index = static_cast<size_t>(selected - bubble_path_ids.begin());
+            if (!has_allele_seq[selected_index]) continue;
+            ref_seq = allele_seqs[selected_index];
+        } else {
+            ref_ptr = db.get(chrom);
+            if (!ref_ptr || end > ref_ptr->size()) continue;
+            ref_seq = ref_ptr->substr(beg, end - beg);
+        }
         if (ref_seq.empty()) continue;
 
         uint32_t out_pos1 = beg + 1;
@@ -4188,6 +4437,7 @@ void BubbleWriter::save_vcf(
         }
 
         while (!called_alleles.empty() && !first_base_all_same_(ref_seq, called_alleles)) {
+            if (use_primary_paths) break;
             if (beg == 0) break;
             --beg;
             out_pos1 = beg + 1;
@@ -4196,6 +4446,7 @@ void BubbleWriter::save_vcf(
                 a.insert(a.begin(), (*ref_ptr)[beg]);
             }
         }
+        if (use_primary_paths && !first_base_all_same_(ref_seq, called_alleles)) continue;
 
         while (can_trim_prefix_(ref_seq, called_alleles)) {
             ref_seq.erase(ref_seq.begin());
@@ -4245,18 +4496,49 @@ void BubbleWriter::save_vcf(
         vcf_records.push_back(std::move(rec));
     }
 
-    std::sort(vcf_records.begin(), vcf_records.end(),
-        [](const VcfRecord& a, const VcfRecord& b) {
-            if (a.chrom != b.chrom) return a.chrom < b.chrom;
-            return a.pos < b.pos;
+    // Nested bubbles can normalize to the same VCF allele. Keep the larger
+    // bubble as the representative and merge its sample evidence below.
+    std::sort(vcf_records.begin(), vcf_records.end(), [](const VcfRecord& a, const VcfRecord& b) {
+        if (a.chrom != b.chrom) return a.chrom < b.chrom;
+        if (a.pos != b.pos) return a.pos < b.pos;
+        if (a.ref != b.ref) return a.ref < b.ref;
+        if (a.alt != b.alt) return a.alt < b.alt;
+        if (a.ln != b.ln) return a.ln > b.ln;
+        if (a.nc != b.nc) return a.nc > b.nc;
+        if (a.ns != b.ns) return a.ns > b.ns;
+        if (a.src != b.src) return a.src < b.src;
+        return a.snk < b.snk;
+    });
+
+    const size_t before_merge = vcf_records.size();
+    size_t kept = 0;
+    for (size_t i = 0; i < vcf_records.size(); ++i) {
+        if (kept > 0 && same_vcf_allele_(vcf_records[kept - 1], vcf_records[i])) {
+            merge_sample_genotypes_(vcf_records[kept - 1], vcf_records[i]);
+            continue;
         }
-    );
+        if (kept != i) vcf_records[kept] = std::move(vcf_records[i]);
+        ++kept;
+    }
+    vcf_records.resize(kept);
 
     for (size_t i = 0; i < vcf_records.size(); ++i) {
         normalize_vcf_record_(vcf_records, i);
         saver.save(vcf_record_string_(vcf_records[i]));
     }
 
+    if (use_primary_paths && primary_unmatched > 0) {
+        warning_stream() << "  ! Skipped " << primary_unmatched
+                         << " bubble(s) without an exact primary-path allele\n";
+    }
+    if (use_primary_paths && primary_ambiguous > 0) {
+        warning_stream() << "  ! Skipped " << primary_ambiguous
+                         << " bubble(s) with multiple exact primary-path placements\n";
+    }
+    if (before_merge > vcf_records.size()) {
+        log_stream() << "  - Duplicate VCF alleles merged: "
+                     << before_merge - vcf_records.size() << "\n";
+    }
     log_stream() << "  - Total VCF records written: " << vcf_records.size() << "\n\n";
 }
 
@@ -4528,20 +4810,88 @@ std::vector<std::string> BubbleWriter::sample_gt_tokens_(
     return out;
 }
 
+bool BubbleWriter::same_vcf_allele_(const VcfRecord& a, const VcfRecord& b)
+{
+    return a.chrom == b.chrom && a.pos == b.pos && a.ref == b.ref && a.alt == b.alt;
+}
+
+std::string BubbleWriter::merge_genotypes_(std::string_view a, std::string_view b)
+{
+    std::vector<uint32_t> alleles;
+    auto collect = [&alleles](std::string_view genotype) {
+        uint32_t allele = 0;
+        bool have_allele = false;
+        for (size_t i = 0; i <= genotype.size(); ++i) {
+            const char c = i < genotype.size() ? genotype[i] : '/';
+            if (c >= '0' && c <= '9') {
+                allele = allele * 10 + static_cast<uint32_t>(c - '0');
+                have_allele = true;
+            } else if (c == '/' || c == '|') {
+                if (have_allele) alleles.push_back(allele);
+                allele = 0;
+                have_allele = false;
+            }
+        }
+    };
+    collect(a);
+    collect(b);
+    if (alleles.empty()) return ".";
+
+    std::sort(alleles.begin(), alleles.end());
+    alleles.erase(std::unique(alleles.begin(), alleles.end()), alleles.end());
+    std::string merged;
+    for (uint32_t allele : alleles) {
+        if (!merged.empty()) merged.push_back('/');
+        merged += std::to_string(allele);
+    }
+    return merged;
+}
+
+void BubbleWriter::merge_sample_genotypes_(VcfRecord& target, const VcfRecord& duplicate)
+{
+    if (target.sample_gt_tokens.size() < duplicate.sample_gt_tokens.size()) {
+        target.sample_gt_tokens.resize(duplicate.sample_gt_tokens.size(), ".");
+    }
+    for (size_t i = 0; i < duplicate.sample_gt_tokens.size(); ++i) {
+        target.sample_gt_tokens[i] = merge_genotypes_(
+            target.sample_gt_tokens[i], duplicate.sample_gt_tokens[i]
+        );
+    }
+}
+
+// Keep graph labels readable while replacing characters that delimit VCF INFO values.
+std::string BubbleWriter::vcf_info_text_(std::string_view value, bool replace_comma)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (const unsigned char c : value) {
+        const bool separator = c == ';' || c == '=' || c == '%' ||
+            (replace_comma && c == ',') || c == '\r' || c == '\n' || c == '\t';
+        out.push_back(separator ? '|' : static_cast<char>(c));
+    }
+    return out;
+}
+
 std::string BubbleWriter::vcf_record_string_(const VcfRecord& record)
 {
     const std::vector<std::string>& gt = record.sample_gt_tokens.empty() ? record.gt_tokens : record.sample_gt_tokens;
+    std::vector<std::string> path_names;
+    path_names.reserve(record.path_names.size());
+    for (const std::string& name : record.path_names) {
+        path_names.push_back(vcf_info_text_(name));
+    }
+
     std::ostringstream out;
     out << record.chrom << '\t' << record.pos << '\t' << record.id << '\t'
         << record.ref << '\t' << record.alt << "\t.\tPASS\t"
         << "END=" << record.end
-        << ";SRC=" << record.src
-        << ";SNK=" << record.snk
+        << ";SRC=" << vcf_info_text_(record.src)
+        << ";SNK=" << vcf_info_text_(record.snk)
         << ";NS=" << record.ns
         << ";LN=" << record.ln
         << ";NC=" << record.nc
-        << ";PN=" << join_strings_(record.path_names, ",");
-    if (!record.vt.empty()) out << ";VT=" << record.vt;
+        << ";PN=" << join_strings_(path_names, ",");
+    if (!record.vt.empty()) out << ";VT=" << vcf_info_text_(record.vt, false);
     out << "\tGT\t" << join_strings_(gt, "\t") << '\n';
     return out.str();
 }

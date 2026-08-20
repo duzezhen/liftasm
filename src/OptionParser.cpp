@@ -868,10 +868,6 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--phase_len must be > 0"
             );
             ensure(
-                cfg.gapfill.phase_min_bp > 0,
-                "--phase_min_bp must be > 0"
-            );
-            ensure(
                 cfg.gapfill.phase_win > 0,
                 "--phase_win must be > 0"
             );
@@ -892,16 +888,8 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--min_similarity must be in [0,1]"
             );
             ensure(
-                cfg.gapfill.boundary_coverage >= 0.0 && cfg.gapfill.boundary_coverage <= 1.0,
-                "--boundary_coverage must be in [0,1]"
-            );
-            ensure(
                 cfg.gapfill.max_overlap >= 0.0 && cfg.gapfill.max_overlap <= 1.0,
                 "--max_overlap must be in [0,1]"
-            );
-            ensure(
-                cfg.gapfill.min_confidence >= 0.0 && cfg.gapfill.min_confidence <= 1.0,
-                "--min_conf must be in [0,1]"
             );
             ensure(
                 cfg.gapfill.misassembly_similarity >= 0.0 && cfg.gapfill.misassembly_similarity <= 1.0,
@@ -952,7 +940,7 @@ void help(char** argv, bool advanced) {
     hp.line("augment", "", "augment a GFA with VCF alleles as variant bubbles");
     hp.line("clean", "", "remove weak UTG links using contig read components (beta)");
     hp.line("collapse", "", "de-overlap and collapse homologous sequences into single nodes");
-    hp.line("gapfill", "", "fill sample contig gaps from unambiguous cross-sample paths");
+    hp.line("gapfill", "", "fill sample contig gaps with source-aware graph walks");
     hp.line("file2map", "", "convert GFA/PAF to map format for liftover");
     hp.line("liftover", "", "liftover coordinates using a coordinate map");
     hp.line("mapq_boost", "", "raise MAPQ for alignments in homologous regions using a coordinate map");
@@ -3572,7 +3560,7 @@ void help_gapfill(char** argv) {
     HelpPrinter hp(std::cerr, 27, 13);
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE [options]\n\n"
-        << "Fill sample contig gaps with unambiguous bridging paths from other samples.\n";
+        << "Fill supported contig gaps with source-aware node walks between trusted graph anchors.\n";
 
     hp.blank();
 
@@ -3581,6 +3569,7 @@ void help_gapfill(char** argv) {
     hp.line("-p, --prefix", "STR", "output prefix [" + GapfillOpts().prefix + "]");
     hp.note(" * <prefix>.<sample>.hap{1,2}.gapfill.{gfa,noseq.gfa}");
     hp.note(" * <prefix>.primary.hap{1,2}.gapfill.{gfa,noseq.gfa}");
+    hp.note(" * <prefix>.primary.hap{1,2}.gapfill.bubbles.vcf");
     hp.note(" * <prefix>.primary.hap{1,2}.lowQ.gapfill.{gfa,noseq.gfa}");
     hp.note(" * <prefix>.gapfill.{tsv,relocations.tsv,html}");
 
@@ -3589,7 +3578,6 @@ void help_gapfill(char** argv) {
     hp.section("Index options");
     hp.line("-k, --kmer", "INT", "minimizer k-mer size [" + std::to_string(GlobalOpts().kmerLen) + "]");
     hp.line("-w, --window", "INT", "minimizer window size [" + std::to_string(GlobalOpts().minimizerW) + "]");
-    hp.line("--max_occ", "INT", "ignore local bridge minimizers occurring more than this many times [" + std::to_string(GapfillOpts().max_occ) + "]");
 
     hp.blank();
 
@@ -3603,31 +3591,28 @@ void help_gapfill(char** argv) {
     hp.blank();
 
     hp.section("Bubble options");
-    hp.line("--depth", "INT", "maximum graph distance searched for one bubble [" + format_size_arg_(GapfillOpts().max_depth) + "]");
+    hp.line("--depth", "INT", "maximum graph distance searched for one bubble or gap walk [" + format_size_arg_(GapfillOpts().max_depth) + "]");
     hp.line("--paths", "INT", "maximum alternative paths kept for one bubble [" + format_size_arg_(GapfillOpts().max_paths) + "]");
-    hp.line("--DFS_guard", "INT", "stop one bubble search after this many visited states [" + format_size_arg_(GapfillOpts().DFS_guard) + "]");
+    hp.line("--DFS_guard", "INT", "stop one bubble or gap walk after this many visited states [" + format_size_arg_(GapfillOpts().DFS_guard) + "]");
     hp.line("--path_diff", "FLOAT", "group bubble paths whose minimizer difference is at most this [" + format_double_(GapfillOpts().path_diff) + "]");
     hp.line("--stall_rounds", "INT", "stop after this many rounds find no new path [" + format_size_arg_(GapfillOpts().stall_round_limit) + "]");
 
     hp.blank();
 
     hp.section("Phase options");
+    hp.line("--full_phase", "STR ...", "samples assembled with chromosome-scale phase information, e.g. trio-binned or Hi-C phased");
+    hp.note(" * Full-phase targets use only full-phase samples as spanning evidence and may exchange haplotypes");
     hp.line("--phase_len", "INT", "use a bubble only when all internal paths are at most this many bp [" + std::to_string(GapfillOpts().phase_path_len) + "]");
-    hp.line("--phase_win", "INT", "local phase window and extension step [" + format_size_arg_(GapfillOpts().phase_win) + "]");
-    hp.line("--phase_min_bp", "INT", "minimum bubble bp required from both paths [" + format_size_arg_(GapfillOpts().phase_min_bp) + "]");
-    hp.note(" * Phase evidence extends inward from the --end_skip boundary until enough bubble sequence is found");
+    hp.line("--phase_win", "INT", "local window used once for bubble phase evidence [" + format_size_arg_(GapfillOpts().phase_win) + "]");
     
     hp.blank();
 
     hp.section("Gap options");
-    hp.line("--end_skip", "INT", "skip this much terminal sequence when choosing trusted graph anchors [" + format_size_arg_(GapfillOpts().end_skip) + "]");
     hp.line("--min_contig", "INT", "do not use contigs shorter than this [" + format_size_arg_(GapfillOpts().min_contig) + "]");
     hp.line("--max_gap", "INT", "largest graph gap that may be filled [" + format_size_arg_(GapfillOpts().max_gap) + "]");
     hp.line("--max_overlap", "FLOAT", "largest allowed overlap between the two target contigs [" + format_double_(GapfillOpts().max_overlap) + "]");
-    hp.line("--min_overlap", "INT", "fill contig must overlap each target contig by at least this many bp [" + format_size_arg_(GapfillOpts().min_overlap) + "]");
-    hp.line("--min_similarity", "FLOAT", "minimum minimizer similarity in each local gap-boundary window [" + format_double_(GapfillOpts().min_similarity) + "]");
-    hp.line("--boundary_coverage", "FLOAT", "minimum chained-hit coverage for using an exact gap boundary [" + format_double_(GapfillOpts().boundary_coverage) + "]");
-    hp.line("--min_conf", "FLOAT", "minimum combined sample, phase, and alignment confidence [" + format_double_(GapfillOpts().min_confidence) + "]");
+    hp.line("--min_overlap", "INT", "bridge must share at least this many bp with each target contig [" + format_size_arg_(GapfillOpts().min_overlap) + "]");
+    hp.line("--min_similarity", "FLOAT", "minimum shared-node similarity for homologous spanning evidence [" + format_double_(GapfillOpts().min_similarity) + "]");
 
     hp.blank();
 
@@ -3663,7 +3648,6 @@ AppConfig main_gapfill(int argc, char** argv) {
 
         {"kmer",                   required_argument, nullptr, 'k'},
         {"window",                 required_argument, nullptr, 'w'},
-        {"max_occ",                required_argument, nullptr, 1001},
 
         {"preset",                 required_argument, nullptr, 'x'},
         {"zdrop",                  required_argument, nullptr, 'z'},
@@ -3677,18 +3661,15 @@ AppConfig main_gapfill(int argc, char** argv) {
         {"path_diff",              required_argument, nullptr, 3004},
         {"stall_rounds",           required_argument, nullptr, 3005},
 
-        {"phase_len",              required_argument, nullptr, 4001},
-        {"phase_win",              required_argument, nullptr, 4002},
-        {"phase_min_bp",           required_argument, nullptr, 4003},
+        {"full_phase",             required_argument, nullptr, 4001},
+        {"phase_len",              required_argument, nullptr, 4002},
+        {"phase_win",              required_argument, nullptr, 4003},
 
-        {"end_skip",               required_argument, nullptr, 5001},
         {"min_contig",             required_argument, nullptr, 5002},
         {"max_gap",                required_argument, nullptr, 5003},
         {"max_overlap",            required_argument, nullptr, 5004},
         {"min_overlap",            required_argument, nullptr, 5005},
         {"min_similarity",         required_argument, nullptr, 5006},
-        {"boundary_coverage",      required_argument, nullptr, 5007},
-        {"min_conf",               required_argument, nullptr, 5008},
 
         {"misassembly_len",        required_argument, nullptr, 6001},
         {"misassembly_similarity", required_argument, nullptr, 6002},
@@ -3723,11 +3704,6 @@ AppConfig main_gapfill(int argc, char** argv) {
                 cfg.global.minimizerW = std::max(1, std::stoi(optarg)); 
                 break;
             }
-            case 1001: {
-                cfg.gapfill.max_occ = std::max(1, std::stoi(optarg));
-                break;
-            }
-
             case 'x': {
                 cfg.collapse.mm2_preset = optarg; 
                 break;
@@ -3776,20 +3752,18 @@ AppConfig main_gapfill(int argc, char** argv) {
             }
 
             case 4001: {
-                cfg.gapfill.phase_path_len = parse_size_arg_u32_(optarg, argc, argv, optind, "--phase_len");
+                cfg.gapfill.full_phase_samples.emplace_back(optarg);
+                while (optind < argc && !is_flag_(argv[optind])) {
+                    cfg.gapfill.full_phase_samples.emplace_back(argv[optind++]);
+                }
                 break;
             }
             case 4002: {
-                cfg.gapfill.phase_win = parse_size_arg_u64_(optarg, argc, argv, optind, "--phase_win");
+                cfg.gapfill.phase_path_len = parse_size_arg_u32_(optarg, argc, argv, optind, "--phase_len");
                 break;
             }
             case 4003: {
-                cfg.gapfill.phase_min_bp = parse_size_arg_u64_(optarg, argc, argv, optind, "--phase_min_bp");
-                break;
-            }
-
-            case 5001: {
-                cfg.gapfill.end_skip = parse_size_arg_u64_(optarg, argc, argv, optind, "--end_skip");
+                cfg.gapfill.phase_win = parse_size_arg_u64_(optarg, argc, argv, optind, "--phase_win");
                 break;
             }
             case 5002: {
@@ -3812,15 +3786,6 @@ AppConfig main_gapfill(int argc, char** argv) {
                 cfg.gapfill.min_similarity = std::stod(optarg);
                 break;
             }
-            case 5007: {
-                cfg.gapfill.boundary_coverage = std::stod(optarg);
-                break;
-            }
-            case 5008: {
-                cfg.gapfill.min_confidence = std::stod(optarg);
-                break;
-            }
-
             case 6001: {
                 cfg.gapfill.misassembly_len = parse_size_arg_u64_(optarg, argc, argv, optind, "--misassembly_len");
                 break;
@@ -3857,6 +3822,12 @@ AppConfig main_gapfill(int argc, char** argv) {
             }
         }
     }
+
+    std::sort(cfg.gapfill.full_phase_samples.begin(), cfg.gapfill.full_phase_samples.end());
+    cfg.gapfill.full_phase_samples.erase(
+        std::unique(cfg.gapfill.full_phase_samples.begin(), cfg.gapfill.full_phase_samples.end()),
+        cfg.gapfill.full_phase_samples.end()
+    );
 
     validate_and_print(argc, argv, cfg);
     finalize_opt_cfg(cfg);

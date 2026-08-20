@@ -1,6 +1,7 @@
 #include "gfa_gapfill.hpp"
 #include "gfa_bubble.hpp"
 #include "gfa_gapfill_logger.hpp"
+#include "gfa_walker.hpp"
 
 #include "../include/ThreadPool.hpp"
 #include "logger.hpp"
@@ -55,13 +56,6 @@ private:
     std::vector<uint8_t> rank_;
 };
 
-// Track haplotype intervals already assigned on each bridge contig.
-using PhaseIntervals = std::map<uint32_t, uint32_t>;
-
-struct LocalPhaseAssignments {
-    std::array<PhaseIntervals, 2> hap;
-};
-
 // Format paired left/right metrics in the final TSV report.
 std::string metric_pair(double left, double right) {
     std::ostringstream out;
@@ -72,34 +66,6 @@ std::string metric_pair(double left, double right) {
     if (right < 0.0) out << '.';
     else out << right;
     return out.str();
-}
-
-// Detect and merge local phase intervals during connection selection.
-bool overlaps_phase_interval(
-    const PhaseIntervals& intervals,
-    uint32_t begin,
-    uint32_t end
-) {
-    auto next = intervals.upper_bound(end);
-    if (next == intervals.begin()) return false;
-    return std::prev(next)->second >= begin;
-}
-
-void add_phase_interval(PhaseIntervals& intervals, uint32_t begin, uint32_t end) {
-    auto next = intervals.lower_bound(begin);
-    if (next != intervals.begin()) {
-        auto previous = std::prev(next);
-        if (previous->second >= begin) {
-            begin = previous->first;
-            end = std::max(end, previous->second);
-            next = intervals.erase(previous);
-        }
-    }
-    while (next != intervals.end() && next->first <= end) {
-        end = std::max(end, next->second);
-        next = intervals.erase(next);
-    }
-    intervals.emplace(begin, end);
 }
 
 // Normalize sample and contig names used in output files and GFA segments.
@@ -155,7 +121,13 @@ uint64_t layout_deviation(const std::vector<int64_t>& values, int64_t center) {
 
 
 // Configure and run the complete gap-fill pipeline.
-GfaGapfill::GfaGapfill(Params params) : params_(params) {}
+GfaGapfill::GfaGapfill(Params params) : params_(std::move(params)) {
+    // Gapfill uses node boundaries from a deoverlapped graph.
+    set_forbid_overlap(true);
+    full_phase_samples_.insert(
+        params_.full_phase_samples.begin(), params_.full_phase_samples.end()
+    );
+}
 
 void GfaGapfill::set_alignment_options(
     const opt::ChainOpts& chain,
@@ -163,22 +135,18 @@ void GfaGapfill::set_alignment_options(
     const opt::ExtendOpts& extend,
     const opt::AlignOpts& align,
     const std::string& preset,
-    uint32_t max_occ,
     double min_match,
     double min_ali_ratio,
-    uint8_t min_mapq,
-    double boundary_coverage
+    uint8_t min_mapq
 ) {
     mm2_.k = chain.k;
     mm2_.w = chain.w;
     mm2_.best_n = anchor.max_kept;
     mm2_.zdrop = extend.dyn_zdrop;
     mm2_.preset = preset;
-    mm2_.max_occ = max_occ;
     mm2_.min_match = min_match;
     mm2_.min_ali_ratio = min_ali_ratio;
     mm2_.min_mapq = min_mapq;
-    mm2_.boundary_coverage = boundary_coverage;
     params_.threads = std::max<uint32_t>(1, align.threads);
 }
 
@@ -186,9 +154,11 @@ void GfaGapfill::set_alignment_options(
 // ================================================= Clear state =================================================
 void GfaGapfill::clear_state_() {
     prepared_candidates_.clear();
-    prepared_selected_.clear();
     candidates_prepared_ = false;
     fragments_.clear();
+    source_ids_.clear();
+    source_scope_.clear();
+    source_transitions_.clear();
     sample_chains_.clear();
     records_.clear();
     relocations_.clear();
@@ -207,21 +177,21 @@ void GfaGapfill::clear_state_() {
 }
 
 size_t GfaGapfill::gapfill(const std::vector<GfaBubble::Bubble>& bubbles) {
-    log_stream() << "Gap-filling sample contigs with cross-sample bridging paths ...\n\n";
-    std::vector<Candidate> candidates, selected;
+    log_stream() << "Gap-filling sample contigs with source-aware graph walks ...\n\n";
+    std::vector<Candidate> candidates;
     if (candidates_prepared_) {
         candidates = std::move(prepared_candidates_);
-        selected = std::move(prepared_selected_);
         candidates_prepared_ = false;
     } else {
         clear_state_();
         index_bubble_nodes_(bubbles);
         build_fragments_();
         build_graph_order_();
+        index_source_transitions_();
         candidates = build_candidates_();
-        selected = select_candidates_(candidates);
-        refine_boundaries_(selected, candidates);
     }
+
+    std::vector<Candidate> selected = select_and_walk_(candidates);
 
     mark_used_relocations_(selected);
     build_sample_chains_(selected);
@@ -241,26 +211,31 @@ std::vector<GfaGapfill::MisassemblyContig> GfaGapfill::prepare_misassemblies(
     index_bubble_nodes_(bubbles);
     build_fragments_();
     build_graph_order_();
+    index_source_transitions_();
 
     std::vector<Candidate> candidates = build_candidates_(true);
     check_unplaced_sequence_(candidates);
     std::vector<MisassemblyContig> result = split_misassemblies_(candidates);
     if (result.empty()) {
+        std::vector<Candidate> phase_edges;
         size_t kept = 0;
         for (size_t i = 0; i < candidates.size(); ++i) {
             const Candidate& candidate = candidates[i];
-            const uint64_t fill_bp = candidate.right_boundary.bridge_cut_bp -
-                candidate.left_boundary.bridge_cut_bp;
-            if ((!candidate.target_overlaps && candidate.target_distance > params_.max_gap_bp) ||
-                fill_bp > params_.max_gap_bp) continue;
+            const uint64_t fill_bp = candidate.right_boundary.bridge_cut_bp - candidate.left_boundary.bridge_cut_bp;  // Gap fill size
+            if ((!candidate.target_overlaps && candidate.target_distance > params_.max_gap_bp) || fill_bp > params_.max_gap_bp) continue;  // Skip long gaps
+            const Fragment& left = fragments_[candidate.left];
+            const Fragment& right = fragments_[candidate.right];
+            if (!full_phase_samples_.count(left.sample) && left.hap != right.hap) continue;  // Skip cross-haplotype connections if not full-phase
+            if (left.hap != right.hap) {
+                phase_edges.push_back(std::move(candidates[i]));
+                continue;
+            }
             if (kept != i) candidates[kept] = std::move(candidates[i]);
             ++kept;
         }
         candidates.resize(kept);
-        std::vector<Candidate> selected = select_candidates_(candidates);
-        refine_boundaries_(selected, candidates);
+        group_full_phase_candidates_(candidates, phase_edges);
         prepared_candidates_ = std::move(candidates);
-        prepared_selected_ = std::move(selected);
         candidates_prepared_ = true;
     }
     return result;
@@ -343,6 +318,17 @@ void GfaGapfill::build_fragments_() {
     log_stream() << "Indexing sample contig paths ...\n";
     fragments_.reserve(paths_.size());
 
+    // ------------------------------------------------ Index haplotype SN labels ------------------------------------------------
+    {
+        const std::vector<std::string>& source_names = getSampleNames();
+        for (uint32_t id = 0; id < source_names.size(); ++id) {
+            source_ids_.emplace(source_names[id], id);
+            if (source_names[id].find(".hap1") != std::string::npos || source_names[id].find(".hap2") != std::string::npos) {
+                source_scope_.insert(id);
+            }
+        }
+    }
+
     // ------------------------------------------------ Read path names ------------------------------------------------
     for (size_t path_id = 0; path_id < paths_.size(); ++path_id) {
         GfaPath& path = paths_[path_id];
@@ -350,6 +336,17 @@ void GfaGapfill::build_fragments_() {
         if (!parse_path_name_(path.name, fragment.sample, fragment.hap)) {
             GfaGapfillDebugger::path(path.name, "drop:unrecognized-sample");
             continue;
+        }
+
+        // P names are authoritative local haplotype labels. Register them even
+        // when the input S lines do not carry matching SN tags.
+        const std::string source_name = fragment.sample + ".hap" + std::to_string(fragment.hap);
+        if (!source_ids_.count(source_name)) {
+            const uint32_t source_id = static_cast<uint32_t>(sample_id_to_name_.size());
+            source_ids_.emplace(source_name, source_id);
+            source_scope_.insert(source_id);
+            sample_name_to_id_.emplace(source_name, source_id);
+            sample_id_to_name_.push_back(source_name);
         }
         // ------------------------------------------------ Normalize and check paths ------------------------------------------------
         path.name = compact_contig_name(path.name);
@@ -435,6 +432,17 @@ void GfaGapfill::build_fragments_() {
         );
         fragments_.push_back(std::move(fragment));
     }
+
+    // ------------------------------------------------ Validate full-phase sample names ------------------------------------------------
+    if (!full_phase_samples_.empty()) {
+        std::unordered_set<std::string> samples;
+        for (const Fragment& fragment : fragments_) samples.insert(fragment.sample);
+        for (const std::string& sample : full_phase_samples_) {
+            if (!samples.count(sample)) {
+                warning_stream() << "  ! Unknown --full_phase sample: " << sample << '\n';
+            }
+        }
+    }
     log_stream() << "  - Contig paths indexed: " << fragments_.size() << "\n\n";
 }
 
@@ -450,10 +458,7 @@ void GfaGapfill::build_graph_order_() {
         LayoutContig contig;
         contig.id = i;
         contig.component = fragment.component;
-        contig.hap = fragment.hap;
         contig.bp = fragment.length;
-        contig.name = paths_[fragment.path_id].name;
-        contig.sample = fragment.sample;
         // ------------------------------------------------ Build shared-node anchors ------------------------------------------------
         contig.anchors.reserve(fragment.vertices.size());
         for (uint32_t j = 0; j < fragment.vertices.size(); ++j) {
@@ -497,6 +502,36 @@ void GfaGapfill::build_graph_order_() {
     log_stream() << "  - Contigs ordered from shared graph nodes: " << layout.size() << "\n\n";
 }
 
+void GfaGapfill::index_source_transitions_() {
+    log_stream() << "Indexing haplotype-supported graph transitions ...\n";
+
+    // ------------------------------------------------ Collect oriented P-path transitions ------------------------------------------------
+    uint64_t path_transitions = 0;
+    for (const Fragment& fragment : fragments_) {
+        if (fragment.hap < 1 || fragment.hap > 2 || fragment.vertices.size() < 2) continue;
+        const auto source = source_ids_.find(fragment.sample + ".hap" + std::to_string(fragment.hap));
+        if (source == source_ids_.end()) continue;
+
+        path_transitions += fragment.vertices.size() - 1;
+        for (size_t i = 1; i < fragment.vertices.size(); ++i) {
+            const uint32_t from = fragment.vertices[i - 1];
+            const uint32_t to = fragment.vertices[i];
+            source_transitions_[(static_cast<uint64_t>(from) << 32) | to].push_back(source->second);
+            source_transitions_[(static_cast<uint64_t>(to ^ 1u) << 32) | (from ^ 1u)].push_back(source->second);
+        }
+    }
+
+    // ------------------------------------------------ Deduplicate source support ------------------------------------------------
+    for (auto& transition : source_transitions_) {
+        std::vector<uint32_t>& sources = transition.second;
+        std::sort(sources.begin(), sources.end());
+        sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
+    }
+
+    log_stream() << "  - P-path transitions: " << path_transitions << '\n';
+    log_stream() << "  - Oriented transitions indexed: " << source_transitions_.size() << "\n\n";
+}
+
 bool GfaGapfill::parse_path_name_(const std::string& name, std::string& sample, uint8_t& hap) {
     const size_t h1 = name.find(".hap1.");
     const size_t h2 = name.find(".hap2.");
@@ -523,24 +558,16 @@ void GfaGapfill::rebuild_fragment_index_(Fragment& fragment) const {
     fragment.vertex_index.clear();
     fragment.vertex_index.reserve(fragment.vertices.size());
     fragment.bubble_positions.clear();
-    fragment.rank_drops.assign(fragment.vertices.size(), 0);
     fragment.path_bp.assign(fragment.vertices.size() + 1, 0);
     fragment.bubble_bp.assign(fragment.vertices.size() + 1, 0);
     for (uint32_t i = 0; i < fragment.vertices.size(); ++i) {
         const uint32_t vertex = fragment.vertices[i];
         const uint32_t segment = Vertex::get_segment_id(vertex);
-        const uint32_t rank = vertex_topo_rank(Vertex(vertex));
         fragment.vertex_index.emplace_back(vertex, i);
         fragment.path_bp[i + 1] = fragment.path_bp[i] + nodes_[segment].length;
         fragment.bubble_bp[i + 1] = fragment.bubble_bp[i] + (segment < bubble_nodes_.size() && bubble_nodes_[segment] ? nodes_[segment].length : 0);
         if (segment < bubble_nodes_.size() && bubble_nodes_[segment]) {
             fragment.bubble_positions.push_back(i);
-        }
-        if (i > 0) {
-            fragment.rank_drops[i] = fragment.rank_drops[i - 1];
-            if (vertex_topo_rank(Vertex(fragment.vertices[i - 1])) > rank) {
-                ++fragment.rank_drops[i];
-            }
         }
     }
     std::sort(fragment.vertex_index.begin(), fragment.vertex_index.end());
@@ -676,13 +703,11 @@ std::vector<GfaGapfill::Candidate> GfaGapfill::build_candidates_(
     bool include_long_gaps
 ) const {
     // ------------------------------------------------ Group contigs by sample ------------------------------------------------
-    std::vector<std::string> group_keys(fragments_.size());
     std::map<std::string, std::vector<uint32_t>> fragments_by_sample;
     for (uint32_t i = 0; i < fragments_.size(); ++i) {
         const Fragment& fragment = fragments_[i];
         if (!fragment.eligible || fragment.redundant) continue;
         fragments_by_sample[fragment.sample].push_back(i);
-        group_keys[i] = fragment.sample + '\t' + std::to_string(fragment.component);
     }
 
     // ------------------------------------------------ Collect node positions ------------------------------------------------
@@ -748,20 +773,18 @@ std::vector<GfaGapfill::Candidate> GfaGapfill::build_candidates_(
                 const PathOverlap& overlap = item.second;
                 const Boundary left_boundary = boundary.inspect(
                     a, overlap.a_begin, b, overlap.b_begin,
-                    false, true
+                    false
                 );
                 const Boundary right_boundary = boundary.inspect(
                     a, overlap.a_end, b, overlap.b_end,
-                    true, true
+                    true
                 );
                 const GfaGapfillDebugger::BoundarySupport left_support_debug{
-                    left_boundary.minimizer,
                     left_boundary.phase.similarity,
                     left_boundary.phase.target_bp,
                     left_boundary.phase.bridge_bp
                 };
                 const GfaGapfillDebugger::BoundarySupport right_support_debug{
-                    right_boundary.minimizer,
                     right_boundary.phase.similarity,
                     right_boundary.phase.target_bp,
                     right_boundary.phase.bridge_bp
@@ -794,7 +817,7 @@ std::vector<GfaGapfill::Candidate> GfaGapfill::build_candidates_(
     for (size_t sample_id = 0; sample_id < sample_groups.size(); ++sample_id) {
         futures.emplace_back(pool.submit([&, sample_id] {
             CandidateBatch batch = build_sample_candidates_(
-                sample_groups[sample_id], overlaps, group_keys, include_long_gaps
+                sample_groups[sample_id], overlaps, include_long_gaps
             );
             progress.hit();
             return batch;
@@ -802,7 +825,7 @@ std::vector<GfaGapfill::Candidate> GfaGapfill::build_candidates_(
     }
 
     // ------------------------------------------------ Merge sample results ------------------------------------------------
-    std::vector<Candidate> candidates;
+    std::vector<Candidate> candidates, phase_edges;
     std::vector<CandidateBatch> results(futures.size());
     for (size_t i = 0; i < futures.size(); ++i) {
         results[i] = futures[i].get();
@@ -815,13 +838,31 @@ std::vector<GfaGapfill::Candidate> GfaGapfill::build_candidates_(
         const std::string& sample = fragments_[sample_groups[i].front()].sample;
         GfaGapfillDebugger::search(
             sample, sample_groups[i].size(), batch.tested, batch.low_support,
-            batch.wrong_group, batch.anchor_failed, batch.candidates.size()
+            batch.wrong_group, batch.anchor_failed,
+            batch.candidates.size() + batch.phase_edges.size()
         );
         candidates.insert(
             candidates.end(),
             std::make_move_iterator(batch.candidates.begin()),
             std::make_move_iterator(batch.candidates.end())
         );
+        phase_edges.insert(
+            phase_edges.end(),
+            std::make_move_iterator(batch.phase_edges.begin()),
+            std::make_move_iterator(batch.phase_edges.end())
+        );
+    }
+
+    // Misassembly detection inspects every valid spanning connection. Formal
+    // gap filling uses cross-haplotype edges only as assignment evidence.
+    if (include_long_gaps) {
+        candidates.insert(
+            candidates.end(),
+            std::make_move_iterator(phase_edges.begin()),
+            std::make_move_iterator(phase_edges.end())
+        );
+    } else {
+        group_full_phase_candidates_(candidates, phase_edges);
     }
 
     log_stream() << "  - Candidate connections: " << candidates.size() << "\n\n";
@@ -831,7 +872,6 @@ std::vector<GfaGapfill::Candidate> GfaGapfill::build_candidates_(
 GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
     const std::vector<uint32_t>& sample_fragments,
     const OverlapIndex& overlaps,
-    const std::vector<std::string>& group_keys,
     bool include_long_gaps
 ) const {
     // ------------------------------------------------ Prepare sample search ------------------------------------------------
@@ -842,6 +882,7 @@ GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
     for (uint32_t left_id : sample_fragments) {
         const Fragment& left = fragments_[left_id];
         if (left.length < params_.min_contig_bp) continue;
+        const bool target_full_phase = full_phase_samples_.count(left.sample);
 
         // ------------------------------------------------ Find bridge and right contigs ------------------------------------------------
         // Keep all bridge paths for each right contig.
@@ -850,12 +891,16 @@ GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
          S.left -> T.bridge2 -> S.right
          S.left -> U.bridge3 -> S.right
         */
-        std::unordered_map<uint32_t, std::vector<Candidate>> evidence_by_right;
+        std::map<uint32_t, std::vector<Candidate>> evidence_by_right;
         // Enumerate bridge paths that connect this left contig to a later contig.
         for (const auto& bridge_item : overlaps[left_id]) {
             const uint32_t bridge_id = bridge_item.first;
             const Fragment& bridge = fragments_[bridge_id];
             if (bridge.sample == left.sample) continue;
+
+            /**************************** may have bugs ********************************/
+            if (target_full_phase && !full_phase_samples_.count(bridge.sample)) continue;  // Skip non-full-phase bridges if the left contig is full-phase
+            /**************************** may have bugs ********************************/
 
             // The left side must share enough nodes with the bridge.
             const OverlapSupport left_support = overlap_support_(
@@ -872,16 +917,17 @@ GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
                 const Fragment& right = fragments_[right_id];
                 ++batch.tested;
 
-                // The right side must also have enough shared nodes.
-                const OverlapSupport right_support = overlap_support_(
-                    bridge, right, right_item.second
-                );
-                if (right_support.shared_bp < params_.min_overlap_bp) {
-                    ++batch.low_support;
+                // Left and right must belong to the same target path group.
+                if (right_id == left_id || right.sample != left.sample || right.component != left.component ||
+                    !ordered_pair_(left, right, include_long_gaps)) {
+                    ++batch.wrong_group;
                     continue;
                 }
-                // Left and right must belong to the same target path group.
-                if (right_id == left_id || group_keys[right_id] != group_keys[left_id] || !ordered_pair_(left, right, include_long_gaps)) {
+                if (!target_full_phase && right.hap != left.hap) {
+                    ++batch.wrong_group;
+                    continue;
+                }
+                if (right.hap == left.hap && skips_backbone_(left_id, right_id)) {
                     ++batch.wrong_group;
                     continue;
                 }
@@ -891,6 +937,15 @@ GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
                 const int64_t bridge_end = bridge.layout_start + static_cast<int64_t>(bridge.length);
                 if (bridge.layout_start > left_end || bridge_end < right.layout_start) {
                     ++batch.wrong_group;
+                    continue;
+                }
+
+                // The right side must also have enough shared nodes.
+                const OverlapSupport right_support = overlap_support_(
+                    bridge, right, right_item.second
+                );
+                if (right_support.shared_bp < params_.min_overlap_bp) {
+                    ++batch.low_support;
                     continue;
                 }
 
@@ -905,7 +960,7 @@ GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
                 candidate.target_distance = static_cast<uint64_t>(target_gap < 0 ? -target_gap : target_gap);
                 candidate.left_shared = left_support.shared_bp;
                 candidate.right_shared = right_support.shared_bp;
-                // Get graph boundaries before the later mm2 refinement.
+                // Boundary fixes the trusted shared nodes used by the later graph walk.
                 if (!boundary.prepare(left_id, right_id, bridge_id, candidate.left_boundary, candidate.right_boundary)) {
                     ++batch.anchor_failed;
                     continue;
@@ -922,8 +977,15 @@ GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
 
         // ------------------------------------------------ Compare bridge haplotypes ------------------------------------------------
         for (auto& item : evidence_by_right) {
+            std::sort(item.second.begin(), item.second.end(), [&](const Candidate& a, const Candidate& b) {
+                const Fragment& ab = fragments_[a.bridge];
+                const Fragment& bb = fragments_[b.bridge];
+                return std::tie(ab.sample, ab.hap, a.bridge) < std::tie(bb.sample, bb.hap, b.bridge);
+            });
+
             // check if the left and right contigs are spanned by a homologous contig in this sample
-            const bool homolog_span = homolog_spans_(left_id, item.first, overlaps);
+            const bool homolog_span = fragments_[item.first].hap == left.hap &&
+                homolog_spans_(left_id, item.first, overlaps);
 
             // Keep the strongest spanning contig for each bridge haplotype.
             std::map<std::string, std::array<size_t, 2>> best_phase;
@@ -970,19 +1032,40 @@ GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
                 }
             }
 
-            // ------------------------------------------------ Add sample support ------------------------------------------------
-            update_sample_support_(item.second);
-
-            // ------------------------------------------------ Keep the best bridge ------------------------------------------------
-            // Boundary alignment is reserved for these coarse candidates instead of every bridge.
-            size_t best = 0;
+            // ------------------------------------------------ Keep the required spanning evidence ------------------------------------------------
             for (Candidate& candidate : item.second) {
                 candidate.homolog_span = homolog_span;
             }
-            for (size_t i = 1; i < item.second.size(); ++i) {
-                if (candidate_better_(item.second[i], item.second[best])) best = i;
+
+            if (target_full_phase) {
+                // Reciprocal target connections must be supported by the two
+                // phased haplotypes of one donor sample. Keep one bridge for
+                // each donor haplotype until those pairs are formed.
+                std::map<std::pair<std::string, uint8_t>, size_t> best;
+                for (size_t i = 0; i < item.second.size(); ++i) {
+                    const Fragment& bridge = fragments_[item.second[i].bridge];
+                    if (bridge.hap == 0 || bridge.hap > 2) continue;
+                    const auto key = std::make_pair(bridge.sample, bridge.hap);
+                    const auto found = best.find(key);
+                    if (found == best.end() || candidate_better_(item.second[i], item.second[found->second])) {
+                        best[key] = i;
+                    }
+                }
+                for (const auto& selected : best) {
+                    Candidate candidate = std::move(item.second[selected.second]);
+                    if (fragments_[candidate.left].hap == fragments_[candidate.right].hap) {
+                        batch.candidates.push_back(std::move(candidate));
+                    } else {
+                        batch.phase_edges.push_back(std::move(candidate));
+                    }
+                }
+            } else {
+                size_t best = 0;
+                for (size_t i = 1; i < item.second.size(); ++i) {
+                    if (candidate_better_(item.second[i], item.second[best])) best = i;
+                }
+                batch.candidates.push_back(std::move(item.second[best]));
             }
-            batch.candidates.push_back(std::move(item.second[best]));
         }
     }
     return batch;
@@ -1003,6 +1086,32 @@ bool GfaGapfill::ordered_pair_(
     const uint64_t overlap = static_cast<uint64_t>(std::min(left_end, right_end) - right.layout_start);
     const double fraction = static_cast<double>(overlap) / std::min(left.length, right.length);
     return fraction <= params_.max_target_overlap;
+}
+
+bool GfaGapfill::skips_backbone_(uint32_t left_id, uint32_t right_id) const {
+    const Fragment& left = fragments_[left_id];
+    const Fragment& right = fragments_[right_id];
+    if (left.hap < 1 || left.hap > 2) return false;
+
+    const int64_t gap_begin = left.layout_start + static_cast<int64_t>(left.length);
+    const int64_t gap_end = right.layout_start;
+    if (gap_begin >= gap_end) return false;
+
+    // fragments_ is already sorted by sample, component and layout. A long
+    // contig that occupies the open gap must be connected first. Contigs
+    // nested inside either endpoint do not block this connection.
+    const uint32_t begin = std::min(left_id, right_id) + 1;
+    const uint32_t end = std::max(left_id, right_id);
+    for (uint32_t id = begin; id < end; ++id) {
+        const Fragment& middle = fragments_[id];
+        if (middle.sample != left.sample || middle.component != left.component ||
+            middle.hap != left.hap || middle.length < params_.min_contig_bp ||
+            !middle.eligible || middle.redundant) continue;
+        const int64_t middle_begin = middle.layout_start;
+        const int64_t middle_end = middle_begin + static_cast<int64_t>(middle.length);
+        if (std::max(gap_begin, middle_begin) < std::min(gap_end, middle_end)) return true;
+    }
+    return false;
 }
 
 GfaGapfill::OverlapSupport GfaGapfill::overlap_support_(
@@ -1054,7 +1163,8 @@ bool GfaGapfill::homolog_spans_(
         const int64_t left_end = left.layout_start + static_cast<int64_t>(left.length);
         const int64_t bridge_end = bridge.layout_start + static_cast<int64_t>(bridge.length);
         if (bridge.layout_start > left_end || bridge_end < right.layout_start) continue;
-        if (boundary.spans(left_id, right_id, bridge_id)) return true;
+        if (!boundary.spans(left_id, right_id, bridge_id)) continue;
+        return true;
     }
     return false;
 }
@@ -1066,162 +1176,508 @@ double GfaGapfill::raw_phase_score_(const Candidate& candidate) {
     return -1.0;
 }
 
-void GfaGapfill::update_sample_support_(std::vector<Candidate>& evidence) const {
-    // Take the part of each bridge that actually fills the gap.
-    std::vector<std::vector<uint32_t>> fill_paths;
-    fill_paths.reserve(evidence.size());
-    for (size_t i = 0; i < evidence.size(); ++i) {
-        const Candidate& witness = evidence[i];
-        const Fragment& bridge = fragments_[witness.bridge];
-        const uint32_t begin = witness.left_boundary.bridge_pos + 1;
-        const uint32_t end = witness.right_boundary.bridge_pos;
-        fill_paths.emplace_back(
-            bridge.vertices.begin() + begin,
-            bridge.vertices.begin() + end
+void GfaGapfill::group_full_phase_candidates_(
+    std::vector<Candidate>& candidates,
+    const std::vector<Candidate>& phase_edges
+) const {
+    // ------------------------------------------------ Collect haplotype-internal gaps ------------------------------------------------
+    struct Gap {
+        uint32_t left{UINT32_MAX}, right{UINT32_MAX};
+        uint8_t hap{0};
+        int64_t begin{0}, end{0};
+        bool homolog_span{false};
+        std::vector<size_t> edges;
+    };
+    std::vector<Gap> gaps;
+    std::map<std::pair<uint32_t, uint32_t>, size_t> gap_by_ends;
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<size_t>> direct_by_ends;
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<size_t>> cross_by_ends;
+    std::map<std::pair<std::string, uint32_t>, std::vector<size_t>> gaps_by_component;
+
+    for (size_t id = 0; id < candidates.size(); ++id) {
+        const Candidate& candidate = candidates[id];
+        const Fragment& left = fragments_[candidate.left];
+        const Fragment& right = fragments_[candidate.right];
+        if (!full_phase_samples_.count(left.sample) || left.hap != right.hap ||
+            left.hap < 1 || left.hap > 2) continue;
+        const uint64_t bridge_bp = candidate.right_boundary.bridge_cut_bp -
+            candidate.left_boundary.bridge_cut_bp;
+        if ((!candidate.target_overlaps && candidate.target_distance > params_.max_gap_bp) ||
+            bridge_bp > params_.max_gap_bp) continue;
+
+        const auto key = std::make_pair(candidate.left, candidate.right);
+        direct_by_ends[key].push_back(id);
+        auto found = gap_by_ends.find(key);
+        if (found == gap_by_ends.end()) {
+            const int64_t left_end = left.layout_start + static_cast<int64_t>(left.length);
+            const int64_t right_begin = right.layout_start;
+            const size_t gap_id = gaps.size();
+            gaps.push_back({
+                candidate.left, candidate.right, left.hap,
+                std::min(left_end, right_begin), std::max(left_end, right_begin),
+                candidate.homolog_span, {id}
+            });
+            gap_by_ends.emplace(key, gap_id);
+            gaps_by_component[{left.sample, left.component}].push_back(gap_id);
+        } else {
+            Gap& gap = gaps[found->second];
+            gap.homolog_span = gap.homolog_span || candidate.homolog_span;
+            gap.edges.push_back(id);
+        }
+    }
+    for (size_t id = 0; id < phase_edges.size(); ++id) {
+        cross_by_ends[{phase_edges[id].left, phase_edges[id].right}].push_back(id);
+    }
+    if (gaps.empty()) return;
+
+    // ------------------------------------------------ Form overlapping diploid loci ------------------------------------------------
+    struct GapPair {
+        size_t hap1{SIZE_MAX}, hap2{SIZE_MAX};
+        uint32_t locus{UINT32_MAX};
+    };
+    std::vector<size_t> parent(gaps.size());
+    std::iota(parent.begin(), parent.end(), 0);
+    const auto root = [&](size_t id) {
+        while (parent[id] != id) {
+            parent[id] = parent[parent[id]];
+            id = parent[id];
+        }
+        return id;
+    };
+    const auto join = [&](size_t a, size_t b) {
+        a = root(a);
+        b = root(b);
+        if (a != b) parent[b] = a;
+    };
+    std::vector<uint8_t> paired(gaps.size(), 0);
+    for (auto& group : gaps_by_component) {
+        std::vector<size_t>& ids = group.second;
+        std::sort(ids.begin(), ids.end(), [&](size_t a, size_t b) {
+            return std::tie(gaps[a].begin, gaps[a].end, gaps[a].hap, a) <
+                std::tie(gaps[b].begin, gaps[b].end, gaps[b].hap, b);
+        });
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const Gap& first = gaps[ids[i]];
+            if (first.homolog_span) continue;
+            for (size_t j = i + 1; j < ids.size() && gaps[ids[j]].begin < first.end; ++j) {
+                const Gap& second = gaps[ids[j]];
+                if (second.homolog_span || first.hap == second.hap ||
+                    std::max(first.begin, second.begin) >= std::min(first.end, second.end)) continue;
+
+                std::array<uint32_t, 4> ends{first.left, first.right, second.left, second.right};
+                std::sort(ends.begin(), ends.end());
+                if (std::adjacent_find(ends.begin(), ends.end()) != ends.end()) continue;
+
+                join(ids[i], ids[j]);
+                paired[ids[i]] = paired[ids[j]] = 1;
+            }
+        }
+    }
+
+    // A simple two-gap locus has one unambiguous diploid decision. If several
+    // gaps overlap transitively, keep their same-haplotype candidates instead
+    // of discarding valid connections or guessing a larger matching.
+    std::map<size_t, std::vector<size_t>> gaps_by_locus;
+    for (size_t id = 0; id < gaps.size(); ++id) {
+        if (paired[id]) gaps_by_locus[root(id)].push_back(id);
+    }
+    std::vector<GapPair> gap_pairs;
+    uint32_t next_locus = 0;
+    for (const auto& item : gaps_by_locus) {
+        if (item.second.size() != 2) continue;
+        const Gap& first = gaps[item.second[0]];
+        const Gap& second = gaps[item.second[1]];
+        if (first.hap == second.hap) continue;
+        gap_pairs.push_back({
+            first.hap == 1 ? item.second[0] : item.second[1],
+            first.hap == 2 ? item.second[0] : item.second[1],
+            next_locus++
+        });
+    }
+    if (gap_pairs.empty()) return;
+
+    // ------------------------------------------------ Enumerate straight and crossed assignments ------------------------------------------------
+    struct PairOption {
+        Candidate first, second;
+        uint32_t locus{UINT32_MAX};
+        uint32_t phase_evidence{0};
+        double phase{0.5}, relative_phase{0.0};
+        uint64_t shared{0}, distance{0};
+        bool crossed{false};
+    };
+    std::vector<PairOption> options;
+    std::vector<uint8_t> in_locus(candidates.size(), 0);
+
+    const auto add_options = [&](
+        const std::vector<Candidate>& source,
+        const std::vector<size_t>* first_ids,
+        const std::vector<size_t>* second_ids,
+        uint32_t locus,
+        uint64_t distance,
+        bool crossed
+    ) {
+        if (first_ids == nullptr || second_ids == nullptr) return;
+        for (size_t first_id : *first_ids) {
+            const Candidate& first = source[first_id];
+            const Fragment& first_bridge = fragments_[first.bridge];
+            for (size_t second_id : *second_ids) {
+                const Candidate& second = source[second_id];
+                const Fragment& second_bridge = fragments_[second.bridge];
+                if (first_bridge.sample != second_bridge.sample ||
+                    first_bridge.hap < 1 || first_bridge.hap > 2 ||
+                    second_bridge.hap < 1 || second_bridge.hap > 2 ||
+                    first_bridge.hap == second_bridge.hap) continue;
+
+                const double similarities[4] = {
+                    first.left_boundary.phase.similarity,
+                    first.right_boundary.phase.similarity,
+                    second.left_boundary.phase.similarity,
+                    second.right_boundary.phase.similarity
+                };
+                uint32_t evidence = 0;
+                double phase = 0.0;
+                for (double similarity : similarities) {
+                    if (similarity < 0.0) continue;
+                    phase += similarity;
+                    ++evidence;
+                }
+                options.push_back({
+                    first, second, locus, evidence,
+                    evidence ? phase / evidence : 0.5,
+                    std::sqrt(first.phase_score * second.phase_score),
+                    first.left_shared + first.right_shared + second.left_shared + second.right_shared,
+                    distance, crossed
+                });
+            }
+        }
+    };
+    const auto edge_ids = [](const auto& index, uint32_t left, uint32_t right) {
+        const auto found = index.find({left, right});
+        return found == index.end() ? nullptr : &found->second;
+    };
+
+    for (const GapPair& pair : gap_pairs) {
+        const Gap& hap1 = gaps[pair.hap1];
+        const Gap& hap2 = gaps[pair.hap2];
+        const uint64_t distance = static_cast<uint64_t>(
+            std::llabs(hap1.begin - hap2.begin) + std::llabs(hap1.end - hap2.end)
         );
+
+        const size_t option_begin = options.size();
+        add_options(
+            candidates,
+            edge_ids(direct_by_ends, hap1.left, hap1.right),
+            edge_ids(direct_by_ends, hap2.left, hap2.right),
+            pair.locus, distance, false
+        );
+        add_options(
+            phase_edges,
+            edge_ids(cross_by_ends, hap1.left, hap2.right),
+            edge_ids(cross_by_ends, hap2.left, hap1.right),
+            pair.locus, distance, true
+        );
+        if (options.size() != option_begin) {
+            for (size_t id : hap1.edges) in_locus[id] = 1;
+            for (size_t id : hap2.edges) in_locus[id] = 1;
+        }
     }
 
-    // Group similar bridge paths together.
-    const GfaBubble::PathClusterer clusterer(
-        *this, params_.path_difference, mm2_.k, mm2_.w
-    );
-    const std::vector<uint32_t> labels = clusterer.cluster(
-        fill_paths, GfaBubble::Type::Tip
-    );
+    // More observed boundaries are stronger than neutral missing values. The
+    // phase similarity then chooses straight versus crossed assignments.
+    std::sort(options.begin(), options.end(), [](const PairOption& a, const PairOption& b) {
+        if (a.locus != b.locus) return a.locus < b.locus;
+        if (a.phase_evidence != b.phase_evidence) return a.phase_evidence > b.phase_evidence;
+        if (a.phase != b.phase) return a.phase > b.phase;
+        if (a.relative_phase != b.relative_phase) return a.relative_phase > b.relative_phase;
+        if (a.shared != b.shared) return a.shared > b.shared;
+        if (a.crossed != b.crossed) return !a.crossed;
+        if (a.distance != b.distance) return a.distance < b.distance;
+        return std::tie(a.first.left, a.first.right, a.first.bridge,
+                        a.second.left, a.second.right, a.second.bridge) <
+            std::tie(b.first.left, b.first.right, b.first.bridge,
+                     b.second.left, b.second.right, b.second.bridge);
+    });
 
-    // Count each sample once per distinct bridge allele. Homozygous
-    // haplotypes therefore contribute one vote, heterozygous ones one each.
-    std::map<std::string, std::vector<size_t>> by_sample;
-    for (size_t i = 0; i < evidence.size(); ++i) {
-        by_sample[fragments_[evidence[i].bridge].sample].push_back(i);
+    // ------------------------------------------------ Replace locus edges with atomic alternatives ------------------------------------------------
+    std::vector<Candidate> grouped;
+    grouped.reserve(candidates.size() + 2 * options.size());
+    for (size_t id = 0; id < candidates.size(); ++id) {
+        if (!in_locus[id]) grouped.push_back(std::move(candidates[id]));
     }
-    std::unordered_map<uint32_t, uint32_t> support_by_label;
-    for (const auto& item : by_sample) {
-        std::unordered_set<uint32_t> sample_labels;
-        for (size_t index : item.second) sample_labels.insert(labels[index]);
-        for (uint32_t label : sample_labels) ++support_by_label[label];
+    uint32_t next_group = 0;
+    for (PairOption& option : options) {
+        option.first.phase_group = next_group;
+        option.second.phase_group = next_group++;
+        option.first.phase_locus = option.locus;
+        option.second.phase_locus = option.locus;
+        grouped.push_back(std::move(option.first));
+        grouped.push_back(std::move(option.second));
     }
-
-    // Write support rate and update the final candidate confidence.
-    for (size_t i = 0; i < evidence.size(); ++i) {
-        Candidate& candidate = evidence[i];
-        candidate.sample_support = support_by_label[labels[i]];
-        candidate.spanning_samples = static_cast<uint32_t>(by_sample.size());
-        candidate.sample_score = candidate.spanning_samples == 0 ? 0.0 : static_cast<double>(candidate.sample_support) / candidate.spanning_samples;
-        update_confidence_(candidate);
-    }
+    candidates.swap(grouped);
 }
 
 
 // ================================================= Candidate selection =================================================
-std::vector<GfaGapfill::Candidate> GfaGapfill::select_candidates_(
+std::vector<GfaGapfill::Candidate> GfaGapfill::select_and_walk_(
+    std::vector<Candidate>& candidates
+) {
+    // Candidate indexes stay stable throughout selection and graph walking.
+    std::vector<size_t> selected_ids;
+    size_t failed = 0;
+    do {
+        selected_ids = select_candidates_(candidates);
+        failed = resolve_fill_paths_(candidates, selected_ids);
+        if (failed) {
+            log_stream() << "Retrying after " << failed << " graph walk failure(s) ...\n";
+        }
+    } while (failed);
+
+    std::vector<Candidate> selected;
+    selected.reserve(selected_ids.size());
+    for (size_t id : selected_ids) selected.push_back(candidates[id]);
+    return selected;
+}
+
+std::vector<size_t> GfaGapfill::select_candidates_(
     std::vector<Candidate>& candidates
 ) {
     log_stream() << "Selecting unambiguous gap-fill connections ...\n";
 
-    // ------------------------------------------------ Sort candidates ------------------------------------------------
-    std::sort(candidates.begin(), candidates.end(), connection_better_);  // Put the most useful connections first.
+    struct Unit {
+        size_t first{SIZE_MAX};
+        size_t second{SIZE_MAX};
+    };
+    std::vector<Unit> units;
+    std::map<uint32_t, std::vector<size_t>> pairs;
+    for (size_t id = 0; id < candidates.size(); ++id) {
+        Candidate& candidate = candidates[id];
+        candidate.walk_hap = 0;
+        const bool crossover = candidate.left_boundary.bridge_pos == candidate.right_boundary.bridge_pos;
+        candidate.right_boundary.target_cut_bp = fragments_[candidate.right].path_bp[
+            candidate.right_boundary.target_pos + static_cast<uint32_t>(crossover)
+        ];
+        candidate.fill.reset();
+        if (candidate.status != Candidate::NO_PATH && candidate.status != Candidate::PAIR_CONFLICT) {
+            candidate.status = Candidate::PENDING;
+        }
+        if (candidate.status != Candidate::PENDING) continue;
+        if (candidate.phase_group == UINT32_MAX) {
+            units.push_back({id, SIZE_MAX});
+            continue;
+        }
+        pairs[candidate.phase_group].push_back(id);
+    }
+    for (auto& item : pairs) {
+        if (item.second.size() == 2 &&
+            candidates[item.second[0]].phase_locus == candidates[item.second[1]].phase_locus) {
+            units.push_back({item.second[0], item.second[1]});
+        } else {
+            for (size_t id : item.second) {
+                candidates[id].status = Candidate::PAIR_CONFLICT;
+            }
+        }
+    }
+
+    // ------------------------------------------------ Sort complete connection units ------------------------------------------------
+    const auto weakest = [&](const Unit& unit) {
+        if (unit.second == SIZE_MAX) return unit.first;
+        return candidate_better_(candidates[unit.first], candidates[unit.second]) ?
+            unit.second : unit.first;
+    };
+    const auto stable_key = [&](const Unit& unit) {
+        const Candidate& first_candidate = candidates[unit.first];
+        std::array<uint32_t, 6> key{
+            first_candidate.left, first_candidate.right, first_candidate.bridge,
+            UINT32_MAX, UINT32_MAX, UINT32_MAX
+        };
+        if (unit.second != SIZE_MAX) {
+            const Candidate& second_candidate = candidates[unit.second];
+            std::array<uint32_t, 3> first{key[0], key[1], key[2]};
+            std::array<uint32_t, 3> second{
+                second_candidate.left, second_candidate.right, second_candidate.bridge
+            };
+            if (second < first) std::swap(first, second);
+            std::copy(first.begin(), first.end(), key.begin());
+            std::copy(second.begin(), second.end(), key.begin() + 3);
+        }
+        return key;
+    };
+    const auto boundary_phase = [&](const Unit& unit) {
+        double total = 0.0;
+        uint32_t evidence = 0, boundaries = 0;
+        const size_t edges[2] = {unit.first, unit.second};
+        for (size_t id : edges) {
+            if (id == SIZE_MAX) continue;
+            const Candidate& edge = candidates[id];
+            const double values[2] = {
+                edge.left_boundary.phase.similarity,
+                edge.right_boundary.phase.similarity
+            };
+            for (double value : values) {
+                total += value >= 0.0 ? value : 0.5;
+                evidence += value >= 0.0;
+                ++boundaries;
+            }
+        }
+        return std::pair<double, uint32_t>{total / boundaries, evidence};
+    };
+    std::sort(units.begin(), units.end(), [&](const Unit& a, const Unit& b) {
+        const Fragment& af = fragments_[candidates[a.first].left];
+        const Fragment& bf = fragments_[candidates[b.first].left];
+        if (af.sample != bf.sample) return af.sample < bf.sample;
+        if (af.component != bf.component) return af.component < bf.component;
+
+        const size_t aw = weakest(a);
+        const size_t bw = weakest(b);
+        // Ordinary samples keep the original r22 ordering. Full-phase
+        // samples use one fixed unit ordering for single and paired edges.
+        if (!full_phase_samples_.count(af.sample)) {
+            if (connection_better_(candidates[aw], candidates[bw])) return true;
+            if (connection_better_(candidates[bw], candidates[aw])) return false;
+            return stable_key(a) < stable_key(b);
+        }
+
+        const bool a_homolog = candidates[a.first].homolog_span ||
+            (a.second != SIZE_MAX && candidates[a.second].homolog_span);
+        const bool b_homolog = candidates[b.first].homolog_span ||
+            (b.second != SIZE_MAX && candidates[b.second].homolog_span);
+        if (a_homolog != b_homolog) return a_homolog;
+
+        const auto a_boundary_phase = boundary_phase(a);
+        const auto b_boundary_phase = boundary_phase(b);
+        if (a_boundary_phase.second != b_boundary_phase.second) {
+            return a_boundary_phase.second > b_boundary_phase.second;
+        }
+        if (a_boundary_phase.first != b_boundary_phase.first) {
+            return a_boundary_phase.first > b_boundary_phase.first;
+        }
+        const double a_relative_phase = a.second != SIZE_MAX ?
+            std::sqrt(candidates[a.first].phase_score * candidates[a.second].phase_score) :
+            candidates[a.first].phase_score;
+        const double b_relative_phase = b.second != SIZE_MAX ?
+            std::sqrt(candidates[b.first].phase_score * candidates[b.second].phase_score) :
+            candidates[b.first].phase_score;
+        if (a_relative_phase != b_relative_phase) return a_relative_phase > b_relative_phase;
+
+        const bool a_crossed = fragments_[candidates[a.first].left].hap !=
+            fragments_[candidates[a.first].right].hap;
+        const bool b_crossed = fragments_[candidates[b.first].left].hap !=
+            fragments_[candidates[b.first].right].hap;
+        if (a_crossed != b_crossed) return !a_crossed;
+
+        if (connection_better_(candidates[aw], candidates[bw])) return true;
+        if (connection_better_(candidates[bw], candidates[aw])) return false;
+        return stable_key(a) < stable_key(b);
+    });
 
     // ------------------------------------------------ Prepare selection state ------------------------------------------------
-    std::vector<Candidate> selected;
-    // Track used contig ends, bridge phase intervals and connected components.
-    std::vector<int32_t> incoming(fragments_.size(), -1), outgoing(fragments_.size(), -1);
-    std::vector<std::unordered_map<std::string, LocalPhaseAssignments>> bridge_phase(fragments_.size());
+    std::vector<size_t> selected;
+    // Track used contig ends and connected components.
+    std::vector<size_t> incoming(fragments_.size(), SIZE_MAX), outgoing(fragments_.size(), SIZE_MAX);
     DisjointSet sets(fragments_.size());
+    std::unordered_set<uint32_t> used_phase_loci;
 
-    // ------------------------------------------------ Check each candidate ------------------------------------------------
-    for (Candidate& candidate : candidates) {
-        const Fragment& left = fragments_[candidate.left];
-        const Fragment& right = fragments_[candidate.right];
-        const std::string& left_name = paths_[fragments_[candidate.left].path_id].name;
-        const std::string& right_name = paths_[fragments_[candidate.right].path_id].name;
-        const std::string& bridge_name = paths_[fragments_[candidate.bridge].path_id].name;
+    // ------------------------------------------------ Check each connection unit ------------------------------------------------
+    for (Unit& unit : units) {
+        const size_t edges[2] = {unit.first, unit.second};
+        const size_t count = unit.second != SIZE_MAX ? 2 : 1;
+        Candidate::Status rejected = Candidate::PENDING;
+        const char* decision = "keep";
 
-        // ------------------------------------------------ Check overlap and confidence ------------------------------------------------
-        if (candidate.target_overlaps && static_cast<double>(candidate.target_distance) / std::min(left.length, right.length) > params_.max_target_overlap) {
-            candidate.status = Candidate::COORDINATE_CONFLICT;
+        const uint32_t phase_locus = candidates[unit.first].phase_locus;
+        if (phase_locus != UINT32_MAX && used_phase_loci.count(phase_locus)) {
+            rejected = Candidate::COORDINATE_CONFLICT;
+            decision = "drop:phase-locus";
+        }
+
+        // All ends and target intervals in a full-phase pair are checked before either edge is committed.
+        for (size_t i = 0; i < count && rejected == Candidate::PENDING; ++i) {
+            Candidate& edge = candidates[edges[i]];
+            const Fragment& left = fragments_[edge.left];
+            const Fragment& right = fragments_[edge.right];
+            if (edge.target_overlaps && static_cast<double>(edge.target_distance) /
+                    std::min(left.length, right.length) > params_.max_target_overlap) {
+                rejected = Candidate::COORDINATE_CONFLICT;
+                decision = "drop:long-overlap";
+            } else if (outgoing[edge.left] != SIZE_MAX || incoming[edge.right] != SIZE_MAX) {
+                rejected = Candidate::USED_END;
+                decision = "drop:used-end";
+            } else {
+                const uint32_t left_entry = incoming[edge.left] == SIZE_MAX ? 0 :
+                    candidates[incoming[edge.left]].right_boundary.target_pos;
+                const uint32_t right_exit = outgoing[edge.right] == SIZE_MAX ?
+                    static_cast<uint32_t>(right.vertices.size() - 1) :
+                    candidates[outgoing[edge.right]].left_boundary.target_pos;
+                if (left_entry > edge.left_boundary.target_pos ||
+                    edge.right_boundary.target_pos > right_exit) {
+                    rejected = Candidate::COORDINATE_CONFLICT;
+                    decision = "drop:coordinate-conflict";
+                }
+            }
+        }
+
+        // Adding either edge must not close a cycle; paired edges are tested atomically.
+        if (rejected == Candidate::PENDING) {
+            const Candidate& first = candidates[unit.first];
+            const uint32_t a = sets.find(first.left);
+            const uint32_t b = sets.find(first.right);
+            if (a == b) {
+                rejected = Candidate::CYCLE;
+                decision = "drop:cycle";
+            } else if (unit.second != SIZE_MAX) {
+                const Candidate& second = candidates[unit.second];
+                const uint32_t c = sets.find(second.left);
+                const uint32_t d = sets.find(second.right);
+                if (c == d || ((c == a || c == b) && (d == a || d == b))) {
+                    rejected = Candidate::CYCLE;
+                    decision = "drop:cycle";
+                }
+            }
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            const size_t id = edges[i];
+            Candidate& edge = candidates[id];
+            if (rejected != Candidate::PENDING) {
+                edge.status = rejected;
+            } else {
+                edge.status = Candidate::KEPT;
+                selected.push_back(id);
+                outgoing[edge.left] = id;
+                incoming[edge.right] = id;
+                sets.join(edge.left, edge.right);
+            }
             GfaGapfillDebugger::selection(
-                left_name, right_name, bridge_name,
-                "drop:long-overlap", candidate.confidence
-            );
-            continue;
-        }
-        if (candidate.confidence < params_.min_confidence && !candidate.homolog_span) {
-            candidate.status = Candidate::LOW_CONFIDENCE;
-            GfaGapfillDebugger::selection(
-                left_name, right_name, bridge_name,
-                "drop:low-confidence", candidate.confidence
-            );
-            continue;
-        }
-        if (outgoing[candidate.left] >= 0 || incoming[candidate.right] >= 0) {
-            candidate.status = Candidate::USED_END;
-            GfaGapfillDebugger::selection(left_name, right_name, bridge_name, "drop:used-end", candidate.confidence);
-            continue;
-        }
-
-        // ------------------------------------------------ Check phase conflict ------------------------------------------------
-        const uint8_t candidate_hap = left.hap;
-        LocalPhaseAssignments& local_phase = bridge_phase[candidate.bridge][left.sample];
-        // Do not reuse the same bridge interval for the opposite haplotype.
-        if (candidate_hap != 0 && overlaps_phase_interval(
-                local_phase.hap[2 - candidate_hap],
-                candidate.left_boundary.bridge_pos,
-                candidate.right_boundary.bridge_pos
-            )
-        ) {
-            candidate.status = Candidate::PHASE_CONFLICT;
-            GfaGapfillDebugger::selection(left_name, right_name, bridge_name, "drop:phase-conflict", candidate.confidence);
-            continue;
-        }
-
-        // ------------------------------------------------ Check target coordinates ------------------------------------------------
-        uint32_t left_entry = 0;
-        if (incoming[candidate.left] >= 0) {
-            left_entry = selected[incoming[candidate.left]].right_boundary.target_pos;
-        }
-        uint32_t right_exit = static_cast<uint32_t>(fragments_[candidate.right].vertices.size() - 1);
-        if (outgoing[candidate.right] >= 0) {
-            right_exit = selected[outgoing[candidate.right]].left_boundary.target_pos;
-        }
-        // Keep the new cuts inside the still-unused target ranges.
-        if (left_entry > candidate.left_boundary.target_pos || candidate.right_boundary.target_pos > right_exit) {
-            candidate.status = Candidate::COORDINATE_CONFLICT;
-            GfaGapfillDebugger::selection(left_name, right_name, bridge_name, "drop:coordinate-conflict", candidate.confidence);
-            continue;
-        }
-
-        // ------------------------------------------------ Check cycle ------------------------------------------------
-        if (sets.find(candidate.left) == sets.find(candidate.right)) {
-            candidate.status = Candidate::CYCLE;
-            GfaGapfillDebugger::selection(left_name, right_name, bridge_name, "drop:cycle", candidate.confidence);
-            continue;
-        }
-
-        // ------------------------------------------------ Keep candidate ------------------------------------------------
-        sets.join(candidate.left, candidate.right);
-        const int32_t index = static_cast<int32_t>(selected.size());
-        selected.push_back(candidate);
-        candidate.status = Candidate::KEPT;
-        selected.back().status = Candidate::KEPT;
-        outgoing[candidate.left] = index;
-        incoming[candidate.right] = index;
-        if (candidate_hap != 0) {
-            add_phase_interval(
-                local_phase.hap[candidate_hap - 1],
-                candidate.left_boundary.bridge_pos,
-                candidate.right_boundary.bridge_pos
+                paths_[fragments_[edge.left].path_id].name,
+                paths_[fragments_[edge.right].path_id].name,
+                paths_[fragments_[edge.bridge].path_id].name,
+                decision
             );
         }
-        GfaGapfillDebugger::selection(left_name, right_name, bridge_name, "keep", candidate.confidence);
+        if (rejected == Candidate::PENDING && phase_locus != UINT32_MAX) {
+            used_phase_loci.insert(phase_locus);
+        }
+    }
+
+    // Propagate the output haplotype from each chain start.  After a
+    // full-phase exchange this follows the assembled chain, not the original
+    // h1/h2 label of each downstream contig.
+    for (size_t fragment = 0; fragment < fragments_.size(); ++fragment) {
+        if (incoming[fragment] != SIZE_MAX || outgoing[fragment] == SIZE_MAX) continue;
+        const uint8_t hap = fragments_[fragment].hap;
+        if (hap < 1 || hap > 2) continue;
+        size_t current = fragment;
+        while (outgoing[current] != SIZE_MAX) {
+            const size_t id = outgoing[current];
+            candidates[id].walk_hap = hap;
+            current = candidates[id].right;
+        }
     }
     log_stream() << "  - Connections selected: " << selected.size() << "\n\n";
     return selected;
 }
 
 bool GfaGapfill::candidate_better_(const Candidate& a, const Candidate& b) {
-    if (a.confidence != b.confidence) return a.confidence > b.confidence;
-    if (a.sample_score != b.sample_score) return a.sample_score > b.sample_score;
     if (a.phase_score != b.phase_score) return a.phase_score > b.phase_score;
     const uint32_t a_phase_boundaries = (a.left_boundary.phase.similarity >= 0.0) + (a.right_boundary.phase.similarity >= 0.0);
     const uint32_t b_phase_boundaries = (b.left_boundary.phase.similarity >= 0.0) + (b.right_boundary.phase.similarity >= 0.0);
@@ -1235,7 +1691,10 @@ bool GfaGapfill::candidate_better_(const Candidate& a, const Candidate& b) {
     const uint32_t alen = a.right_boundary.bridge_pos - a.left_boundary.bridge_pos;
     const uint32_t blen = b.right_boundary.bridge_pos - b.left_boundary.bridge_pos;
     if (alen != blen) return alen < blen;
-    return a.bridge < b.bridge;
+    return std::tie(a.left, a.right, a.bridge,
+                    a.left_boundary.target_pos, a.right_boundary.target_pos) <
+        std::tie(b.left, b.right, b.bridge,
+                 b.left_boundary.target_pos, b.right_boundary.target_pos);
 }
 
 bool GfaGapfill::connection_better_(const Candidate& a, const Candidate& b) {
@@ -1248,106 +1707,287 @@ bool GfaGapfill::connection_better_(const Candidate& a, const Candidate& b) {
 }
 
 
-// ================================================= Refine left/bridge and bridge/right cut positions with local alignment =================================================
-void GfaGapfill::refine_boundaries_(
-    std::vector<Candidate>& selected,
-    std::vector<Candidate>& candidates
+// ================================================= Node-level gap filling =================================================
+size_t GfaGapfill::resolve_fill_paths_(
+    std::vector<Candidate>& candidates,
+    std::vector<size_t>& selected
 ) const {
-    log_stream() << "Refining selected gap boundaries from local alignments ...\n";
-    const GfaGapfillBoundary boundary(*this);
-    ThreadPool pool(params_.threads);
-    std::vector<std::future<bool>> futures;
-    futures.reserve(selected.size());
-    ProgressTracker progress(selected.size());
+    log_stream() << "Walking graph nodes between selected Boundary anchors ...\n";
 
-    // Only selected graph connections need base-level cut refinement.
-    for (Candidate& candidate : selected) {
-        Candidate* task = &candidate;
-        futures.emplace_back(pool.submit([&boundary, task, &progress]() {
-            const bool refined = boundary.refine(
-                task->left, task->right, task->bridge,
-                task->left_boundary, task->right_boundary
-            );
-            progress.hit();
-            return refined;
-        }));
+    // ------------------------------------------------ Stable sample order ------------------------------------------------
+    std::sort(selected.begin(), selected.end(), [&](size_t a_id, size_t b_id) {
+        const Candidate& a = candidates[a_id];
+        const Candidate& b = candidates[b_id];
+        const Fragment& al = fragments_[a.left];
+        const Fragment& bl = fragments_[b.left];
+        if (al.sample != bl.sample) return al.sample < bl.sample;
+
+        if (full_phase_samples_.count(al.sample)) {
+            if (al.component != bl.component) return al.component < bl.component;
+            if (a.phase_group != b.phase_group) return a.phase_group < b.phase_group;
+            if (al.hap != bl.hap) return al.hap < bl.hap;
+        } else {
+            const uint8_t ah = al.hap == 1 ? 0 : (al.hap == 2 ? 1 : 2);
+            const uint8_t bh = bl.hap == 1 ? 0 : (bl.hap == 2 ? 1 : 2);
+            if (ah != bh) return ah < bh;
+            if (al.component != bl.component) return al.component < bl.component;
+        }
+        return std::tie(al.layout_start, a.left, a.right, a_id) <
+            std::tie(bl.layout_start, b.left, b.right, b_id);
+    });
+
+    // ------------------------------------------------ Group work and original haplotype nodes by sample ------------------------------------------------
+    struct SampleWork {
+        size_t begin{0}, end{0};
+        std::vector<uint32_t> fragments;
+    };
+    std::vector<SampleWork> work;
+    std::unordered_map<std::string, size_t> work_by_sample;
+    for (size_t begin = 0; begin < selected.size();) {
+        const std::string& sample = fragments_[candidates[selected[begin]].left].sample;
+        size_t end = begin + 1;
+        while (end < selected.size() && fragments_[candidates[selected[end]].left].sample == sample) ++end;
+        work_by_sample.emplace(sample, work.size());
+        work.push_back({begin, end, {}});
+        begin = end;
+    }
+    for (uint32_t fragment_id = 0; fragment_id < fragments_.size(); ++fragment_id) {
+        const Fragment& fragment = fragments_[fragment_id];
+        if (fragment.hap < 1 || fragment.hap > 2) continue;
+        const auto found = work_by_sample.find(fragment.sample);
+        if (found != work_by_sample.end()) work[found->second].fragments.push_back(fragment_id);
     }
 
-    size_t refined = 0;
-    // Finish all alignments before final end assignment.
-    for (size_t i = 0; i < selected.size(); ++i) {
-        if (futures[i].get()) ++refined;
+    // ------------------------------------------------ Resolve samples in parallel ------------------------------------------------
+    size_t resolved = 0;
+    if (!work.empty()) {
+        ThreadPool pool(std::min<size_t>(params_.threads, work.size()));
+        ProgressTracker progress(work.size());
+        std::vector<std::future<size_t>> futures;
+        futures.reserve(work.size());
+        for (size_t work_id = 0; work_id < work.size(); ++work_id) {
+            futures.emplace_back(pool.submit([&, work_id] {
+                SampleWork& item = work[work_id];
+                const size_t count = resolve_sample_fill_paths_(
+                    candidates, selected, item.begin, item.end, item.fragments
+                );
+                progress.hit();
+                return count;
+            }));
+        }
+        for (std::future<size_t>& future : futures) resolved += future.get();
+        progress.finish();
+        pool.stop();
     }
 
-    // Refresh scores and write the cached evidence once.
-    for (Candidate& candidate : selected) {
-        update_confidence_(candidate);
+    // ------------------------------------------------ Report resolved walks serially ------------------------------------------------
+    for (size_t id : selected) {
+        const Candidate& candidate = candidates[id];
+        if (!candidate.fill) continue;
         const Fragment& left = fragments_[candidate.left];
-        const Fragment& right = fragments_[candidate.right];
-        const Fragment& bridge = fragments_[candidate.bridge];
-        GfaGapfillDebugger::refined_boundary(
-            {paths_[left.path_id].name, left.length, left.reverse},
-            candidate.left_boundary.target_cut_bp,
-            {paths_[right.path_id].name, right.length, right.reverse},
-            candidate.right_boundary.target_cut_bp,
-            {paths_[bridge.path_id].name, bridge.length, bridge.reverse},
-            candidate.left_boundary.bridge_cut_bp,
-            candidate.right_boundary.bridge_cut_bp,
-            {candidate.left_boundary.minimizer,
-             candidate.left_boundary.phase.similarity,
-             candidate.left_boundary.phase.target_bp,
-             candidate.left_boundary.phase.bridge_bp},
-            {candidate.right_boundary.minimizer,
-             candidate.right_boundary.phase.similarity,
-             candidate.right_boundary.phase.target_bp,
-             candidate.right_boundary.phase.bridge_bp},
-            candidate.left_boundary.identity,
-            candidate.right_boundary.identity
-        );
         GfaGapfillDebugger::candidate(
-            paths_[fragments_[candidate.left].path_id].name,
+            paths_[left.path_id].name,
             paths_[fragments_[candidate.right].path_id].name,
             paths_[fragments_[candidate.bridge].path_id].name,
-            fragments_[candidate.left].component,
+            left.component,
             candidate.left_boundary.phase.similarity,
             candidate.right_boundary.phase.similarity,
             candidate.left_boundary.phase.target_bp,
             candidate.left_boundary.phase.bridge_bp,
             candidate.right_boundary.phase.target_bp,
             candidate.right_boundary.phase.bridge_bp,
-            candidate.left_boundary.minimizer,
-            candidate.right_boundary.minimizer,
             candidate.homolog_span,
-            candidate.sample_support, candidate.spanning_samples,
-            candidate.sample_score, candidate.phase_score,
-            candidate.alignment_score, candidate.confidence
+            candidate.phase_score
+        );
+        std::vector<std::string> walk_vertices;
+        if (DEBUG_ENABLED) {
+            walk_vertices.reserve(candidate.fill->vertices.size());
+            for (uint32_t vertex : candidate.fill->vertices) {
+                walk_vertices.push_back(
+                    nodes_[Vertex::get_segment_id(vertex)].name +
+                    (Vertex::get_is_reverse(vertex) ? "-" : "+")
+                );
+            }
+        }
+        GfaGapfillDebugger::node_walk(
+            paths_[left.path_id].name,
+            paths_[fragments_[candidate.right].path_id].name,
+            paths_[fragments_[candidate.bridge].path_id].name,
+            candidate.fill->length,
+            candidate.fill->left_cut,
+            candidate.fill->right_cut,
+            walk_vertices
         );
     }
 
-    // Keep the HTML/report copy of selected candidates in sync.
-    size_t selected_id = 0;
-    for (Candidate& candidate : candidates) {
-        if (candidate.status == Candidate::KEPT) {
-            candidate = selected[selected_id++];
-        }
-    }
-    progress.finish();
-    pool.stop();
-    log_stream() << "  - Boundaries refined: " << refined << "\n\n";
+    const size_t failed = selected.size() - resolved;
+    log_stream() << "  - Node walks resolved: " << resolved << '\n';
+    log_stream() << "  - Node walks rejected: " << failed << "\n\n";
+    return failed;
 }
 
-void GfaGapfill::update_confidence_(Candidate& candidate) {
-    const double left = candidate.left_boundary.identity >= 0.0 && candidate.left_boundary.coverage >= 0.0 ?
-        std::sqrt(candidate.left_boundary.identity * candidate.left_boundary.coverage) :
-        (candidate.left_boundary.minimizer >= 0.0 ? candidate.left_boundary.minimizer : 0.5);
-    const double right = candidate.right_boundary.identity >= 0.0 && candidate.right_boundary.coverage >= 0.0 ?
-        std::sqrt(candidate.right_boundary.identity * candidate.right_boundary.coverage) :
-        (candidate.right_boundary.minimizer >= 0.0 ? candidate.right_boundary.minimizer : 0.5);
-    candidate.alignment_score = std::min(left, right);
-    candidate.confidence =
-        std::pow(std::clamp(candidate.sample_score, 0.0, 1.0), 0.5) *
-        std::pow(std::clamp(candidate.phase_score, 0.0, 1.0), 0.1) *
-        std::pow(std::clamp(candidate.alignment_score, 0.0, 1.0), 0.4);
+size_t GfaGapfill::resolve_sample_fill_paths_(
+    std::vector<Candidate>& candidates,
+    const std::vector<size_t>& selected,
+    size_t begin,
+    size_t end,
+    const std::vector<uint32_t>& sample_fragments
+) const {
+    // Original haplotype nodes are the initial soft masks. Filled internal
+    // nodes are added only after a single edge or complete atomic pair succeeds.
+    std::vector<uint8_t> used(nodes_.size(), 0); // bit 0: hap1, bit 1: hap2
+    for (uint32_t fragment_id : sample_fragments) {
+        const Fragment& fragment = fragments_[fragment_id];
+        const uint8_t bit = static_cast<uint8_t>(1u << (fragment.hap - 1));
+        for (uint32_t vertex : fragment.vertices) {
+            used[Vertex::get_segment_id(vertex)] |= bit;
+        }
+    }
+
+    const auto add_internal = [](const FillPath& fill, std::vector<uint8_t>& used, uint8_t bit) {
+        for (size_t i = 1; i + 1 < fill.vertices.size(); ++i) {
+            used[Vertex::get_segment_id(fill.vertices[i])] |= bit;
+        }
+    };
+    size_t resolved = 0;
+
+    // ------------------------------------------------ Resolve single connections and atomic pairs ------------------------------------------------
+    for (size_t i = begin; i < end;) {
+        const Candidate& current = candidates[selected[i]];
+        size_t mate = SIZE_MAX;
+        if (current.phase_group != UINT32_MAX && i + 1 < end &&
+            candidates[selected[i + 1]].phase_group == current.phase_group) {
+            mate = i + 1;
+        }
+
+        const size_t count = mate == SIZE_MAX ? 1 : 2;
+        size_t edges[2] = {selected[i], mate == SIZE_MAX ? SIZE_MAX : selected[mate]};
+        if (count == 2) {
+            const bool second_better = candidate_better_(candidates[edges[1]], candidates[edges[0]]);
+            const bool tied = !second_better && !candidate_better_(candidates[edges[0]], candidates[edges[1]]);
+            if (second_better || (tied && fragments_[candidates[edges[1]].left].hap < fragments_[candidates[edges[0]].left].hap)) {
+                std::swap(edges[0], edges[1]);
+            }
+        }
+
+        Candidate first = candidates[edges[0]];
+        const uint8_t first_hap = first.walk_hap ? first.walk_hap : fragments_[first.left].hap;
+        bool ok = first_hap >= 1 && first_hap <= 2;
+        if (ok) {
+            const uint8_t blocked_bit = static_cast<uint8_t>(1u << (2 - first_hap));
+            ok = resolve_fill_path_(first, used, blocked_bit);
+        }
+
+        Candidate second;
+        if (ok && count == 2) {
+            second = candidates[edges[1]];
+            const uint8_t second_hap = second.walk_hap ? second.walk_hap : fragments_[second.left].hap;
+            ok = second_hap >= 1 && second_hap <= 2;
+            if (ok) {
+                const uint8_t blocked_bit = static_cast<uint8_t>(1u << (2 - second_hap));
+                std::vector<uint32_t> temporary;
+                for (size_t pos = 1; pos + 1 < first.fill->vertices.size(); ++pos) {
+                    const uint32_t segment = Vertex::get_segment_id(first.fill->vertices[pos]);
+                    if (!(used[segment] & blocked_bit)) {
+                        used[segment] |= blocked_bit;
+                        temporary.push_back(segment);
+                    }
+                }
+                ok = resolve_fill_path_(second, used, blocked_bit);
+                for (uint32_t segment : temporary) used[segment] &= static_cast<uint8_t>(~blocked_bit);
+            }
+        }
+
+        if (!ok) {
+            for (size_t edge = 0; edge < count; ++edge) {
+                candidates[edges[edge]].fill.reset();
+                candidates[edges[edge]].status = Candidate::NO_PATH;
+            }
+        } else {
+            candidates[edges[0]] = std::move(first);
+            if (count == 2) candidates[edges[1]] = std::move(second);
+            for (size_t edge = 0; edge < count; ++edge) {
+                Candidate& candidate = candidates[edges[edge]];
+                const uint8_t hap = candidate.walk_hap ? candidate.walk_hap : fragments_[candidate.left].hap;
+                add_internal(*candidate.fill, used, static_cast<uint8_t>(1u << (hap - 1)));
+                ++resolved;
+            }
+        }
+
+        i += count;
+    }
+    return resolved;
+}
+
+bool GfaGapfill::resolve_fill_path_(
+    Candidate& candidate,
+    const std::vector<uint8_t>& soft_blocked,
+    uint8_t soft_block_mask
+) const {
+    const Fragment& left = fragments_[candidate.left];
+    const Fragment& right = fragments_[candidate.right];
+    const Fragment& bridge = fragments_[candidate.bridge];
+    const uint32_t source = left.vertices[candidate.left_boundary.target_pos];
+    const uint32_t sink = right.vertices[candidate.right_boundary.target_pos];
+
+    // ------------------------------------------------ Configure source-aware walk ------------------------------------------------
+    GfaSourceWalker::Options options;
+    const std::string bridge_source = bridge.sample + ".hap" + std::to_string(bridge.hap);
+    const auto named_source = source_ids_.find(bridge_source);
+    if (named_source != source_ids_.end()) options.preferred_source = named_source->second;
+
+    // Use the dominant local SN carried by the real spanning bridge. This is
+    // robust when P-path sample names and node provenance names are different.
+    std::vector<double> bridge_source_weight(getSampleNames().size(), 0.0);
+    for (uint32_t pos = candidate.left_boundary.bridge_pos + 1; pos < candidate.right_boundary.bridge_pos; ++pos) {
+        const uint32_t segment = Vertex::get_segment_id(bridge.vertices[pos]);
+        std::vector<uint32_t> sources;
+        for (uint32_t source_id : getNodeSampleIds(segment)) {
+            if (source_scope_.empty() || source_scope_.count(source_id)) sources.push_back(source_id);
+        }
+        if (sources.empty()) continue;
+        const double share = static_cast<double>(
+            bridge.path_bp[pos + 1] - bridge.path_bp[pos]
+        ) / sources.size();
+        for (uint32_t source_id : sources) bridge_source_weight[source_id] += share;
+    }
+    for (uint32_t source_id = 0; source_id < bridge_source_weight.size(); ++source_id) {
+        if (bridge_source_weight[source_id] > 0.0 && (options.preferred_source == UINT32_MAX || bridge_source_weight[source_id] > bridge_source_weight[options.preferred_source])) {
+            options.preferred_source = source_id;
+        }
+    }
+    options.source_scope = source_scope_.empty() ? nullptr : &source_scope_;
+    options.transition_sources = &source_transitions_;
+    options.soft_blocked = soft_blocked.empty() ? nullptr : &soft_blocked;
+    options.soft_block_mask = soft_block_mask;
+    options.max_depth = params_.max_depth;
+    options.max_bp = params_.max_gap_bp;
+    options.max_states = params_.dfs_guard;
+
+    const GfaSourceWalker::Result result = GfaSourceWalker(*this).walk(source, sink, options);
+    if (!result || result.truncated) return false;
+
+    // ------------------------------------------------ Build node walk sequence ------------------------------------------------
+    auto fill = std::make_shared<FillPath>();
+    fill->vertices = result.vertices;
+    for (uint32_t vertex : result.vertices) {
+        fill->length += nodes_[Vertex::get_segment_id(vertex)].length;
+    }
+    fill->sequence = get_path_sequence(result.vertices);
+    if (fill->sequence == "*") fill->sequence.clear();
+
+    // Source belongs to the left target; sink belongs to the right target.
+    if (source == sink) {
+        fill->left_cut = fill->right_cut = fill->length;
+        candidate.right_boundary.target_cut_bp = right.path_bp[candidate.right_boundary.target_pos + 1];
+    } else {
+        fill->left_cut = nodes_[Vertex::get_segment_id(source)].length;
+        fill->right_cut = fill->length - nodes_[Vertex::get_segment_id(sink)].length;
+    }
+    if (fill->left_cut > fill->right_cut || fill->right_cut - fill->left_cut > params_.max_gap_bp || fill->right_cut > fill->length || candidate.right_boundary.target_cut_bp > right.length) return false;
+
+    candidate.fill = std::move(fill);
+    return true;
 }
 
 
@@ -1377,8 +2017,8 @@ void GfaGapfill::check_unplaced_sequence_(std::vector<Candidate>& candidates) co
         const Fragment& bridge = fragments_[candidate.bridge];
 
         if (check_left) {
-            const uint64_t target_begin = left.path_bp[candidate.left_boundary.junction_target_pos + 1];
-            const uint64_t bridge_begin = bridge.path_bp[candidate.left_boundary.junction_bridge_pos + 1];
+            const uint64_t target_begin = left.path_bp[candidate.left_boundary.target_pos + 1];
+            const uint64_t bridge_begin = bridge.path_bp[candidate.left_boundary.bridge_pos + 1];
             const uint64_t compare_bp = std::min(left.length - target_begin, bridge.length - bridge_begin);
             const std::string unplaced = fragment_subsequence_(left, target_begin, target_begin + compare_bp);
             const std::string filled = fragment_subsequence_(bridge, bridge_begin, bridge_begin + compare_bp);
@@ -1386,8 +2026,8 @@ void GfaGapfill::check_unplaced_sequence_(std::vector<Candidate>& candidates) co
             candidate.left_misassembly = candidate.left_unplaced_similarity >= 0.0 && candidate.left_unplaced_similarity < params_.misassembly_similarity;
         }
         if (check_right) {
-            const uint64_t target_end = right.path_bp[candidate.right_boundary.junction_target_pos];
-            const uint64_t bridge_end = bridge.path_bp[candidate.right_boundary.junction_bridge_pos];
+            const uint64_t target_end = right.path_bp[candidate.right_boundary.target_pos];
+            const uint64_t bridge_end = bridge.path_bp[candidate.right_boundary.bridge_pos];
             const uint64_t compare_bp = std::min(target_end, bridge_end);
             const std::string unplaced = fragment_subsequence_(right, target_end - compare_bp, target_end);
             const std::string filled = fragment_subsequence_(bridge, bridge_end - compare_bp, bridge_end);
@@ -1403,8 +2043,8 @@ void GfaGapfill::check_unplaced_sequence_(std::vector<Candidate>& candidates) co
         Candidate& candidate = candidates[i];
         const Fragment& left = fragments_[candidate.left];
         const Fragment& right = fragments_[candidate.right];
-        candidate.left_unplaced = left.length - left.path_bp[candidate.left_boundary.junction_target_pos + 1];
-        candidate.right_unplaced = right.path_bp[candidate.right_boundary.junction_target_pos];
+        candidate.left_unplaced = left.length - left.path_bp[candidate.left_boundary.target_pos + 1];
+        candidate.right_unplaced = right.path_bp[candidate.right_boundary.target_pos];
         const uint64_t keys[2] = {
             (static_cast<uint64_t>(candidate.left) << END_KEY_SHIFT) | LEFT_END_CODE,
             (static_cast<uint64_t>(candidate.right) << END_KEY_SHIFT) | RIGHT_END_CODE
@@ -1440,8 +2080,8 @@ void GfaGapfill::check_unplaced_sequence_(std::vector<Candidate>& candidates) co
         const bool left_side = (item.first & LEFT_END_CODE) == LEFT_END_CODE;
         const Candidate& candidate = candidates[candidate_id];
         const Fragment& fragment = fragments_[left_side ? candidate.left : candidate.right];
-        const uint32_t begin = left_side ? candidate.left_boundary.junction_target_pos + 1 : 0;
-        const uint32_t end = left_side ? fragment.vertices.size() : candidate.right_boundary.junction_target_pos;
+        const uint32_t begin = left_side ? candidate.left_boundary.target_pos + 1 : 0;
+        const uint32_t end = left_side ? fragment.vertices.size() : candidate.right_boundary.target_pos;
         const uint32_t terminal_id = candidate_id * TERMINAL_SLOTS + (left_side ? LEFT_TERMINAL_OFFSET : RIGHT_TERMINAL_OFFSET);
         terminal_bp[terminal_id] = left_side ? candidate.left_unplaced : candidate.right_unplaced;
         for (uint32_t pos = begin; pos < end; ++pos) {
@@ -1531,7 +2171,7 @@ void GfaGapfill::check_unplaced_sequence_(std::vector<Candidate>& candidates) co
         possible += candidate.left_misassembly;
         possible += candidate.right_misassembly;
         if (candidate.left_misassembly) {
-            uint64_t begin = left.path_bp[candidate.left_boundary.junction_target_pos + 1];
+            uint64_t begin = left.path_bp[candidate.left_boundary.target_pos + 1];
             uint64_t end = left.length;
             if (left.reverse) {
                 end = left.length - begin;
@@ -1547,7 +2187,7 @@ void GfaGapfill::check_unplaced_sequence_(std::vector<Candidate>& candidates) co
         }
         if (candidate.right_misassembly) {
             uint64_t begin = 0;
-            uint64_t end = right.path_bp[candidate.right_boundary.junction_target_pos];
+            uint64_t end = right.path_bp[candidate.right_boundary.target_pos];
             if (right.reverse) {
                 begin = right.length - end;
                 end = right.length;
@@ -1598,10 +2238,10 @@ std::vector<GfaGapfill::MisassemblyContig> GfaGapfill::split_misassemblies_(
     std::unordered_set<uint64_t> seen;
     for (const Candidate& candidate : candidates) {
         const uint32_t sources[2] = {candidate.left, candidate.right};
-        const uint32_t begins[2] = {candidate.left_boundary.junction_target_pos + 1, 0};
+        const uint32_t begins[2] = {candidate.left_boundary.target_pos + 1, 0};
         const uint32_t ends[2] = {
             static_cast<uint32_t>(fragments_[candidate.left].vertices.size()),
-            candidate.right_boundary.junction_target_pos
+            candidate.right_boundary.target_pos
         };
         const bool flagged[2] = {candidate.left_misassembly, candidate.right_misassembly};
         for (uint32_t side = 0; side < 2; ++side) {
@@ -1644,10 +2284,10 @@ std::vector<GfaGapfill::MisassemblyContig> GfaGapfill::split_misassemblies_(
             }
             if (first == UINT32_MAX || shared_bp < terminal_bp * params_.misassembly_similarity) continue;
 
-            const uint64_t prefix_bp = fragment.path_bp[first];
-            const uint64_t suffix_bp = fragment.length - fragment.path_bp[last + 1];
-            const bool prefix = prefix_bp <= params_.end_skip_bp;
-            const bool suffix = suffix_bp <= params_.end_skip_bp;
+            // Propagate only blocks that actually touch a contig end. This is
+            // a structural terminal check, not a fixed-distance heuristic.
+            const bool prefix = first == 0;
+            const bool suffix = last + 1 == fragment.vertices.size();
             if (!prefix && !suffix) continue;
             const uint64_t fragment_key = static_cast<uint64_t>(fragment_id) << SPLIT_END_BITS;
             const uint64_t right_end_key = fragment_key | SPLIT_RIGHT_END;
@@ -1805,11 +2445,24 @@ std::vector<GfaGapfill::MisassemblyContig> GfaGapfill::split_misassemblies_(
 
 void GfaGapfill::mark_used_relocations_(const std::vector<Candidate>& selected) {
     for (const Candidate& candidate : selected) {
-        if (candidate.right_boundary.bridge_pos <= candidate.left_boundary.bridge_pos + 1) continue;
-        const uint32_t ids[3] = {candidate.left, candidate.right, candidate.bridge};
+        const uint32_t ids[2] = {candidate.left, candidate.right};
         for (uint32_t id : ids) {
             const int32_t relocation = fragments_[id].relocation;
             if (relocation >= 0) relocations_[relocation].used_for_gap = true;
+        }
+        if (!candidate.fill) continue;
+        std::unordered_set<uint32_t> fill_segments;
+        for (size_t i = 1; i + 1 < candidate.fill->vertices.size(); ++i) {
+            fill_segments.insert(Vertex::get_segment_id(candidate.fill->vertices[i]));
+        }
+        for (const Fragment& fragment : fragments_) {
+            if (fragment.relocation < 0) continue;
+            for (uint32_t vertex : fragment.vertices) {
+                if (fill_segments.count(Vertex::get_segment_id(vertex))) {
+                    relocations_[fragment.relocation].used_for_gap = true;
+                    break;
+                }
+            }
         }
     }
 }
@@ -1819,195 +2472,36 @@ void GfaGapfill::mark_used_relocations_(const std::vector<Candidate>& selected) 
 void GfaGapfill::build_sample_chains_(const std::vector<Candidate>& selected) {
     log_stream() << "Building gap-filled sample paths ...\n\n";
 
-    // ------------------------------------------------ Build selected connection indexes ------------------------------------------------
+    // ------------------------------------------------ Index selected connections ------------------------------------------------
     std::vector<int32_t> incoming(fragments_.size(), -1), outgoing(fragments_.size(), -1);
     for (size_t i = 0; i < selected.size(); ++i) {
         incoming[selected[i].right] = static_cast<int32_t>(i);
         outgoing[selected[i].left] = static_cast<int32_t>(i);
     }
 
-    // ------------------------------------------------ Build chains from selected connections ------------------------------------------------
-    std::map<std::pair<std::string, uint32_t>, std::vector<Chain>> groups;  // Sample name + component -> chains
+    // ------------------------------------------------ Build chains in their selected left-end phase ------------------------------------------------
     for (uint32_t i = 0; i < fragments_.size(); ++i) {
-        if (incoming[i] >= 0) continue;
-
         const Fragment& fragment = fragments_[i];
-        if (!fragment.eligible || fragment.redundant) continue;  // Short fragment or redundant fragment which is already included in a gap-filled chain
+        if (incoming[i] >= 0 || !fragment.eligible || fragment.redundant ||
+            fragment.hap == 0 || fragment.hap > 2) continue;
         Chain chain = build_chain_(i, incoming, outgoing, selected);
-        if (chain.vertices.empty()) continue;
-        // Example: sampleA + component3 -> [chain1, chain2, ...]
-        groups[{fragment.sample, fragment.component}].push_back(std::move(chain));
-    }
-
-    // ------------------------------------------------ Compare overlapping chains based on shared nodes ------------------------------------------------
-    for (auto& group : groups) {
-        std::vector<Chain>& chains = group.second;
-        // ------------------------------------------------ Find shared graph nodes ------------------------------------------------
-        std::vector<std::pair<uint32_t, uint32_t>> node_chains;  // (segment_id, chain_id)
-        size_t total_nodes = 0;
-        for (const Chain& chain : chains) total_nodes += chain.vertices.size();
-        node_chains.reserve(total_nodes);
-        for (uint32_t i = 0; i < chains.size(); ++i) {
-            for (uint32_t vertex : chains[i].vertices) {
-                node_chains.emplace_back(Vertex::get_segment_id(vertex), i);
-            }
-        }
-        std::sort(node_chains.begin(), node_chains.end());
-
-        const uint64_t min_shared = static_cast<uint64_t>(std::ceil(params_.min_overlap_bp * params_.min_similarity));
-
-        std::unordered_map<uint64_t, uint64_t> shared_bp;  // Key = (chain_a << 32) | chain_b, Value = shared base pairs
-        for (size_t begin = 0; begin < node_chains.size();) {
-            size_t end = begin + 1;
-            while (end < node_chains.size() && node_chains[end].first == node_chains[begin].first) {
-                ++end;
-            }
-            for (size_t i = begin; i < end; ++i) {
-                if (i > begin && node_chains[i].second == node_chains[i - 1].second) continue;
-                for (size_t j = i + 1; j < end; ++j) {
-                    if (node_chains[j].second == node_chains[j - 1].second) continue;
-                    const uint32_t a = node_chains[i].second;
-                    const uint32_t b = node_chains[j].second;
-                    const uint64_t key = (static_cast<uint64_t>(a) << 32) | b;
-                    shared_bp[key] += nodes_[node_chains[begin].first].length;
-                }
-            }
-            begin = end;
-        }
-
-        // ------------------------------------------------ Compare overlapping chains based on layout ------------------------------------------------
-        std::vector<std::pair<int64_t, uint32_t>> chain_order;  // (chain_begin, chain_id)
-        std::vector<std::pair<int64_t, int64_t>> chain_bounds(chains.size());  // (chain_begin, chain_end)
-        chain_order.reserve(chains.size());
-        for (uint32_t i = 0; i < chains.size(); ++i) {
-            int64_t begin = std::numeric_limits<int64_t>::max();
-            int64_t end = std::numeric_limits<int64_t>::min();
-            for (uint32_t fragment_id : chains[i].source_fragments) {
-                const Fragment& fragment = fragments_[fragment_id];
-                begin = std::min(begin, fragment.layout_start);
-                end = std::max(end, fragment.layout_start + static_cast<int64_t>(fragment.length));
-            }
-            chain_bounds[i] = {begin, end};
-            chain_order.emplace_back(begin, i);
-        }
-        std::sort(chain_order.begin(), chain_order.end());
-        std::vector<int32_t> best_partner(chains.size(), -1);
-        std::vector<uint64_t> best_overlap(chains.size(), 0);
-        for (size_t i = 0; i < chain_order.size(); ++i) {
-            const uint32_t a = chain_order[i].second;
-            const bool mixed_a = chains[a].hap_bp[0] > 0 && chains[a].hap_bp[1] > 0;
-            for (size_t j = i + 1; j < chain_order.size(); ++j) {
-                const uint32_t b = chain_order[j].second;
-                if (chain_bounds[b].first >= chain_bounds[a].second) break;  // no overlap
-                const bool mixed_b = chains[b].hap_bp[0] > 0 && chains[b].hap_bp[1] > 0;
-                if (!mixed_a && !mixed_b) continue;  // both chains are already assigned to a single haplotype
-                const int64_t overlap = std::min(chain_bounds[a].second, chain_bounds[b].second) - chain_bounds[b].first;
-                const int64_t shorter = std::min(chain_bounds[a].second - chain_bounds[a].first, chain_bounds[b].second - chain_bounds[b].first);
-                if (overlap < static_cast<int64_t>(min_shared) || overlap * 2 < shorter) continue;
-                const uint64_t overlap_bp = static_cast<uint64_t>(overlap);
-                if (overlap_bp > best_overlap[a]) {
-                    best_overlap[a] = overlap_bp;
-                    best_partner[a] = static_cast<int32_t>(b);
-                }
-                if (overlap_bp > best_overlap[b]) {
-                    best_overlap[b] = overlap_bp;
-                    best_partner[b] = static_cast<int32_t>(a);
-                }
-            }
-        }
-        for (uint32_t a = 0; a < chains.size(); ++a) {
-            if (best_partner[a] < 0) continue;
-            const uint32_t b = static_cast<uint32_t>(best_partner[a]);
-            const uint32_t first = std::min(a, b);
-            const uint32_t second = std::max(a, b);
-            const uint64_t key = (static_cast<uint64_t>(first) << 32) | second;
-            shared_bp[key] = std::max(shared_bp[key], best_overlap[a]);
-        }
-
-        // ------------------------------------------------ Build chain conflict graph ------------------------------------------------
-        std::vector<std::vector<uint32_t>> conflicts(chains.size());  // Chain ID -> conflicting chain IDs
-        for (const auto& item : shared_bp) {
-            if (item.second < min_shared) continue;
-            const uint32_t a = static_cast<uint32_t>(item.first >> 32);
-            const uint32_t b = static_cast<uint32_t>(item.first);
-            conflicts[a].push_back(b);
-            conflicts[b].push_back(a);
-        }
-
-        // ------------------------------------------------ Assign chain haplotypes ------------------------------------------------
-        std::vector<int8_t> color(chains.size(), -1);
-        std::array<uint64_t, 2> component_bp{0, 0};
-        for (uint32_t root = 0; root < chains.size(); ++root) {
-            if (color[root] >= 0) continue;
-            std::queue<uint32_t> queue;
-            std::vector<uint32_t> block;
-            bool conflict = false;
-            color[root] = 0;
-            queue.push(root);
-            while (!queue.empty()) {
-                const uint32_t u = queue.front();
-                queue.pop();
-                block.push_back(u);
-                for (uint32_t v : conflicts[u]) {
-                    if (color[v] < 0) {
-                        color[v] = color[u] ^ 1;
-                        queue.push(v);
-                    } else if (color[v] == color[u]) {
-                        conflict = true;
-                    }
-                }
-            }
-
-            uint64_t normal = 0;
-            uint64_t swapped = 0;
-            uint64_t color_bp[2] = {0, 0};
-            for (uint32_t i : block) {
-                const Chain& chain = chains[i];
-                const uint64_t length = chain_length_(chain);
-                color_bp[color[i]] += length;
-                if (color[i] == 0) {
-                    normal += chain.hap_bp[0];
-                    swapped += chain.hap_bp[1];
-                } else {
-                    normal += chain.hap_bp[1];
-                    swapped += chain.hap_bp[0];
-                }
-            }
-            bool swap = swapped > normal;
-            if (swapped == normal) {
-                const uint64_t normal_hap1 = component_bp[0] + color_bp[0];
-                const uint64_t normal_hap2 = component_bp[1] + color_bp[1];
-                const uint64_t swapped_hap1 = component_bp[0] + color_bp[1];
-                const uint64_t swapped_hap2 = component_bp[1] + color_bp[0];
-                const uint64_t normal_diff = normal_hap1 > normal_hap2 ? normal_hap1 - normal_hap2 : normal_hap2 - normal_hap1;
-                const uint64_t swapped_diff = swapped_hap1 > swapped_hap2 ? swapped_hap1 - swapped_hap2 : swapped_hap2 - swapped_hap1;
-                swap = swapped_diff < normal_diff;
-            }
-            for (uint32_t i : block) {
-                const uint8_t assigned = static_cast<uint8_t>(color[i]) ^ swap;
-                Chain& chain = chains[i];
-                chain.hap = assigned + 1;
-                component_bp[assigned] += chain_length_(chain);
-                GfaGapfillDebugger::assignment(
-                    chain.sample, chain.component, chain.hap,
-                    chain.hap_bp[0], chain.hap_bp[1], conflict
-                );
-                sample_chains_[chain.sample][assigned].push_back(std::move(chain));
-            }
+        if (!chain.vertices.empty()) {
+            sample_chains_[chain.sample][chain.hap - 1].push_back(std::move(chain));
         }
     }
 
     // ------------------------------------------------ Keep short single fragments ------------------------------------------------
     for (uint32_t i = 0; i < fragments_.size(); ++i) {
         const Fragment& fragment = fragments_[i];
-        if (fragment.eligible || fragment.relocation >= 0 || fragment.redundant) continue;
+        if (fragment.eligible || fragment.relocation >= 0 || fragment.redundant ||
+            fragment.vertices.empty() || fragment.hap == 0 || fragment.hap > 2) continue;
         Chain chain;
         chain.sample = fragment.sample;
         chain.hap = fragment.hap;
         chain.component = fragment.component;
         chain.source_fragments.push_back(i);
-        chain.vertices.push_back(fragment.vertices.front());
-        chain.parts.push_back({i, 0, fragment.length, false});
+        chain.vertices = fragment.vertices;
+        chain.parts.push_back({i, UINT32_MAX, 0, fragment.length, false});
         sample_chains_[fragment.sample][fragment.hap - 1].push_back(std::move(chain));
     }
 }
@@ -2033,28 +2527,25 @@ GfaGapfill::Chain GfaGapfill::build_chain_(
         const uint64_t begin_bp = incoming[current] < 0 ? 0 : selected[incoming[current]].right_boundary.target_cut_bp;
         const uint64_t end_bp = outgoing[current] < 0 ? fragment.length : selected[outgoing[current]].left_boundary.target_cut_bp;
         if (begin_bp < end_bp) {
-            chain.parts.push_back({current, begin_bp, end_bp, false});
-            chain.hap_bp[fragment.hap - 1] += end_bp - begin_bp;
+            chain.parts.push_back({current, UINT32_MAX, begin_bp, end_bp, false});
         }
         for (uint32_t i = begin; i <= end; ++i) {
+            if (!chain.vertices.empty() && chain.vertices.back() == fragment.vertices[i]) continue;
             chain.vertices.push_back(fragment.vertices[i]);
         }
         if (outgoing[current] < 0) break;
 
         const Candidate& edge = selected[outgoing[current]];
-        const Fragment& bridge = fragments_[edge.bridge];
-        if (edge.left_boundary.bridge_cut_bp <= edge.right_boundary.bridge_cut_bp) {
-            chain.parts.push_back({
-                edge.bridge, edge.left_boundary.bridge_cut_bp,
-                edge.right_boundary.bridge_cut_bp, true
-            });
-        }
-        if (edge.left_boundary.bridge_cut_bp < edge.right_boundary.bridge_cut_bp) {
-            for (uint32_t i = edge.left_boundary.bridge_pos + 1; i < edge.right_boundary.bridge_pos; ++i) {
-                chain.vertices.push_back(bridge.vertices[i]);
-            }
-        }
+        if (!edge.fill) break;
+        const uint32_t gap = static_cast<uint32_t>(chain.gaps.size());
         chain.gaps.push_back(edge);
+        chain.parts.push_back({
+            UINT32_MAX, gap, edge.fill->left_cut, edge.fill->right_cut, true
+        });
+        for (size_t i = 1; i + 1 < edge.fill->vertices.size(); ++i) {
+            if (!chain.vertices.empty() && chain.vertices.back() == edge.fill->vertices[i]) continue;
+            chain.vertices.push_back(edge.fill->vertices[i]);
+        }
         current = edge.right;
     }
     return chain;
@@ -2084,7 +2575,6 @@ void GfaGapfill::mark_redundant_fragments_(const std::vector<Candidate>& selecte
         const Candidate& candidate = selected[candidate_id];
         used[candidate.left] = true;
         used[candidate.right] = true;
-        used[candidate.bridge] = true;
         const Fragment& left = fragments_[candidate.left];
         /**************************** may have bugs ********************************/
         // Coverage for left/right with different haplotypes uses the final chain hap. (2026-08-11 v0.1.3-r21)
@@ -2112,11 +2602,13 @@ void GfaGapfill::mark_redundant_fragments_(const std::vector<Candidate>& selecte
         bool sequence_loaded = false;
         for (size_t candidate_id : group->second) {
             const Candidate& candidate = selected[candidate_id];
-            const Fragment& bridge = fragments_[candidate.bridge];
-            if (candidate.right_boundary.bridge_pos <= candidate.left_boundary.bridge_pos + 1) continue;
+            if (!candidate.fill || candidate.fill->left_cut >= candidate.fill->right_cut) continue;
+            if (candidate.fill->sequence.empty()) continue;
 
-            const int64_t gap_begin = bridge.layout_start + static_cast<int64_t>(candidate.left_boundary.bridge_cut_bp);
-            const int64_t gap_end = bridge.layout_start + static_cast<int64_t>(candidate.right_boundary.bridge_cut_bp);
+            const int64_t gap_begin = fragments_[candidate.left].layout_start +
+                static_cast<int64_t>(candidate.left_boundary.target_cut_bp);
+            const int64_t gap_end = fragments_[candidate.right].layout_start +
+                static_cast<int64_t>(candidate.right_boundary.target_cut_bp);
             const int64_t overlap_begin = std::max(fragment_begin, gap_begin);
             const int64_t overlap_end = std::min(fragment_end, gap_end);
             if (overlap_end <= overlap_begin || static_cast<uint64_t>(overlap_end - overlap_begin) * 10 < fragment.length * 8) continue;
@@ -2124,9 +2616,9 @@ void GfaGapfill::mark_redundant_fragments_(const std::vector<Candidate>& selecte
             // ------------------------------------------------ Compare covered sequences ------------------------------------------------
             std::string& gap_sequence = gap_sequences[candidate_id];
             if (gap_sequence.empty()) {
-                gap_sequence = fragment_subsequence_(
-                    bridge, candidate.left_boundary.bridge_cut_bp,
-                    candidate.right_boundary.bridge_cut_bp
+                gap_sequence = candidate.fill->sequence.substr(
+                    candidate.fill->left_cut,
+                    candidate.fill->right_cut - candidate.fill->left_cut
                 );
             }
             if (!sequence_loaded) {
@@ -2140,7 +2632,10 @@ void GfaGapfill::mark_redundant_fragments_(const std::vector<Candidate>& selecte
             fragment.redundant = true;
             ++redundant;
             redundant_bp += fragment.length;
-            log_stream() << "  - Covered contig: " << paths_[fragment.path_id].name << " by " << paths_[bridge.path_id].name << " (similarity=" << std::fixed << std::setprecision(4) << similarity << ")\n";
+            log_stream() << "  - Covered contig: " << paths_[fragment.path_id].name
+                         << " by bridge " << paths_[fragments_[candidate.bridge].path_id].name
+                         << " (similarity=" << std::fixed << std::setprecision(4)
+                         << similarity << ")\n";
             break;
         }
     }
@@ -2540,17 +3035,18 @@ void GfaGapfill::print_summary_(size_t selected) const {
     log_stream() << "Gap-fill summary:\n";
     log_stream() << "  - Samples: " << sample_chains_.size() << "\n";
     log_stream() << "  - Contig paths: " << fragments_.size() << "\n";
-    log_stream() << "  - Confident gap bridges: " << selected << "\n";
+    log_stream() << "  - Node-walk gaps filled: " << selected << "\n";
     log_stream() << "  - Sample paths written: " << path_count << "\n\n";
 }
 
 // Select representative haplotypes, assemble sequence and write final GFA and reports.
-void GfaGapfill::save_samples(
+GfaGapfill::PrimaryPaths GfaGapfill::save_samples(
     const std::string& prefix,
     const std::string& command_line
 ) {
+    PrimaryPaths primary_paths;
     log_stream() << "Writing gap-filled sample graphs ...\n";
-    std::unordered_set<std::string> filenames;
+    std::unordered_set<std::string> filenames{"primary"};
     for (const auto& item : sample_chains_) {
         std::string name = safe_name(item.first);
         const std::string base = name;
@@ -2569,8 +3065,8 @@ void GfaGapfill::save_samples(
 
     const PrimarySelection primary = select_primary_chains_();
     log_stream() << "Writing primary haplotype graphs ...\n";
-    save_haplotype_("primary", 1, primary.primary[0], prefix + ".primary.hap1", command_line, true);
-    save_haplotype_("primary", 2, primary.primary[1], prefix + ".primary.hap2", command_line, true);
+    save_haplotype_("primary", 1, primary.primary[0], prefix + ".primary.hap1", command_line, true, "pr", &primary_paths[0]);
+    save_haplotype_("primary", 2, primary.primary[1], prefix + ".primary.hap2", command_line, true, "pr", &primary_paths[1]);
     std::cerr << '\n';
 
     log_stream() << "Writing low-quality primary graphs ...\n";
@@ -2579,8 +3075,7 @@ void GfaGapfill::save_samples(
 
     SAVE report(prefix + ".gapfill.tsv");
     report.save(
-        "sample\thap\tcomponent\tcontig\tleft\tright\tbridge\tgap_interval\t"
-        "phase\talign_identity\talign_coverage\tsample_support\tconfidence\n"
+        "sample\thap\tcomponent\tcontig\tleft\tright\tbridge\tgap_interval\tphase\n"
     );
     for (const GapRecord& record : records_) {
         std::ostringstream line;
@@ -2590,11 +3085,7 @@ void GfaGapfill::save_samples(
              << record.bridge << '\t'
              << record.gap_beg << '-' << record.gap_end << '\t'
              << std::fixed << std::setprecision(2);
-        line << metric_pair(record.phase_left, record.phase_right) << '\t'
-             << metric_pair(record.identity_left, record.identity_right) << '\t'
-             << metric_pair(record.coverage_left, record.coverage_right) << '\t'
-             << record.sample_support << '/' << record.spanning_samples << '\t'
-             << record.confidence << '\n';
+        line << metric_pair(record.phase_left, record.phase_right) << '\n';
         report.save(line.str());
     }
 
@@ -2615,6 +3106,7 @@ void GfaGapfill::save_samples(
         relocation_report.save(line.str());
     }
     log_stream() << "  - Samples written: " << sample_chains_.size() << "\n\n";
+    return primary_paths;
 }
 
 void GfaGapfill::save_haplotype_(
@@ -2624,7 +3116,8 @@ void GfaGapfill::save_haplotype_(
     const std::string& prefix,
     const std::string& command_line,
     bool primary,
-    const char* primary_kind
+    const char* primary_kind,
+    std::vector<GfaBubble::ReferencePath>* reference_paths
 ) {
     // ------------------------------------------------ Open files ------------------------------------------------
     const std::string suffix = ".gapfill";
@@ -2644,8 +3137,8 @@ void GfaGapfill::save_haplotype_(
     header += "H\tCO:Z:  SN:Z   node source/sample name\n";
     header += "H\tCO:Z:  CP:i   graph component\n";
     header += "H\tCO:Z:  GF:Z   gap-filled intervals (0-based, half-open)\n";
-    header += "H\tCO:Z:  SC:Z   target pieces as contig@start-end+/- (source coordinates; 0-based, half-open)\n";
-    header += "H\tCO:Z:  GS:Z   gap-source pieces in GF order, using the same coordinate format\n";
+    header += "H\tCO:Z:  SC:Z   target pieces as contig:start-end+/- (source coordinates; 0-based, half-open)\n";
+    header += "H\tCO:Z:  GS:Z   bridge-source:start-end+/- pieces in GF order (walk coordinates; 0-based, half-open)\n";
     header += "H\tCO:Z:  MS:Z   source contig of an unused misassembly\n";
     header += "H\tCO:Z:  ME:Z   source end of an unused misassembly\n";
     header += "H\tCO:Z:  MR:Z   reason the misassembly was not used\n";
@@ -2709,9 +3202,19 @@ void GfaGapfill::save_haplotype_(
                     intervals.emplace_back(assembled_length, assembled_length + part_length);
                 }
                 if (chain_part.begin < chain_part.end) {
-                    std::string part = fragment_subsequence_(
-                        fragments_[chain_part.fragment], chain_part.begin, chain_part.end
-                    );
+                    std::string part;
+                    if (chain_part.filled) {
+                        const Candidate& gap = chain.gaps[chain_part.gap];
+                        if (gap.fill && chain_part.end <= gap.fill->sequence.size()) {
+                            part = gap.fill->sequence.substr(
+                                chain_part.begin, chain_part.end - chain_part.begin
+                            );
+                        }
+                    } else {
+                        part = fragment_subsequence_(
+                            fragments_[chain_part.fragment], chain_part.begin, chain_part.end
+                        );
+                    }
                     if (part.empty()) sequence_available = false;
                     for (char& base : part) {
                         base = chain_part.filled ?
@@ -2740,6 +3243,24 @@ void GfaGapfill::save_haplotype_(
         }
         if (!sequence_available) sequence.clear();
 
+        // ------------------------------------------------ Export the exact primary node path ------------------------------------------------
+        if (reference_paths) {
+            uint64_t path_length = 0;
+            for (size_t i = 0; i < assembled_vertices->size(); ++i) {
+                const uint32_t vertex = (*assembled_vertices)[i];
+                const uint32_t node_length = nodes_[Vertex::get_segment_id(vertex)].length;
+                const uint32_t overlap = i == 0 ? 0 : get_edge_ow((*assembled_vertices)[i - 1], vertex);
+                path_length += node_length > overlap ? node_length - overlap : 0;
+            }
+            if (path_length == assembled_length) {
+                reference_paths->push_back({name, *assembled_vertices});
+            } else {
+                warning_stream() << "  ! Primary path length does not match output contig: "
+                                 << name << " (path=" << path_length
+                                 << ", output=" << assembled_length << ")\n";
+            }
+        }
+
         // ------------------------------------------------ Build segment tags ------------------------------------------------
         std::ostringstream tags;
         tags << "\tLN:i:" << assembled_length << "\tSN:Z:" << chain.sample
@@ -2765,7 +3286,7 @@ void GfaGapfill::save_haplotype_(
                     end = source.length - part.begin;
                 }
                 tags << output_contig_name(paths_[source.path_id].name, chain.sample)
-                     << '@' << begin << '-' << end << (source.reverse ? '-' : '+');
+                     << ':' << begin << '-' << end << (source.reverse ? '-' : '+');
             }
             tags << "\tGS:Z:";
             first = true;
@@ -2773,14 +3294,10 @@ void GfaGapfill::save_haplotype_(
                 if (!part.filled) continue;
                 if (!first) tags << ',';
                 first = false;
-                const Fragment& source = fragments_[part.fragment];
-                uint64_t begin = part.begin, end = part.end;
-                if (source.reverse) {
-                    begin = source.length - part.end;
-                    end = source.length - part.begin;
-                }
-                tags << paths_[source.path_id].name
-                     << '@' << begin << '-' << end << (source.reverse ? '-' : '+');
+                const Candidate& gap = chain.gaps[part.gap];
+                const Fragment& bridge = fragments_[gap.bridge];
+                tags << bridge.sample << ".hap" << static_cast<uint32_t>(bridge.hap)
+                     << ':' << part.begin << '-' << part.end << '+';
             }
         }
 
@@ -2804,14 +3321,7 @@ void GfaGapfill::save_haplotype_(
                 intervals[i].first,
                 intervals[i].second,
                 candidate.left_boundary.phase.similarity,
-                candidate.right_boundary.phase.similarity,
-                candidate.left_boundary.identity,
-                candidate.left_boundary.coverage,
-                candidate.right_boundary.identity,
-                candidate.right_boundary.coverage,
-                candidate.sample_support,
-                candidate.spanning_samples,
-                candidate.confidence
+                candidate.right_boundary.phase.similarity
             });
         }
         GfaGapfillDebugger::chain(
@@ -2824,7 +3334,7 @@ void GfaGapfill::save_haplotype_(
 }
 
 
-// ================================================= helpers =================================================
+// ================================================= Sequence helpers =================================================
 std::string GfaGapfill::fragment_sequence_(
     const Fragment& fragment,
     uint32_t begin,
@@ -2835,7 +3345,8 @@ std::string GfaGapfill::fragment_sequence_(
     std::string sequence;
     sequence.reserve(fragment.path_bp[end] - fragment.path_bp[begin]);
     for (uint32_t i = begin; i < end; ++i) {
-        const uint32_t overlap = i == begin ? 0 : get_edge_ow(fragment.vertices[i - 1], fragment.vertices[i]);
+        const uint32_t overlap = i == begin ? 0 :
+            get_edge_ow(fragment.vertices[i - 1], fragment.vertices[i]);
         std::string part = get_oriented_sequence(Vertex(fragment.vertices[i]), overlap);
         if (part.empty()) return {};
         sequence += part;
@@ -2900,7 +3411,7 @@ uint64_t GfaGapfill::ng50_(std::vector<uint64_t> lengths, uint64_t component_bp)
 /* =================================================================================================================
  * GAP BOUNDARY START
  * ================================================================================================================= */
-// Build graph anchors and local evidence once, then refine selected cuts with mm2
+// Build ordered graph anchors and cache the local evidence once.
 bool GfaGapfillBoundary::prepare(
     uint32_t left_id, uint32_t right_id, uint32_t bridge_id,
     Boundary& left_boundary, Boundary& right_boundary
@@ -2910,13 +3421,20 @@ bool GfaGapfillBoundary::prepare(
     const GfaGapfill::Fragment& right = gapfill_.fragments_[right_id];
     const GfaGapfill::Fragment& bridge = gapfill_.fragments_[bridge_id];
 
-    // Shared-node cuts are safe fallbacks when local alignment is unavailable.
+    // Shared-node cuts are the final node-level gap boundaries. A three-way
+    // crossover owns its shared node on the left and starts the right target
+    // immediately after it, so the node appears exactly once.
     left_boundary.target_cut_bp = left.path_bp[left_boundary.target_pos + 1];
     left_boundary.bridge_cut_bp = bridge.path_bp[left_boundary.bridge_pos + 1];
-    right_boundary.bridge_cut_bp = bridge.path_bp[right_boundary.bridge_pos];
-    right_boundary.target_cut_bp = right.path_bp[right_boundary.target_pos];
+    if (left_boundary.bridge_pos == right_boundary.bridge_pos) {
+        right_boundary.bridge_cut_bp = left_boundary.bridge_cut_bp;
+        right_boundary.target_cut_bp = right.path_bp[right_boundary.target_pos + 1];
+    } else {
+        right_boundary.bridge_cut_bp = bridge.path_bp[right_boundary.bridge_pos];
+        right_boundary.target_cut_bp = right.path_bp[right_boundary.target_pos];
+    }
 
-    // Cache all local evidence and alignment coordinates once per candidate.
+    // Cache local phase evidence once per candidate.
     left_boundary.phase = phase_similarity_(
         left_id, left_boundary.target_pos,
         bridge_id, left_boundary.bridge_pos, true
@@ -2925,17 +3443,6 @@ bool GfaGapfillBoundary::prepare(
         right_id, right_boundary.target_pos,
         bridge_id, right_boundary.bridge_pos, false
     );
-    left_boundary.minimizer = minimizer_similarity_(
-        left_id, left_boundary.target_pos,
-        bridge_id, left_boundary.bridge_pos, true, 1
-    );
-    right_boundary.minimizer = minimizer_similarity_(
-        right_id, right_boundary.target_pos,
-        bridge_id, right_boundary.bridge_pos, false, 1
-    );
-
-    prepare_alignment_window_(left_id, bridge_id, left_boundary, right_boundary, true, left_boundary);
-    prepare_alignment_window_(right_id, bridge_id, left_boundary, right_boundary, false, right_boundary);
     return true;
 }
 
@@ -2951,8 +3458,7 @@ GfaGapfillBoundary::Boundary GfaGapfillBoundary::inspect(
     uint32_t target_pos,
     uint32_t bridge,
     uint32_t bridge_pos,
-    bool before,
-    bool expand_minimizer
+    bool before
 ) const {
     Boundary boundary;
     boundary.target_pos = target_pos;
@@ -2960,116 +3466,7 @@ GfaGapfillBoundary::Boundary GfaGapfillBoundary::inspect(
     boundary.phase = phase_similarity_(
         target, target_pos, bridge, bridge_pos, before
     );
-    boundary.minimizer = minimizer_similarity_(
-        target, target_pos, bridge, bridge_pos, before,
-        expand_minimizer ? boundary.phase.windows : 1
-    );
     return boundary;
-}
-
-bool GfaGapfillBoundary::refine(
-    uint32_t left_id, uint32_t right_id, uint32_t bridge_id,
-    Boundary& left_boundary, Boundary& right_boundary
-) const {
-    const GfaGapfill::Fragment& left = gapfill_.fragments_[left_id];
-    const GfaGapfill::Fragment& right = gapfill_.fragments_[right_id];
-    const GfaGapfill::Fragment& bridge = gapfill_.fragments_[bridge_id];
-    std::array<Alignment, 2> alignments;
-    bool mapped_left = false;
-    bool mapped_right = false;
-    if (left_boundary.alignable) {
-        mapped_left = align_(
-            gapfill_.fragment_subsequence_(
-                bridge, left_boundary.bridge_begin, left_boundary.bridge_end
-            ),
-            gapfill_.fragment_subsequence_(
-                left, left_boundary.target_begin, left_boundary.target_end
-            ),
-            true, alignments[0]
-        );
-    }
-    if (right_boundary.alignable) {
-        mapped_right = align_(
-            gapfill_.fragment_subsequence_(
-                bridge, right_boundary.bridge_begin, right_boundary.bridge_end
-            ),
-            gapfill_.fragment_subsequence_(
-                right, right_boundary.target_begin, right_boundary.target_end
-            ),
-            false, alignments[1]
-        );
-    }
-    if (left_boundary.alignable && alignments[0].hits > 0) {
-        left_boundary.identity = alignments[0].identity;
-        left_boundary.coverage = alignments[0].coverage;
-    }
-    if (right_boundary.alignable && alignments[1].hits > 0) {
-        right_boundary.identity = alignments[1].identity;
-        right_boundary.coverage = alignments[1].coverage;
-    }
-
-    const GfaGapfillDebugger::Alignment left_result{
-        left_boundary.target_begin, left_boundary.target_end,
-        left_boundary.bridge_begin, left_boundary.bridge_end,
-        alignments[0].query_cut, alignments[0].reference_cut,
-        alignments[0].query_begin, alignments[0].query_end,
-        alignments[0].reference_begin, alignments[0].reference_end,
-        alignments[0].hits, alignments[0].mapq,
-        alignments[0].identity, alignments[0].coverage,
-        alignments[0].accepted, alignments[0].reverse
-    };
-    const GfaGapfillDebugger::Alignment right_result{
-        right_boundary.target_begin, right_boundary.target_end,
-        right_boundary.bridge_begin, right_boundary.bridge_end,
-        alignments[1].query_cut, alignments[1].reference_cut,
-        alignments[1].query_begin, alignments[1].query_end,
-        alignments[1].reference_begin, alignments[1].reference_end,
-        alignments[1].hits, alignments[1].mapq,
-        alignments[1].identity, alignments[1].coverage,
-        alignments[1].accepted, alignments[1].reverse
-    };
-    GfaGapfillDebugger::boundary_alignment(
-        {gapfill_.paths_[left.path_id].name, left.length, left.reverse},
-        {gapfill_.paths_[right.path_id].name, right.length, right.reverse},
-        {gapfill_.paths_[bridge.path_id].name, bridge.length, bridge.reverse},
-        left_result,
-        right_result
-    );
-
-    /**************************** may have bugs ********************************/
-    /**
-     * @date 2026-08-13
-     * @version v0.1.3-r21
-     * 
-     * @note
-     *   left_cut = std::max(old_left_cut, refined_left_cut);
-     *   right_cut = std::min(old_right_cut, refined_right_cut);
-     */
-    uint64_t left_cut = left_boundary.target_cut_bp;
-    uint64_t bridge_left_cut = left_boundary.bridge_cut_bp;
-    uint64_t bridge_right_cut = right_boundary.bridge_cut_bp;
-    uint64_t right_cut = right_boundary.target_cut_bp;
-    if (mapped_left) {
-        left_cut = left_boundary.target_begin + alignments[0].query_cut;
-        bridge_left_cut = left_boundary.bridge_begin + alignments[0].reference_cut;
-    }
-    if (mapped_right) {
-        bridge_right_cut = right_boundary.bridge_begin + alignments[1].reference_cut;
-        right_cut = right_boundary.target_begin + alignments[1].query_cut;
-    }
-    if (bridge_left_cut > bridge_right_cut) {
-        if (!mapped_left || !mapped_right || !splice_overlap_(
-                alignments[0], alignments[1], left_boundary, right_boundary,
-                left_cut, right_cut, bridge_left_cut, bridge_right_cut
-            )) return false;
-    }
-    left_boundary.target_cut_bp = left_cut;
-    left_boundary.bridge_cut_bp = bridge_left_cut;
-    right_boundary.bridge_cut_bp = bridge_right_cut;
-    right_boundary.target_cut_bp = right_cut;
-    /**************************** may have bugs ********************************/
-
-    return mapped_left || mapped_right;
 }
 
 // Anchor discovery keeps graph order and rejects ambiguous or non-unique bridge intervals.
@@ -3106,7 +3503,7 @@ bool GfaGapfillBoundary::find_anchors_(
 
     // ------------------------------------------------ Collect shared nodes ------------------------------------------------
     std::vector<std::pair<uint32_t, uint32_t>> left_matches;  // {bridge_pos, left_pos}
-    std::vector<std::pair<uint32_t, uint32_t>> right_matches;  // {bridge_pos, right_pos}}
+    std::vector<std::pair<uint32_t, uint32_t>> right_matches;  // {bridge_pos, right_pos}
     left_matches.reserve(std::min(left.vertices.size(), bridge.vertices.size()));
     right_matches.reserve(std::min(right.vertices.size(), bridge.vertices.size()));
 
@@ -3119,7 +3516,13 @@ bool GfaGapfillBoundary::find_anchors_(
     }
     if (left_matches.empty() || right_matches.empty()) return false;
 
-    // ------------------------------------------------ Choose the best junctions ------------------------------------------------
+    // ------------------------------------------------ Find an ordered source/sink pair ------------------------------------------------
+    // Without a three-way crossover, retain as much target sequence as
+    // possible while keeping source before sink on the spanning bridge.
+    GfaGapfill::Candidate ordered;
+    bool have_ordered = false;
+    uint64_t ordered_retained = 0;
+    uint32_t ordered_span = UINT32_MAX;
     std::vector<uint32_t> suffix(right_matches.size());
     suffix.back() = static_cast<uint32_t>(right_matches.size() - 1);
     for (size_t i = right_matches.size() - 1; i > 0; --i) {
@@ -3127,11 +3530,6 @@ bool GfaGapfillBoundary::find_anchors_(
         const uint32_t best = suffix[i];
         suffix[current] = right_matches[current].second < right_matches[best].second ? current : best;
     }
-
-    // Trend to select the junctions that retain the most target sequence, and in case of ties, the smallest bridge span
-    uint64_t best_retained = 0;
-    uint32_t best_span = UINT32_MAX;
-    bool found = false;
     for (const auto& left_match : left_matches) {
         const auto it = std::upper_bound(
             right_matches.begin(), right_matches.end(),
@@ -3139,148 +3537,68 @@ bool GfaGapfillBoundary::find_anchors_(
         );
         if (it == right_matches.end()) continue;
 
-        const size_t first = static_cast<size_t>(it - right_matches.begin());
-        const auto& right_match = right_matches[suffix[first]];
-        if (bridge.rank_drops[right_match.first] != bridge.rank_drops[left_match.first]) continue;  // left and right matches must be on the same phase region
-        const uint64_t retained = left.path_bp[left_match.second + 1] + right.length - right.path_bp[right_match.second];
+        const auto& right_match = right_matches[suffix[it - right_matches.begin()]];
+        const uint64_t retained = left.path_bp[left_match.second + 1] +
+            right.length - right.path_bp[right_match.second];
         const uint32_t span = right_match.first - left_match.first;
-        if (!found || retained > best_retained || (retained == best_retained && span < best_span)) {
-            candidate.left_boundary.target_pos = left_match.second;
-            candidate.left_boundary.bridge_pos = left_match.first;
-            candidate.right_boundary.bridge_pos = right_match.first;
-            candidate.right_boundary.target_pos = right_match.second;
-            best_retained = retained;
-            best_span = span;
-            found = true;
+        if (!have_ordered || retained > ordered_retained ||
+            (retained == ordered_retained && span < ordered_span) ||
+            (retained == ordered_retained && span == ordered_span &&
+             std::tie(left_match.first, right_match.first) <
+             std::tie(ordered.left_boundary.bridge_pos, ordered.right_boundary.bridge_pos))) {
+            ordered.left_boundary.target_pos = left_match.second;
+            ordered.left_boundary.bridge_pos = left_match.first;
+            ordered.right_boundary.bridge_pos = right_match.first;
+            ordered.right_boundary.target_pos = right_match.second;
+            ordered_retained = retained;
+            ordered_span = span;
+            have_ordered = true;
         }
     }
-    if (!found) return false;
 
-    // ------------------------------------------------ Try a shared crossover junction ------------------------------------------------
-    GfaGapfill::Candidate normal = candidate;
-    normal.left_boundary.junction_target_pos = normal.left_boundary.target_pos;
-    normal.left_boundary.junction_bridge_pos = normal.left_boundary.bridge_pos;
-    normal.right_boundary.junction_bridge_pos = normal.right_boundary.bridge_pos;
-    normal.right_boundary.junction_target_pos = normal.right_boundary.target_pos;
-
-    GfaGapfill::Candidate crossover = normal;
-    uint64_t crossover_retained = 0;
+    // ------------------------------------------------ Find a three-way crossover ------------------------------------------------
+    GfaGapfill::Candidate crossover;
     bool have_crossover = false;
-    // A shared three-way node is preferred when the two target contigs overlap.
+    uint64_t crossover_retained = 0;
     for (const auto& match : left_matches) {
-        const uint32_t vertex = bridge.vertices[match.first];
-        const uint32_t right_pos = find_position_(right_id, vertex);
+        const uint32_t right_pos = find_position_(right_id, bridge.vertices[match.first]);
         if (right_pos == UINT32_MAX) continue;
-        const uint64_t retained = left.path_bp[match.second] + right.length - right.path_bp[right_pos];
-        const bool prefer_right_intersection = right.length > left.length && match.first < crossover.left_boundary.bridge_pos;
-        const bool prefer_left_intersection = left.length > right.length && match.first > crossover.left_boundary.bridge_pos;
-        if (!have_crossover || retained > crossover_retained || (retained == crossover_retained && (prefer_right_intersection || prefer_left_intersection))) {
+
+        const uint64_t retained = left.path_bp[match.second + 1] +
+            right.length - right.path_bp[right_pos + 1];
+        if (!have_crossover || retained > crossover_retained ||
+            (retained == crossover_retained && match.first < crossover.left_boundary.bridge_pos)) {
             crossover.left_boundary.target_pos = match.second;
             crossover.left_boundary.bridge_pos = match.first;
             crossover.right_boundary.bridge_pos = match.first;
             crossover.right_boundary.target_pos = right_pos;
-            crossover.left_boundary.junction_target_pos = match.second;
-            crossover.left_boundary.junction_bridge_pos = match.first;
-            crossover.right_boundary.junction_bridge_pos = match.first;
-            crossover.right_boundary.junction_target_pos = right_pos;
             crossover_retained = retained;
             have_crossover = true;
         }
     }
 
-    // ------------------------------------------------ Move boundaries to the trusted regions ------------------------------------------------
-    if (have_crossover && adjust_boundaries_(left_id, right_id, bridge_id, left_matches, right_matches, crossover.left_boundary, crossover.right_boundary)) {
+    // ------------------------------------------------ Select and validate the boundary ------------------------------------------------
+    if (have_crossover) {
         candidate = crossover;
+    } else if (have_ordered) {
+        candidate = ordered;
     } else {
-        candidate = normal;
-        if (!adjust_boundaries_(left_id, right_id, bridge_id, left_matches, right_matches, candidate.left_boundary, candidate.right_boundary)) return false;
+        return false;
     }
 
-    if (!is_cycle_free_(left_id, right_id, bridge_id, candidate.left_boundary, candidate.right_boundary)) return false;
-
-    // ------------------------------------------------ Move junctions outside the shared overlap ------------------------------------------------
-    // Misassembly checks start outside the complete target/bridge overlap: after the last shared node on the left and before the first on the right.
-    const uint32_t left_bridge_rank = bridge.rank_drops[candidate.left_boundary.junction_bridge_pos];
-    for (const auto& match : left_matches) {
-        if (bridge.rank_drops[match.first] != left_bridge_rank || match.first < candidate.left_boundary.junction_bridge_pos || match.second < candidate.left_boundary.junction_target_pos) continue;
-        if (match.second > candidate.left_boundary.junction_target_pos || (match.second == candidate.left_boundary.junction_target_pos && match.first > candidate.left_boundary.junction_bridge_pos)) {
-            candidate.left_boundary.junction_bridge_pos = match.first;
-            candidate.left_boundary.junction_target_pos = match.second;
+    if (!is_cycle_free_(left_id, right_id, bridge_id, candidate.left_boundary, candidate.right_boundary)) {
+        const bool selected_crossover = candidate.left_boundary.bridge_pos == candidate.right_boundary.bridge_pos;
+        const GfaGapfill::Candidate* fallback = selected_crossover && have_ordered ? &ordered :
+            (!selected_crossover && have_crossover ? &crossover : nullptr);
+        if (!fallback || !is_cycle_free_(left_id, right_id, bridge_id, fallback->left_boundary, fallback->right_boundary)) {
+            return false;
         }
+        candidate = *fallback;
     }
 
-    const uint32_t right_bridge_rank = bridge.rank_drops[candidate.right_boundary.junction_bridge_pos];
-    for (const auto& match : right_matches) {
-        if (bridge.rank_drops[match.first] != right_bridge_rank || match.first > candidate.right_boundary.junction_bridge_pos || match.second > candidate.right_boundary.junction_target_pos) continue;
-        if (match.second < candidate.right_boundary.junction_target_pos || (match.second == candidate.right_boundary.junction_target_pos && match.first < candidate.right_boundary.junction_bridge_pos)) {
-            candidate.right_boundary.junction_bridge_pos = match.first;
-            candidate.right_boundary.junction_target_pos = match.second;
-        }
-    }
-
-    // ------------------------------------------------ Return the selected boundaries ------------------------------------------------
     left_boundary = candidate.left_boundary;
     right_boundary = candidate.right_boundary;
     return true;
-}
-
-bool GfaGapfillBoundary::adjust_boundaries_(
-    uint32_t left_id, uint32_t right_id, uint32_t bridge_id,
-    const std::vector<std::pair<uint32_t, uint32_t>>& left_matches,
-    const std::vector<std::pair<uint32_t, uint32_t>>& right_matches,
-    Boundary& left_boundary, Boundary& right_boundary
-) const {
-    const GfaGapfill::Fragment& left = gapfill_.fragments_[left_id];
-    const GfaGapfill::Fragment& right = gapfill_.fragments_[right_id];
-    const GfaGapfill::Fragment& bridge = gapfill_.fragments_[bridge_id];
-    // Move each junction past the unreliable contig end to the nearest shared node.
-    const uint64_t left_junction = left.path_bp[left_boundary.junction_target_pos + 1];
-    const uint64_t left_trusted_end = left.length > gapfill_.params_.end_skip_bp ? left.length - gapfill_.params_.end_skip_bp : 0;
-    const uint64_t left_goal = std::min(left_junction, left_trusted_end);
-    uint64_t best_left_distance = UINT64_MAX;
-    uint32_t best_left_bridge = left_boundary.junction_bridge_pos;
-    uint32_t best_left_pos = left_boundary.junction_target_pos;
-    bool have_left = false;
-    for (const auto& match : left_matches) {
-        if (match.first > left_boundary.junction_bridge_pos || match.second > left_boundary.junction_target_pos) continue;  // in the left
-        if (bridge.rank_drops[match.first] != bridge.rank_drops[left_boundary.junction_bridge_pos]) continue;  // need to be on the same phase region
-        const uint64_t position = left.path_bp[match.second + 1];
-        if (position > left_goal) continue;
-        const uint64_t distance = left_goal - position;
-        if (distance < best_left_distance) {
-            best_left_distance = distance;
-            best_left_bridge = match.first;
-            best_left_pos = match.second;
-            have_left = true;
-        }
-    }
-
-    const uint64_t right_junction = right.path_bp[right_boundary.junction_target_pos];
-    const uint64_t right_goal = std::max(right_junction, gapfill_.params_.end_skip_bp);
-    uint64_t best_right_distance = UINT64_MAX;
-    uint32_t best_right_bridge = right_boundary.junction_bridge_pos;
-    uint32_t best_right_pos = right_boundary.junction_target_pos;
-    bool have_right = false;
-    for (const auto& match : right_matches) {
-        if (match.first < right_boundary.junction_bridge_pos || match.second < right_boundary.junction_target_pos) continue;  // in the right
-        if (bridge.rank_drops[match.first] != bridge.rank_drops[right_boundary.junction_bridge_pos]) continue;  // need to be on the same phase region
-        const uint64_t position = right.path_bp[match.second];
-        if (position < right_goal) continue;
-        const uint64_t distance = position - right_goal;
-        if (distance < best_right_distance) {
-            best_right_distance = distance;
-            best_right_bridge = match.first;
-            best_right_pos = match.second;
-            have_right = true;
-        }
-    }
-
-    if (!have_left || !have_right) return false;
-    left_boundary.target_pos = best_left_pos;
-    left_boundary.bridge_pos = best_left_bridge;
-    right_boundary.bridge_pos = best_right_bridge;
-    right_boundary.target_pos = best_right_pos;
-    return right_boundary.bridge_pos > left_boundary.bridge_pos;
 }
 
 bool GfaGapfillBoundary::is_cycle_free_(
@@ -3297,49 +3615,29 @@ bool GfaGapfillBoundary::is_cycle_free_(
     for (uint32_t i = left_boundary.bridge_pos + 1; i < right_boundary.bridge_pos; ++i) {
         if (!seen.insert(Vertex::get_segment_id(bridge.vertices[i])).second) return false;
     }
-    for (uint32_t i = right_boundary.target_pos; i < right.vertices.size(); ++i) {
+    const bool crossover = left_boundary.bridge_pos == right_boundary.bridge_pos;
+    const uint32_t right_begin = right_boundary.target_pos + static_cast<uint32_t>(crossover);
+    for (uint32_t i = right_begin; i < right.vertices.size(); ++i) {
         if (!seen.insert(Vertex::get_segment_id(right.vertices[i])).second) return false;
     }
     return true;
 }
 
-// Local phase and minimizer evidence uses the trusted sequence inside each gap boundary.
-uint64_t GfaGapfillBoundary::phase_available_(
+std::pair<uint32_t, uint32_t> GfaGapfillBoundary::phase_region_(
     uint32_t fragment_id,
     uint32_t pos,
     bool before
 ) const {
     const GfaGapfill::Fragment& fragment = gapfill_.fragments_[fragment_id];
-    if (before) {
-        return std::min(fragment.path_bp[pos + 1], fragment.length > gapfill_.params_.end_skip_bp ? fragment.length - gapfill_.params_.end_skip_bp : 0);
-    }
-    const uint64_t begin = std::min(std::max(fragment.path_bp[pos], gapfill_.params_.end_skip_bp), fragment.length);
-    return fragment.length - begin;
-}
-
-std::pair<uint32_t, uint32_t> GfaGapfillBoundary::phase_region_(
-    uint32_t fragment_id,
-    uint32_t pos,
-    bool before,
-    uint64_t windows
-) const {
-    const GfaGapfill::Fragment& fragment = gapfill_.fragments_[fragment_id];
     const uint64_t window = gapfill_.params_.phase_window_bp;
-    const uint64_t available = phase_available_(fragment_id, pos, before);
-    const uint64_t max_windows = available / window + (available % window != 0);
-    const uint64_t span = windows >= max_windows ? available : window * windows;
     uint64_t begin_bp = 0;
     uint64_t end_bp = 0;
     if (before) {
-        end_bp = std::min(
-            fragment.path_bp[pos + 1],
-            fragment.length > gapfill_.params_.end_skip_bp ? fragment.length - gapfill_.params_.end_skip_bp : 0
-        );
-        begin_bp = end_bp - span;
+        end_bp = fragment.path_bp[pos + 1];
+        begin_bp = end_bp > window ? end_bp - window : 0;
     } else {
-        begin_bp = std::max(fragment.path_bp[pos], gapfill_.params_.end_skip_bp);
-        begin_bp = std::min(begin_bp, fragment.length);
-        end_bp = begin_bp + span;
+        begin_bp = fragment.path_bp[pos];
+        end_bp = std::min(fragment.length, begin_bp + window);
     }
     if (end_bp <= begin_bp) return {0, 0};
 
@@ -3366,34 +3664,13 @@ GfaGapfillBoundary::PhaseSupport GfaGapfillBoundary::phase_similarity_(
     const GfaGapfill::Fragment& target = gapfill_.fragments_[target_id];
     const GfaGapfill::Fragment& bridge = gapfill_.fragments_[bridge_id];
     PhaseSupport support;
-    const uint64_t window = gapfill_.params_.phase_window_bp;
-    const uint64_t target_available = phase_available_(target_id, target_pos, before);
-    const uint64_t bridge_available = phase_available_(bridge_id, bridge_pos, before);
-    const uint64_t target_windows = target_available / window + (target_available % window != 0);
-    const uint64_t bridge_windows = bridge_available / window + (bridge_available % window != 0);
-    uint64_t windows = 1;
-    support.windows = windows;
-    auto target_region = phase_region_(target_id, target_pos, before, windows);
-    auto bridge_region = phase_region_(bridge_id, bridge_pos, before, windows);
-    uint64_t target_bp = target.bubble_bp[target_region.second] - target.bubble_bp[target_region.first];
-    uint64_t bridge_bp = bridge.bubble_bp[bridge_region.second] - bridge.bubble_bp[bridge_region.first];
-    // Expand by whole phase windows until both paths contain enough bubble evidence.
-    while (target_bp < gapfill_.params_.phase_min_bp || bridge_bp < gapfill_.params_.phase_min_bp) {
-        if ((target_bp < gapfill_.params_.phase_min_bp && windows >= target_windows) || (bridge_bp < gapfill_.params_.phase_min_bp && windows >= bridge_windows)) {
-            support.target_bp = target_bp;
-            support.bridge_bp = bridge_bp;
-            support.windows = windows;
-            return support;
-        }
-        ++windows;
-        support.windows = windows;
-        target_region = phase_region_(target_id, target_pos, before, windows);
-        bridge_region = phase_region_(bridge_id, bridge_pos, before, windows);
-        target_bp = target.bubble_bp[target_region.second] - target.bubble_bp[target_region.first];
-        bridge_bp = bridge.bubble_bp[bridge_region.second] - bridge.bubble_bp[bridge_region.first];
-    }
+    const auto target_region = phase_region_(target_id, target_pos, before);
+    const auto bridge_region = phase_region_(bridge_id, bridge_pos, before);
+    const uint64_t target_bp = target.bubble_bp[target_region.second] - target.bubble_bp[target_region.first];
+    const uint64_t bridge_bp = bridge.bubble_bp[bridge_region.second] - bridge.bubble_bp[bridge_region.first];
     support.target_bp = target_bp;
     support.bridge_bp = bridge_bp;
+    if (target_bp == 0 || bridge_bp == 0) return support;
 
     const GfaGapfill::Fragment* query = &target;
     const GfaGapfill::Fragment* reference = &bridge;
@@ -3435,373 +3712,6 @@ GfaGapfillBoundary::PhaseSupport GfaGapfillBoundary::phase_similarity_(
     const uint64_t compared_bp = std::min(target_bp, bridge_bp);
     support.similarity = std::min(1.0, static_cast<double>(support.shared_bp) / compared_bp);
     return support;
-}
-
-double GfaGapfillBoundary::minimizer_similarity_(
-    uint32_t target,
-    uint32_t target_pos,
-    uint32_t bridge,
-    uint32_t bridge_pos,
-    bool before,
-    uint64_t windows
-) const {
-    const GfaGapfill::Fragment& target_fragment = gapfill_.fragments_[target];
-    const GfaGapfill::Fragment& bridge_fragment = gapfill_.fragments_[bridge];
-    const auto target_region = phase_region_(target, target_pos, before, windows);
-    const auto bridge_region = phase_region_(bridge, bridge_pos, before, windows);
-    const std::string target_sequence = gapfill_.fragment_sequence_(target_fragment, target_region.first, target_region.second);
-    const std::string bridge_sequence = gapfill_.fragment_sequence_(bridge_fragment, bridge_region.first, bridge_region.second);
-    if (target_sequence.empty() || bridge_sequence.empty()) return -1.0;
-
-    minimizerdna::Options options;
-    options.k = gapfill_.mm2_.k;
-    options.w = gapfill_.mm2_.w;
-    const minimizerdna::MinimizerBuilder builder(options);
-    const minimizerdna::Sketch target_sketch = builder.build(target_sequence);
-    const minimizerdna::Sketch bridge_sketch = builder.build(bridge_sequence);
-    if (target_sketch.empty() || bridge_sketch.empty()) return -1.0;
-    return target_sketch.jaccard(bridge_sketch);
-}
-
-// Alignment windows reuse cached graph anchors and only update cuts when minimap2 passes both filters.
-bool GfaGapfillBoundary::prepare_alignment_window_(
-    uint32_t target_id, uint32_t bridge_id,
-    const Boundary& left_boundary,
-    const Boundary& right_boundary,
-    bool before,
-    Boundary& boundary
-) const {
-    const GfaGapfill::Fragment& target = gapfill_.fragments_[target_id];
-    const GfaGapfill::Fragment& bridge = gapfill_.fragments_[bridge_id];
-    if (target.vertices.empty() || bridge.vertices.empty()) return false;
-    uint64_t anchor_begin = 0;
-    uint64_t anchor_end = 0;
-    if (before) {
-        anchor_end = target.length > gapfill_.params_.end_skip_bp ? target.length - gapfill_.params_.end_skip_bp : 0;
-        anchor_begin = anchor_end > gapfill_.params_.phase_window_bp ? anchor_end - gapfill_.params_.phase_window_bp : 0;
-    } else {
-        anchor_begin = std::min(target.length, gapfill_.params_.end_skip_bp);
-        anchor_end = anchor_begin + std::min(gapfill_.params_.phase_window_bp, target.length - anchor_begin);
-    }
-    if (anchor_begin >= anchor_end) return false;
-
-    const uint32_t first = std::min(
-        static_cast<uint32_t>(std::upper_bound(target.path_bp.begin(), target.path_bp.end(), anchor_begin) - target.path_bp.begin() - 1),
-        static_cast<uint32_t>(target.vertices.size() - 1)
-    );
-    const uint32_t last = std::min(
-        static_cast<uint32_t>(std::lower_bound(target.path_bp.begin(), target.path_bp.end(), anchor_end) - target.path_bp.begin()),
-        static_cast<uint32_t>(target.vertices.size() - 1)
-    );
-    // Anchor the outer edge of the target phase window on the same bridge rank.
-    uint32_t target_anchor = UINT32_MAX;
-    uint32_t bridge_anchor = UINT32_MAX;
-
-    if (before) {
-        for (uint32_t pos = first; pos <= last; ++pos) {
-            if (!shared_anchor_(target_id, bridge_id, left_boundary, right_boundary, pos, true, bridge_anchor)) continue;
-            target_anchor = pos;
-            break;
-        }
-        for (uint32_t pos = first; target_anchor == UINT32_MAX && pos > 0; --pos) {
-            if (shared_anchor_(target_id, bridge_id, left_boundary, right_boundary, pos - 1, true, bridge_anchor)) {
-                target_anchor = pos - 1;
-            }
-        }
-    } else {
-        for (uint32_t pos = last + 1; target_anchor == UINT32_MAX && pos > first; --pos) {
-            if (shared_anchor_(target_id, bridge_id, left_boundary, right_boundary, pos - 1, false, bridge_anchor)) {
-                target_anchor = pos - 1;
-            }
-        }
-        for (uint32_t pos = last + 1; target_anchor == UINT32_MAX && pos < target.vertices.size(); ++pos) {
-            if (shared_anchor_(target_id, bridge_id, left_boundary, right_boundary, pos, false, bridge_anchor)) {
-                target_anchor = pos;
-            }
-        }
-    }
-    if (target_anchor == UINT32_MAX) return false;
-
-    // Anchor in trusted sequence, but include the complete contig end in the alignment.
-    if (before) {
-        boundary.target_begin = target.path_bp[target_anchor];
-        boundary.target_end = target.length;
-        boundary.bridge_begin = bridge.path_bp[bridge_anchor];
-        const uint64_t query_length = boundary.target_end - boundary.target_begin;
-        const uint64_t reference_length = query_length + (query_length + 9) / 10;
-        boundary.bridge_end = boundary.bridge_begin + std::min(reference_length, bridge.length - boundary.bridge_begin);
-    } else {
-        boundary.target_begin = 0;
-        boundary.target_end = target.path_bp[target_anchor + 1];
-        boundary.bridge_end = bridge.path_bp[bridge_anchor + 1];
-        const uint64_t query_length = boundary.target_end - boundary.target_begin;
-        const uint64_t reference_length = query_length + (query_length + 9) / 10;
-        boundary.bridge_begin = boundary.bridge_end > reference_length ? boundary.bridge_end - reference_length : 0;
-    }
-    boundary.alignable = boundary.target_begin < boundary.target_end && boundary.bridge_begin < boundary.bridge_end;
-    return boundary.alignable;
-}
-
-bool GfaGapfillBoundary::shared_anchor_(
-    uint32_t target_id, uint32_t bridge_id,
-    const Boundary& left_boundary,
-    const Boundary& right_boundary,
-    uint32_t target_pos,
-    bool before,
-    uint32_t& bridge_pos
-) const {
-    const GfaGapfill::Fragment& target = gapfill_.fragments_[target_id];
-    const GfaGapfill::Fragment& bridge = gapfill_.fragments_[bridge_id];
-    bridge_pos = find_position_(bridge_id, target.vertices[target_pos]);
-    if (bridge_pos == UINT32_MAX) return false;
-    const uint32_t rank = before ? left_boundary.bridge_pos : right_boundary.bridge_pos;
-    const bool ordered = before ? bridge_pos < right_boundary.bridge_pos : bridge_pos > left_boundary.bridge_pos;
-    return ordered && bridge.rank_drops[bridge_pos] == bridge.rank_drops[rank];
-}
-
-bool GfaGapfillBoundary::align_(
-    const std::string& reference,
-    const std::string& query,
-    bool before,
-    Alignment& alignment
-) const {
-    if (reference.empty() || query.empty()) return false;
-
-    mm_idxopt_t index_options;
-    mm_mapopt_t map_options;
-    mm_set_opt(nullptr, &index_options, &map_options);
-    if (mm_set_opt(gapfill_.mm2_.preset.c_str(), &index_options, &map_options) < 0) return false;
-    index_options.k = static_cast<short>(gapfill_.mm2_.k);
-    index_options.w = static_cast<short>(gapfill_.mm2_.w);
-    map_options.best_n = static_cast<short>(gapfill_.mm2_.best_n);
-    map_options.mid_occ = static_cast<int32_t>(gapfill_.mm2_.max_occ);
-    map_options.zdrop = gapfill_.mm2_.zdrop;
-    map_options.flag |= MM_F_CIGAR;
-    map_options.flag &= ~MM_F_EQX;
-
-    const char* reference_sequence = reference.c_str();
-    const char* reference_name = "bridge";
-    mm_idx_t* index = mm_idx_str(
-        index_options.w, index_options.k,
-        (index_options.flag & MM_I_HPC) ? 1 : 0,
-        index_options.bucket_bits, 1,
-        &reference_sequence, &reference_name
-    );
-    if (!index) return false;
-    mm_mapopt_update(&map_options, index);
-    mm_tbuf_t* buffer = mm_tbuf_init();
-    if (!buffer) {
-        mm_idx_destroy(index);
-        return false;
-    }
-
-    int count = 0;
-    mm_reg1_t* hits = mm_map(
-        index, static_cast<int>(query.size()), query.c_str(),
-        &count, buffer, &map_options, "boundary"
-    );
-    std::vector<AlignmentHit> candidates;
-    candidates.reserve(count);
-    for (int i = 0; i < count; ++i) {
-        const mm_reg1_t& hit = hits[i];
-        AlignmentHit candidate;
-        if (hit.p) {
-            candidate.cigar = hit.p->cigar;
-            candidate.cigar_size = hit.p->n_cigar;
-        }
-        candidate.query_begin = hit.qs;
-        candidate.query_end = hit.qe;
-        candidate.reference_begin = hit.rs;
-        candidate.reference_end = hit.re;
-        candidate.matches = hit.mlen > 0 ? static_cast<uint64_t>(hit.mlen) : 0;
-        candidate.columns = hit.blen > 0 ? static_cast<uint64_t>(hit.blen) : 0;
-        candidate.mapq = hit.mapq;
-        candidate.reverse = hit.rev;
-        candidates.push_back(candidate);
-    }
-    const double coverage = filter_and_chain_hits_(
-        candidates, query.size(), reference.size(), before, alignment
-    );
-    alignment.accepted = alignment.cut_mapped && coverage >= gapfill_.mm2_.boundary_coverage;
-    if (hits) {
-        for (int i = 0; i < count; ++i) std::free(hits[i].p);
-        std::free(hits);
-    }
-    mm_tbuf_destroy(buffer);
-    mm_idx_destroy(index);
-    return alignment.accepted;
-}
-
-double GfaGapfillBoundary::filter_and_chain_hits_(
-    std::vector<AlignmentHit>& hits,
-    uint64_t query_length,
-    uint64_t reference_length,
-    bool before,
-    Alignment& alignment
-) const {
-    const uint64_t shorter_length = std::min(query_length, reference_length);
-    if (shorter_length == 0) return -1.0;
-
-    // Filter each independent hit before rebuilding one forward collinear chain.
-    size_t retained = 0;
-    for (AlignmentHit& hit : hits) {
-        if (!hit.cigar || hit.cigar_size == 0 || hit.reverse || hit.mapq < gapfill_.mm2_.min_mapq || hit.query_begin >= hit.query_end || hit.reference_begin >= hit.reference_end) continue;
-
-        const double match_ratio = hit.columns == 0 ? 0.0 : static_cast<double>(hit.matches) / hit.columns;
-        const uint64_t aligned_span = std::min(
-            hit.query_end - hit.query_begin,
-            hit.reference_end - hit.reference_begin
-        );
-        const double alignment_ratio = static_cast<double>(aligned_span) / shorter_length;
-        if (match_ratio < gapfill_.mm2_.min_match || alignment_ratio < gapfill_.mm2_.min_ali_ratio) continue;
-        hits[retained++] = hit;
-    }
-    hits.resize(retained);
-    std::sort(hits.begin(), hits.end());
-
-    // The longest hit is the anchor; add only non-overlapping collinear hits.
-    std::map<uint32_t, const AlignmentHit*> chain;
-    for (const AlignmentHit& hit : hits) {
-        const auto next = chain.lower_bound(hit.query_begin);
-        if (next != chain.end() && (hit.query_end > next->second->query_begin || hit.reference_end > next->second->reference_begin)) continue;
-        if (next != chain.begin()) {
-            const AlignmentHit& previous = *std::prev(next)->second;
-            if (previous.query_end > hit.query_begin || previous.reference_end > hit.reference_begin) continue;
-        }
-        chain.emplace(hit.query_begin, &hit);
-    }
-    if (chain.empty()) return -1.0;
-
-    uint64_t matches = 0;
-    uint64_t columns = 0;
-    uint64_t covered = 0;
-    alignment.mapq = UINT8_MAX;
-    for (const auto& item : chain) {
-        const AlignmentHit& hit = *item.second;
-        matches += hit.matches;
-        columns += hit.columns;
-        covered += hit.query_end - hit.query_begin;
-        alignment.mapq = std::min(alignment.mapq, hit.mapq);
-
-        uint64_t query = hit.query_begin;
-        uint64_t reference = hit.reference_begin;
-        for (uint32_t i = 0; i < hit.cigar_size; ++i) {
-            const uint32_t length = hit.cigar[i] >> 4;
-            const uint32_t operation = hit.cigar[i] & 0xf;
-            if (operation == MM_CIGAR_MATCH) {
-                alignment.matches.push_back({
-                    static_cast<uint32_t>(query), static_cast<uint32_t>(reference), length
-                });
-                if (before || !alignment.cut_mapped) {
-                    alignment.query_cut = before ? query + length : query;
-                    alignment.reference_cut = before ? reference + length : reference;
-                    alignment.cut_mapped = true;
-                }
-            }
-            if (operation == MM_CIGAR_MATCH || operation == MM_CIGAR_INS) query += length;
-            if (operation == MM_CIGAR_MATCH || operation == MM_CIGAR_DEL || operation == MM_CIGAR_N_SKIP) reference += length;
-        }
-    }
-    const AlignmentHit& first = *chain.begin()->second;
-    const AlignmentHit& last = *chain.rbegin()->second;
-    alignment.query_begin = first.query_begin;
-    alignment.query_end = last.query_end;
-    alignment.reference_begin = first.reference_begin;
-    alignment.reference_end = last.reference_end;
-    alignment.hits = static_cast<uint32_t>(chain.size());
-    alignment.identity = columns == 0 ? 0.0 : static_cast<double>(matches) / columns;
-    alignment.coverage = std::min(1.0, static_cast<double>(covered) / query_length);
-    return alignment.coverage;
-}
-
-bool GfaGapfillBoundary::splice_overlap_(
-    const Alignment& left,
-    const Alignment& right,
-    const Boundary& left_boundary,
-    const Boundary& right_boundary,
-    uint64_t& left_cut,
-    uint64_t& right_cut,
-    uint64_t& bridge_left_cut,
-    uint64_t& bridge_right_cut
-) const {
-    const uint64_t overlap_begin = right_boundary.bridge_begin + right.reference_cut;
-    const uint64_t overlap_end = left_boundary.bridge_begin + left.reference_cut;
-    if (overlap_begin >= overlap_end || left.matches.empty() || right.matches.empty()) return false;
-
-    // Find the longest reference interval covered by M blocks from both targets.
-    size_t i = 0, j = 0;
-    uint64_t best_span = 0;
-    const Alignment::MatchBlock* best_left = nullptr;
-    const Alignment::MatchBlock* best_right = nullptr;
-    uint64_t best_begin = 0, best_end = 0;
-    while (i < left.matches.size() && j < right.matches.size()) {
-        const Alignment::MatchBlock& a = left.matches[i];
-        const Alignment::MatchBlock& b = right.matches[j];
-        const uint64_t a_begin = left_boundary.bridge_begin + a.reference_begin;
-        const uint64_t b_begin = right_boundary.bridge_begin + b.reference_begin;
-        const uint64_t a_end = a_begin + a.length;
-        const uint64_t b_end = b_begin + b.length;
-        const uint64_t begin = std::max({a_begin, b_begin, overlap_begin});
-        const uint64_t end = std::min({a_end, b_end, overlap_end});
-        if (begin < end && (!best_left || end - begin > best_span)) {
-            best_span = end - begin;
-            best_left = &a;
-            best_right = &b;
-            best_begin = begin;
-            best_end = end;
-        }
-        if (a_end <= b_end) ++i;
-        if (b_end <= a_end) ++j;
-    }
-    if (best_left) {
-        bridge_left_cut = best_begin + (best_end - best_begin) / 2;
-        bridge_right_cut = bridge_left_cut;
-        left_cut = left_boundary.target_begin + best_left->query_begin + bridge_left_cut - (left_boundary.bridge_begin + best_left->reference_begin);
-        right_cut = right_boundary.target_begin + best_right->query_begin + bridge_right_cut - (right_boundary.bridge_begin + best_right->reference_begin);
-        return left_cut <= left_boundary.target_end && right_cut <= right_boundary.target_end;
-    }
-
-    // No common M: use the nearest ordered M ends and fill their interval from the bridge.
-    size_t left_index = 0;
-    const Alignment::MatchBlock* nearest_left = nullptr;
-    const Alignment::MatchBlock* nearest_right = nullptr;
-    const Alignment::MatchBlock* latest_left = nullptr;
-    uint64_t nearest_distance = UINT64_MAX;
-    uint64_t nearest_loss = UINT64_MAX;
-    uint64_t nearest_left_end = 0, nearest_right_begin = 0, latest_left_end = 0;
-    for (const Alignment::MatchBlock& b : right.matches) {
-        const uint64_t b_begin = right_boundary.bridge_begin + b.reference_begin;
-        while (left_index < left.matches.size()) {
-            const Alignment::MatchBlock& a = left.matches[left_index];
-            const uint64_t a_end = left_boundary.bridge_begin + a.reference_begin + a.length;
-            if (a_end > b_begin) break;
-            if (!latest_left || a_end > latest_left_end) {
-                latest_left = &a;
-                latest_left_end = a_end;
-            }
-            ++left_index;
-        }
-        if (!latest_left) continue;
-        const uint64_t distance = b_begin - latest_left_end;
-        const uint64_t left_query_end = latest_left->query_begin + latest_left->length;
-        const uint64_t loss = (left.query_cut > left_query_end ? left.query_cut - left_query_end : 0) + (b.query_begin > right.query_cut ? b.query_begin - right.query_cut : 0);
-        if (distance < nearest_distance || (distance == nearest_distance && loss < nearest_loss)) {
-            nearest_distance = distance;
-            nearest_loss = loss;
-            nearest_left = latest_left;
-            nearest_right = &b;
-            nearest_left_end = latest_left_end;
-            nearest_right_begin = b_begin;
-        }
-    }
-    if (!nearest_left) return false;
-    if (nearest_right_begin - nearest_left_end > gapfill_.params_.max_gap_bp) return false;
-
-    bridge_left_cut = nearest_left_end;
-    bridge_right_cut = nearest_right_begin;
-    left_cut = left_boundary.target_begin + nearest_left->query_begin + nearest_left->length;
-    right_cut = right_boundary.target_begin + nearest_right->query_begin;
-    return left_cut <= left_boundary.target_end && right_cut <= right_boundary.target_end;
 }
 
 uint32_t GfaGapfillBoundary::find_position_(

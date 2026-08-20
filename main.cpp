@@ -1,6 +1,9 @@
 #include <iostream>
 #include <string>
 #include <iomanip>
+#include <filesystem>
+#include <memory>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -372,19 +375,19 @@ int main(int argc, char** argv) {
     } else if (sub == "gapfill") {
         AppConfig cfg = main_gapfill(argc, argv);
         const GfaGapfill::Params gapfill_params{
-            cfg.gapfill.end_skip,
+            cfg.gapfill.max_depth,
+            cfg.gapfill.DFS_guard,
+            cfg.gapfill.path_diff,
+            cfg.gapfill.full_phase_samples,
+            cfg.gapfill.phase_path_len,
+            cfg.gapfill.phase_win,
             cfg.gapfill.min_contig,
             cfg.gapfill.max_gap,
             cfg.gapfill.max_overlap,
             cfg.gapfill.min_overlap,
             cfg.gapfill.min_similarity,
-            cfg.gapfill.min_confidence,
             cfg.gapfill.misassembly_len,
             cfg.gapfill.misassembly_similarity,
-            cfg.gapfill.path_diff,
-            cfg.gapfill.phase_path_len,
-            cfg.gapfill.phase_win,
-            cfg.gapfill.phase_min_bp,
             cfg.gapfill.dedup_similarity,
             cfg.gapfill.dedup_component,
             static_cast<uint32_t>(cfg.global.threads),
@@ -394,14 +397,13 @@ int main(int argc, char** argv) {
         auto configure_gapfill = [&cfg](GfaGapfill& graph) {
             graph.set_alignment_options(
                 cfg.map.chainOpts, cfg.map.anchorOpts, cfg.map.extendOpts, cfg.map.alignOpts,
-                cfg.collapse.mm2_preset, cfg.gapfill.max_occ,
-                cfg.gapfill.min_match, cfg.gapfill.min_ali_ratio, cfg.gapfill.min_mapq,
-                cfg.gapfill.boundary_coverage
+                cfg.collapse.mm2_preset,
+                cfg.gapfill.min_match, cfg.gapfill.min_ali_ratio, cfg.gapfill.min_mapq
             );
         };
         auto find_gapfill_bubbles = [&cfg](const GfaGraph& graph) {
             const BubbleOpts defaults;
-            GfaBubble::GfaBubbleFinder finder(
+            auto finder = std::make_unique<GfaBubble::GfaBubbleFinder>(
                 graph, cfg.gapfill.max_depth, cfg.gapfill.max_paths,
                 cfg.gapfill.DFS_guard, cfg.gapfill.path_diff,
                 cfg.gapfill.stall_round_limit, false, true,
@@ -412,8 +414,36 @@ int main(int argc, char** argv) {
                 defaults.homo_bloom_bits, defaults.homo_bloom_hash,
                 cfg.global.threads
             );
-            finder.find_bubbles();
-            return finder.get_bubbles();
+            finder->find_bubbles();
+            return finder;
+        };
+        auto save_primary_vcfs = [&cfg](
+            const GfaBubble::GfaBubbleFinder& finder,
+            const GfaGapfill::PrimaryPaths& paths
+        ) {
+            for (uint8_t hap = 0; hap < 2; ++hap) {
+                finder.save_bubble_as_vcf(
+                    cfg.gapfill.prefix + ".primary.hap" + std::to_string(hap + 1) + ".gapfill",
+                    "", "", cfg.bubble.ali_min_mapq, cfg.bubble.ali_min_len,
+                    &paths[hap]
+                );
+            }
+        };
+        std::vector<std::string> intermediate_gfas;
+        auto protect_gapfill_input = [&cfg](const std::string& file) {
+            std::error_code error;
+            if (!std::filesystem::equivalent(file, cfg.gapfill.gfa_file, error)) return;
+            error_stream() << "Refusing to overwrite the input GFA with the intermediate file '"
+                           << file << "'\n";
+            std::exit(1);
+        };
+        auto cleanup_gapfill_intermediates = [&intermediate_gfas]() {
+            for (const std::string& file : intermediate_gfas) {
+                std::error_code error;
+                std::filesystem::remove(file, error);
+                if (error) warning_stream() << "  ! Cannot remove intermediate GFA '"
+                                            << file << "': " << error.message() << '\n';
+            }
         };
 
         std::string input = cfg.gapfill.gfa_file;
@@ -428,18 +458,22 @@ int main(int argc, char** argv) {
             preliminary.build_vertex_topological_index(false);
             const bool debug = DEBUG_ENABLED;
             DEBUG_ENABLED = false;
-            std::vector<GfaBubble::Bubble> bubbles = find_gapfill_bubbles(preliminary);
+            auto finder = find_gapfill_bubbles(preliminary);
             DEBUG_ENABLED = debug;
-            misassemblies = preliminary.prepare_misassemblies(bubbles);
+            misassemblies = preliminary.prepare_misassemblies(finder->get_bubbles());
 
             if (misassemblies.empty()) {
-                preliminary.gapfill(bubbles);
-                preliminary.save_samples(cfg.gapfill.prefix, command_line);
+                preliminary.gapfill(finder->get_bubbles());
+                const GfaGapfill::PrimaryPaths primary_paths = preliminary.save_samples(
+                    cfg.gapfill.prefix, command_line
+                );
+                save_primary_vcfs(*finder, primary_paths);
                 gapfill_complete = true;
             } else {
-                preliminary.save_to_disk(
-                    cfg.gapfill.prefix + ".gapfill.ms.gfa", true, false, true, command_line
-                );
+                const std::string ms_file = cfg.gapfill.prefix + ".gapfill.ms.gfa";
+                protect_gapfill_input(ms_file);
+                preliminary.save_to_disk(ms_file, true, false, true, command_line);
+                intermediate_gfas.push_back(ms_file);
             }
         }
 
@@ -471,14 +505,12 @@ int main(int argc, char** argv) {
             collapser.build_nodes_connectivity_index(false);
             collapser.build_vertex_topological_index(false);
             collapser.rebuild_component_paths();
-            collapser.save_to_disk(
-                cfg.gapfill.prefix + ".gapfill.ms.gfa", true, false, true, command_line
-            );
             const std::string collapse_prefix = cfg.gapfill.prefix + ".gapfill.recollapse";
+            protect_gapfill_input(collapse_prefix + ".gfa");
             relocated = collapser.collapse_misassemblies(source_components, collapse_prefix);
             input = collapse_prefix + ".gfa";
             collapser.save_to_disk(input, true, false, true, command_line);
-            collapser.save_to_disk(collapse_prefix + ".noseq.gfa", true, false, false, command_line);
+            intermediate_gfas.push_back(input);
         }
 
         if (!gapfill_complete) {
@@ -490,11 +522,15 @@ int main(int argc, char** argv) {
             G.build_vertex_topological_index(false);
             const bool debug = DEBUG_ENABLED;
             DEBUG_ENABLED = false;
-            std::vector<GfaBubble::Bubble> bubbles = find_gapfill_bubbles(G);
+            auto finder = find_gapfill_bubbles(G);
             DEBUG_ENABLED = debug;
-            G.gapfill(bubbles);
-            G.save_samples(cfg.gapfill.prefix, command_line);
+            G.gapfill(finder->get_bubbles());
+            const GfaGapfill::PrimaryPaths primary_paths = G.save_samples(
+                cfg.gapfill.prefix, command_line
+            );
+            save_primary_vcfs(*finder, primary_paths);
         }
+        cleanup_gapfill_intermediates();
     } else if (sub == "file2map") {
         AppConfig cfg = main_file2map(argc, argv);
         mapconv::file_to_map_auto(cfg.file2map.inputFiles, cfg.file2map.outFile, cfg.file2map.paf_primary_only, cfg.file2map.min_len, cfg.file2map.min_mapq);

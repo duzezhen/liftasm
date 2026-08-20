@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <vector>
 #include <string>
 #include <utility>
@@ -6,6 +7,11 @@
 #include "minimizer_dna.hpp"
 
 namespace GfaBubble {
+
+struct ReferencePath {
+    std::string name;
+    std::vector<uint32_t> vertices;
+};
 
 enum class Type : uint8_t {
     Tip,        // bubble formed by dead-end branches

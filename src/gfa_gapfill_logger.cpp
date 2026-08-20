@@ -14,45 +14,24 @@ std::string metric(double value) {
     return out.str();
 }
 
-std::string source_interval(
-    const GfaGapfillDebugger::Source& source,
-    uint64_t begin,
-    uint64_t end
-) {
-    if (source.reverse) {
-        const uint64_t oriented_begin = begin;
-        begin = source.length - end;
-        end = source.length - oriented_begin;
-    }
-    std::ostringstream out;
-    out << source.name << '@' << begin << '-' << end
-        << (source.reverse ? '-' : '+');
-    return out.str();
-}
-
 std::string boundary_table_header() {
     std::ostringstream out;
     out << "  - " << std::left << std::setw(9) << "Boundary"
         << std::right << std::setw(8) << "Phase"
-        << std::setw(18) << "Bubble bp"
-        << std::setw(12) << "Minimizer"
-        << std::setw(12) << "Alignment";
+        << std::setw(18) << "Bubble bp";
     return out.str();
 }
 
 std::string boundary_table_row(
     const char* label,
-    const GfaGapfillDebugger::BoundarySupport& support,
-    double alignment
+    const GfaGapfillDebugger::BoundarySupport& support
 ) {
     std::ostringstream bubble;
     bubble << support.first_bubble_bp << '/' << support.second_bubble_bp;
     std::ostringstream out;
     out << "  - " << std::left << std::setw(9) << label
         << std::right << std::setw(8) << metric(support.phase)
-        << std::setw(18) << bubble.str()
-        << std::setw(12) << metric(support.minimizer)
-        << std::setw(12) << metric(alignment);
+        << std::setw(18) << bubble.str();
     return out.str();
 }
 
@@ -106,20 +85,14 @@ void GfaGapfillDebugger::overlap(
     debug_stream() << "  - Whole-node bp: shared=" << shared_bp << " overlap=" << overlap_bp << " similarity=" << std::fixed << std::setprecision(3) << similarity << '\n';
     debug_stream() << "  - Contig overlap fractions: " << std::fixed << std::setprecision(3) << a_fraction << ", " << b_fraction << '\n';
     std::ostringstream left_line;
-    left_line << std::fixed << std::setprecision(3) << "  - Left overlap boundary: minimizer=";
-    if (left.minimizer < 0.0) left_line << "NA";
-    else left_line << left.minimizer;
-    left_line << " phase=";
+    left_line << std::fixed << std::setprecision(3) << "  - Left overlap boundary: phase=";
     if (left.phase < 0.0) left_line << "NA";
     else left_line << left.phase;
     left_line << " bubble_bp=" << left.first_bubble_bp << '/' << left.second_bubble_bp;
     debug_stream() << left_line.str() << '\n';
 
     std::ostringstream right_line;
-    right_line << std::fixed << std::setprecision(3) << "  - Right overlap boundary: minimizer=";
-    if (right.minimizer < 0.0) right_line << "NA";
-    else right_line << right.minimizer;
-    right_line << " phase=";
+    right_line << std::fixed << std::setprecision(3) << "  - Right overlap boundary: phase=";
     if (right.phase < 0.0) right_line << "NA";
     else right_line << right.phase;
     right_line << " bubble_bp=" << right.first_bubble_bp << '/' << right.second_bubble_bp;
@@ -154,15 +127,8 @@ void GfaGapfillDebugger::candidate(
     uint64_t left_bridge_bp,
     uint64_t right_target_bp,
     uint64_t right_bridge_bp,
-    double left_boundary,
-    double right_boundary,
     bool homolog_span,
-    uint32_t sample_support,
-    uint32_t spanning_samples,
-    double sample_score,
-    double phase_score,
-    double alignment_score,
-    double confidence
+    double phase_score
 ) {
     if (!DEBUG_ENABLED) return;
     debug_stream() << "Candidate:\n";
@@ -170,112 +136,46 @@ void GfaGapfillDebugger::candidate(
     debug_stream() << "  - Left: " << left << '\n';
     debug_stream() << "  - Right: " << right << '\n';
     debug_stream() << "  - Bridge: " << bridge << '\n';
-    const BoundarySupport left_support{
-        left_boundary, left_phase, left_target_bp, left_bridge_bp
-    };
-    const BoundarySupport right_support{
-        right_boundary, right_phase, right_target_bp, right_bridge_bp
-    };
+    const BoundarySupport left_support{left_phase, left_target_bp, left_bridge_bp};
+    const BoundarySupport right_support{right_phase, right_target_bp, right_bridge_bp};
     debug_stream() << boundary_table_header() << '\n';
-    debug_stream() << boundary_table_row("Left", left_support, -1.0) << '\n';
-    debug_stream() << boundary_table_row("Right", right_support, -1.0) << '\n';
+    debug_stream() << boundary_table_row("Left", left_support) << '\n';
+    debug_stream() << boundary_table_row("Right", right_support) << '\n';
     debug_stream() << "  - Other hap spans gap: " << (homolog_span ? "yes" : "no") << '\n';
-    debug_stream() << "  - Sample support: " << sample_support << '/' << spanning_samples << '\n';
-    debug_stream() << "  - Confidence: sample=" << std::fixed << std::setprecision(3)
-                   << sample_score << " phase=" << phase_score
-                   << " alignment=" << alignment_score
-                   << " combined=" << confidence << '\n';
-}
-
-void GfaGapfillDebugger::refined_boundary(
-    const Source& left, uint64_t left_cut,
-    const Source& right, uint64_t right_cut,
-    const Source& bridge, uint64_t bridge_begin, uint64_t bridge_end,
-    const BoundarySupport& left_support,
-    const BoundarySupport& right_support,
-    double left_alignment,
-    double right_alignment
-) {
-    if (!DEBUG_ENABLED) return;
-    debug_stream() << "Final gap boundary:\n";
-    debug_stream() << "  - Left: " << source_interval(left, 0, left_cut) << '\n';
-    debug_stream() << "  - Right: " << source_interval(right, right_cut, right.length) << '\n';
-    debug_stream() << "  - Bridge: " << source_interval(bridge, bridge_begin, bridge_end) << '\n';
-    debug_stream() << boundary_table_header() << '\n';
-    debug_stream() << boundary_table_row("Left", left_support, left_alignment) << '\n';
-    debug_stream() << boundary_table_row("Right", right_support, right_alignment) << '\n';
-}
-
-void GfaGapfillDebugger::boundary_alignment(
-    const Source& left,
-    const Source& right,
-    const Source& bridge,
-    const Alignment& left_alignment,
-    const Alignment& right_alignment
-) {
-    if (!DEBUG_ENABLED) return;
-
-    debug_stream() << "Boundary alignment: " << left.name << " -> " << right.name
-                   << " via " << bridge.name << '\n';
-    const Alignment* alignments[2] = {&left_alignment, &right_alignment};
-    const char* labels[2] = {"Left", "Right"};
-    const Source* targets[2] = {&left, &right};
-    for (uint32_t side = 0; side < 2; ++side) {
-        const Alignment& alignment = *alignments[side];
-        const Source& target = *targets[side];
-        debug_stream() << "  - " << labels[side] << ": "
-                       << source_interval(target, alignment.target_begin, alignment.target_end)
-                       << " vs " << source_interval(bridge, alignment.bridge_begin, alignment.bridge_end)
-                       << " query=" << source_interval(
-                              target,
-                              alignment.target_begin + alignment.query_begin,
-                              alignment.target_begin + alignment.query_end
-                          )
-                       << " ref=" << source_interval(
-                              bridge,
-                              alignment.bridge_begin + alignment.reference_begin,
-                              alignment.bridge_begin + alignment.reference_end
-                          )
-                       << " hits=" << alignment.hits
-                       << " mapq=" << static_cast<uint32_t>(alignment.mapq)
-                       << " identity=" << std::fixed << std::setprecision(3) << alignment.identity
-                       << " coverage=" << alignment.coverage
-                       << " " << (alignment.accepted ? "keep" : "drop")
-                       << std::endl;
-    }
+    debug_stream() << "  - Phase score: " << std::fixed << std::setprecision(3)
+                   << phase_score << '\n';
 }
 
 void GfaGapfillDebugger::selection(
     const std::string& left,
     const std::string& right,
     const std::string& bridge,
-    const std::string& decision,
-    double confidence
+    const std::string& decision
 ) {
     if (!DEBUG_ENABLED) return;
     debug_stream() << "Selection: " << decision << '\n';
-    debug_stream() << "  - Confidence: " << std::fixed << std::setprecision(2) << confidence << '\n';
     debug_stream() << "  - Left: " << left << '\n';
     debug_stream() << "  - Right: " << right << '\n';
     debug_stream() << "  - Bridge: " << bridge << '\n';
 }
 
-void GfaGapfillDebugger::assignment(
-    const std::string& sample,
-    uint32_t component,
-    uint8_t hap,
-    uint64_t hap1_bp,
-    uint64_t hap2_bp,
-    bool conflict
+void GfaGapfillDebugger::node_walk(
+    const std::string& left,
+    const std::string& right,
+    const std::string& bridge,
+    uint64_t walk_length,
+    uint64_t left_cut,
+    uint64_t right_cut,
+    const std::vector<std::string>& vertices
 ) {
     if (!DEBUG_ENABLED) return;
-    debug_stream() << "Haplotype assignment:\n";
-    debug_stream() << "  - Sample: " << sample << '\n';
-    debug_stream() << "  - Component: " << component << '\n';
-    debug_stream() << "  - Input bp: hap1=" << hap1_bp << " hap2=" << hap2_bp << '\n';
-    debug_stream() << "  - Output haplotype: " << static_cast<uint32_t>(hap) << '\n';
-    if (conflict) {
-        debug_stream() << "  - Warning: more than two overlapping contigs\n";
+    debug_stream() << "Node walk: " << left << " -> " << right << '\n';
+    debug_stream() << "  - Bridge: " << bridge << '\n';
+    debug_stream() << "  - Walk: bp=" << walk_length << " cuts=" << left_cut << '/' << right_cut
+                   << " fill_bp=" << (right_cut - left_cut) << '\n';
+    debug_stream() << "  - Vertices (" << vertices.size() << "):\n";
+    for (const std::string& vertex : vertices) {
+        debug_stream() << "    - " << vertex << '\n';
     }
 }
 

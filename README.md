@@ -83,7 +83,7 @@ liftasm gapfill \
   -g out.iter3.collapse.gfa
 ```
 
-`gapfill` writes haplotype-specific GFAs for each input tissue or sample, primary haplotype GFAs, and reports named `out.gapfill.tsv`, `out.gapfill.relocations.tsv`, and `out.gapfill.html`.
+`gapfill` writes haplotype-specific GFAs for each input tissue or sample, primary haplotype GFAs, primary-coordinate bubble VCFs for hap1 and hap2, and reports named `out.gapfill.tsv`, `out.gapfill.relocations.tsv`, and `out.gapfill.html`.
 
 ## Main commands
 
@@ -95,7 +95,7 @@ The most useful controls are `--iterations` (how many rounds to run), `--min_mat
 
 ### `gapfill`
 
-This command is intended for the final graph from CTG-mode `collapse`. It selects only phased bridging paths with sufficient overlap, and sequence similarity.
+This command is intended for the final graph from CTG-mode `collapse`. A real spanning contig first establishes the connection and trusted shared-node boundaries; the gap sequence is then chosen by a source-aware node walk rather than copied from that contig. `--full_phase` lists samples with chromosome-scale phase information. Their haplotypes may be paired across a gap using local bubble phase, and only listed full-phase samples can support those connections. Other samples are joined within each haplotype.
 
 ### `deoverlap`
 

@@ -4,12 +4,11 @@
 #include "gfa_bubble_types.hpp"
 #include "options.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
-#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -20,49 +19,22 @@ class GfaGapfill;
 /* =================================================================================================================
  *                                             GAP BOUNDARY START
  * ================================================================================================================= */
-// Builds graph anchors and local evidence, then refines selected cuts with mm2.
+// Finds ordered shared-node anchors and caches local graph evidence.
 class GfaGapfillBoundary {
 public:
     struct PhaseSupport {
         uint64_t target_bp{0};   // Bubble bp examined on the target contig.
         uint64_t bridge_bp{0};   // Bubble bp examined on the bridge contig.
         uint64_t shared_bp{0};   // Bubble bp shared by both local paths.
-        uint64_t windows{1};     // Phase windows needed for sufficient evidence.
         double similarity{-1.0}; // shared_bp / min(target_bp, bridge_bp); -1 if unavailable.
     };
 
-    struct Alignment {
-        struct MatchBlock {
-            uint32_t query_begin{0}, reference_begin{0}, length{0}; // One retained CIGAR M block.
-        };
-        uint64_t reference_cut{0}; // Cut relative to the bridge window.
-        uint64_t query_cut{0};     // Cut relative to the target window.
-        uint32_t query_begin{0}, query_end{0};         // Outer target interval of the retained hit chain.
-        uint32_t reference_begin{0}, reference_end{0}; // Outer bridge interval of the retained hit chain.
-        uint32_t hits{0};          // Number of retained minimap2 hits.
-        uint8_t mapq{0};           // Lowest mapping quality in the retained hit chain.
-        double identity{0.0};      // Matching bases / alignment columns across the retained hits.
-        double coverage{0.0};      // Target bases covered by the retained hit chain.
-        bool accepted{false};      // Chain coverage and M cut passed.
-        bool reverse{false};       // Retained hits are reverse-complemented.
-        bool cut_mapped{false};    // A CIGAR M operation defines the cut.
-        std::vector<MatchBlock> matches; // M blocks used to map an overlap splice to both targets.
-    };
-
     struct Boundary {
-        uint32_t target_pos{0}; // Shared node nearest the gap after skipping the end_skip_bp region, used for sequence extraction and gap filling.
-        uint32_t bridge_pos{0}; // Same selected shared node in the bridge, will be used for sequence extract and gap fill.
-        uint32_t junction_target_pos{0}; // Outer edge node of the shared part in left/right contig, will be used for misassembly check.
-        uint32_t junction_bridge_pos{0}; // Matching outer edge node of the shared part in bridge, will be used for misassembly check.
+        uint32_t target_pos{0}; // Outermost ordered shared node in the target contig.
+        uint32_t bridge_pos{0}; // Same oriented node in the spanning bridge.
         uint64_t target_cut_bp{0}; // Base coordinate where left/right contig is cut.
         uint64_t bridge_cut_bp{0}; // Base coordinate where bridge is cut on this side.
-        uint64_t target_begin{0}, target_end{0}; // Sequence range taken from left/right contig for alignment.
-        uint64_t bridge_begin{0}, bridge_end{0}; // Sequence range taken from bridge for alignment.
         PhaseSupport phase; // Phase support around this boundary.
-        double minimizer{-1.0}; // Quick sequence similarity around this boundary.
-        double identity{-1.0}; // Matching rate from local alignment.
-        double coverage{-1.0}; // Fraction of the target range covered by alignment.
-        bool alignable{false}; // Both sequence ranges are available for alignment.
     };
 
     explicit GfaGapfillBoundary(const GfaGapfill& gapfill) : gapfill_(gapfill) {}
@@ -72,55 +44,19 @@ public:
     // Test whether a bridge spans a target pair without running base alignment.
     bool spans(uint32_t left, uint32_t right, uint32_t bridge) const;
     // Inspect one known overlap boundary for debug output.
-    Boundary inspect(uint32_t target, uint32_t target_pos, uint32_t bridge, uint32_t bridge_pos, bool before, bool expand_minimizer = false) const;
-    // Refine cached node cuts when the filtered mm2 hits form a sufficiently covered collinear chain.
-    bool refine(uint32_t left, uint32_t right, uint32_t bridge, Boundary& left_boundary, Boundary& right_boundary) const;
+    Boundary inspect(uint32_t target, uint32_t target_pos, uint32_t bridge, uint32_t bridge_pos, bool before) const;
 
 private:
-    // One raw mm2 hit and the CIGAR evidence used for local chaining.
-    struct AlignmentHit {
-        const uint32_t* cigar{nullptr};
-        uint32_t cigar_size{0};
-        uint32_t query_begin{0}, query_end{0};
-        uint32_t reference_begin{0}, reference_end{0};
-        uint64_t matches{0}, columns{0};
-        uint8_t mapq{0};
-        bool reverse{false};
-
-        bool operator<(const AlignmentHit& other) const {
-            const uint32_t span = std::min(
-                query_end - query_begin, reference_end - reference_begin
-            );
-            const uint32_t other_span = std::min(
-                other.query_end - other.query_begin,
-                other.reference_end - other.reference_begin
-            );
-            if (span != other_span) return span > other_span;
-            if (matches != other.matches) return matches > other.matches;
-            if (mapq != other.mapq) return mapq > other.mapq;
-            return std::tie(query_begin, reference_begin, query_end, reference_end) < std::tie(other.query_begin, other.reference_begin, other.query_end, other.reference_end);
-        }
-    };
-
     const GfaGapfill& gapfill_;
 
     // Anchor discovery and graph-order validation.
     bool find_anchors_(uint32_t left, uint32_t right, uint32_t bridge, Boundary& left_boundary, Boundary& right_boundary) const;
-    bool adjust_boundaries_(uint32_t left, uint32_t right, uint32_t bridge, const std::vector<std::pair<uint32_t, uint32_t>>& left_matches, const std::vector<std::pair<uint32_t, uint32_t>>& right_matches, Boundary& left_boundary, Boundary& right_boundary) const;
     bool is_cycle_free_(uint32_t left, uint32_t right, uint32_t bridge, const Boundary& left_boundary, const Boundary& right_boundary) const;
 
-    // Local phase and minimizer evidence inside trusted boundary sequence.
-    uint64_t phase_available_(uint32_t fragment, uint32_t pos, bool before) const;
-    std::pair<uint32_t, uint32_t> phase_region_(uint32_t fragment, uint32_t pos, bool before, uint64_t windows) const;
+    // Local phase evidence extending inward from the final graph boundary.
+    std::pair<uint32_t, uint32_t> phase_region_(uint32_t fragment, uint32_t pos, bool before) const;
     PhaseSupport phase_similarity_(uint32_t target, uint32_t target_pos, uint32_t bridge, uint32_t bridge_pos, bool before) const;
-    double minimizer_similarity_(uint32_t target, uint32_t target_pos, uint32_t bridge, uint32_t bridge_pos, bool before, uint64_t windows) const;
 
-    // Alignment-window construction and minimap2 cut refinement.
-    bool shared_anchor_(uint32_t target, uint32_t bridge, const Boundary& left_boundary, const Boundary& right_boundary, uint32_t target_pos, bool before, uint32_t& bridge_pos) const;
-    bool prepare_alignment_window_(uint32_t target, uint32_t bridge, const Boundary& left_boundary, const Boundary& right_boundary, bool before, Boundary& boundary) const;
-    bool align_(const std::string& reference, const std::string& query, bool before, Alignment& alignment) const;
-    double filter_and_chain_hits_(std::vector<AlignmentHit>& hits, uint64_t query_length, uint64_t reference_length, bool before, Alignment& alignment) const;
-    bool splice_overlap_(const Alignment& left, const Alignment& right, const Boundary& left_boundary, const Boundary& right_boundary, uint64_t& left_cut, uint64_t& right_cut, uint64_t& bridge_left_cut, uint64_t& bridge_right_cut) const;
     uint32_t find_position_(uint32_t fragment, uint32_t vertex) const;
 };
 /* =================================================================================================================
@@ -130,6 +66,8 @@ private:
 
 class GfaGapfill : public GfaGraph {
 public:
+    using PrimaryPaths = std::array<std::vector<GfaBubble::ReferencePath>, 2>;
+
     struct MisassemblyContig {
         std::string name, sample, source, side;
         uint8_t hap{0};
@@ -137,21 +75,26 @@ public:
     };
 
     struct Params {
-        uint64_t end_skip_bp{500'000};
+        // Bubble phase evidence and graph-walk limits.
+        uint32_t max_depth{100'000};
+        uint64_t dfs_guard{1'000'000};
+        double path_difference{0.05};
+        std::vector<std::string> full_phase_samples;
+        uint32_t phase_path_len{10};
+        uint64_t phase_window_bp{500'000};
+
+        // Gap anchors and spanning evidence.
         uint64_t min_contig_bp{1'000'000};
         uint64_t max_gap_bp{10'000'000};
         double max_target_overlap{0.1};
         uint64_t min_overlap_bp{1'000'000};
         double min_similarity{0.7};
-        double min_confidence{0.5};
+
+        // Misassembly detection and output deduplication.
         uint64_t misassembly_check_bp{10'000'000};
         double misassembly_similarity{0.7};
-        double path_difference{0.05};
-        uint32_t phase_path_len{10};
-        uint64_t phase_window_bp{500'000};
-        uint64_t phase_min_bp{1'000};
         double dedup_similarity{0.95};
-        uint64_t dedup_component_bp{20'000'000};
+        uint64_t dedup_component_bp{10'000'000};
         uint32_t threads{1};
         std::string html_file;
     };
@@ -159,24 +102,22 @@ public:
     explicit GfaGapfill(Params params);
     ~GfaGapfill() = default;
 
-    // Copy minimap2/index settings shared by boundary refinement and relocation checks.
+    // Copy minimap2/index settings used by relocation and deduplication checks.
     void set_alignment_options(
         const opt::ChainOpts& chain,
         const opt::AnchorOpts& anchor,
         const opt::ExtendOpts& extend,
         const opt::AlignOpts& align,
         const std::string& preset,
-        uint32_t max_occ,
         double min_match,
         double min_ali_ratio,
-        uint8_t min_mapq,
-        double boundary_coverage
+        uint8_t min_mapq
     );
 
     size_t gapfill(const std::vector<GfaBubble::Bubble>& bubbles);
     std::vector<MisassemblyContig> prepare_misassemblies(const std::vector<GfaBubble::Bubble>& bubbles);
     void set_misassemblies(const std::vector<MisassemblyContig>& records, const std::unordered_set<std::string>& relocated);
-    void save_samples(const std::string& prefix, const std::string& command_line);
+    PrimaryPaths save_samples(const std::string& prefix, const std::string& command_line);
 
 private:
     friend class GfaGapfillBoundary;
@@ -189,11 +130,9 @@ private:
 
     struct LayoutContig {
         uint32_t id{0}, component{0};  // fragment and component
-        uint8_t hap{0};
         uint64_t bp{0};  // contig length
         int64_t start{0};  // layout position
         bool reverse{false};  // need reverse
-        std::string name, sample;
         std::vector<LayoutAnchor> anchors;
     };
 
@@ -211,7 +150,6 @@ private:
         int32_t relocation{-1};  // relocation record id
         std::vector<uint32_t> vertices;  // oriented path nodes
         std::vector<std::pair<uint32_t, uint32_t>> vertex_index;  // node -> path position
-        std::vector<uint32_t> rank_drops;  // topology rank drops
         std::vector<uint32_t> bubble_positions;  // bubble node positions
         std::vector<uint64_t> path_bp;  // cumulative path bp
         std::vector<uint64_t> bubble_bp;  // cumulative bubble bp
@@ -233,17 +171,22 @@ private:
 
     /* Candidate records keep all evidence from graph anchors through final selection. */
     using Boundary = GfaGapfillBoundary::Boundary;
-    using BoundaryPhaseSupport = GfaGapfillBoundary::PhaseSupport;
-    using BoundaryAlignment = GfaGapfillBoundary::Alignment;
+
+    // Node-level sequence selected between the two Boundary anchors.
+    struct FillPath {
+        std::vector<uint32_t> vertices; // complete source-to-sink walk
+        std::string sequence;           // walk sequence
+        uint64_t length{0}, left_cut{0}, right_cut{0}; // full walk and copied interval
+    };
 
     struct Candidate {
         // Why a candidate was kept or dropped during selection.
         enum Status : uint8_t {
             PENDING,             // not selected yet
             KEPT,                // selected
-            LOW_CONFIDENCE,      // score too low
+            NO_PATH,             // no bounded source-to-sink graph walk
+            PAIR_CONFLICT,       // incomplete full-phase reciprocal pair
             USED_END,            // left/right end already used
-            PHASE_CONFLICT,      // conflicts with another haplotype path
             COORDINATE_CONFLICT, // overlaps an already selected connection
             CYCLE                // would create a loop
         };
@@ -257,18 +200,18 @@ private:
         double left_unplaced_similarity{-1.0}, right_unplaced_similarity{-1.0};
         bool left_misassembly{false}, right_misassembly{false};
         bool homolog_span{false};
-        uint32_t sample_support{0}; // samples supporting this bridge path
-        uint32_t spanning_samples{0}; // samples that provide a bridge
-        double sample_score{0.0}; // sample_support / spanning_samples
+        uint32_t phase_group{UINT32_MAX}; // reciprocal full-phase connections selected as one unit
+        uint32_t phase_locus{UINT32_MAX}; // alternative straight/cross units for one overlapping diploid gap
+        uint8_t walk_hap{0}; // output haplotype track after full-phase exchanges
+        std::shared_ptr<FillPath> fill; // final node-level gap sequence
         double phase_score{0.5}; // haplotype support
-        double alignment_score{1.0}; // boundary support
-        double confidence{0.0}; // combined score
         Status status{PENDING}; // selection result
     };
 
     // Candidate search result produced independently for one sample/thread.
     struct CandidateBatch {
-        std::vector<Candidate> candidates; // candidates from one sample
+        std::vector<Candidate> candidates; // within-haplotype gap candidates from one sample
+        std::vector<Candidate> phase_edges; // cross-haplotype assignment evidence for full-phase samples
         uint64_t tested{0}; // pairs tested
         uint64_t low_support{0}; // not enough shared bp
         uint64_t wrong_group{0}; // wrong sample/component/layout
@@ -282,10 +225,6 @@ private:
         uint32_t component{UINT32_MAX};
         uint64_t gap_beg{0}, gap_end{0};
         double phase_left{0.0}, phase_right{0.0};
-        double identity_left{-1.0}, coverage_left{-1.0};
-        double identity_right{-1.0}, coverage_right{-1.0};
-        uint32_t sample_support{0}, spanning_samples{0};
-        double confidence{0.0};
     };
 
     struct RelocationRecord {
@@ -297,13 +236,14 @@ private:
         bool used_for_gap{false};
     };
 
-    // Final sample contig assembled from target fragments and bridge intervals.
+    // Final sample contig assembled from target fragments and node walks.
     struct Chain {
-        // One sequence piece copied from a fragment or a bridge.
+        // One sequence piece copied from a target fragment or node walk.
         struct Part {
             uint32_t fragment{UINT32_MAX}; // source fragment
+            uint32_t gap{UINT32_MAX}; // gap record for a node-walk piece
             uint64_t begin{0}, end{0}; // bp range on the fragment
-            bool filled{false}; // copied from a gap bridge
+            bool filled{false}; // copied from a node walk
         };
         std::string sample; // sample name
         uint8_t hap{0}; // assigned haplotype
@@ -312,7 +252,6 @@ private:
         std::vector<uint32_t> source_fragments; // fragments used by this chain
         std::vector<Part> parts; // bp pieces used for output
         std::vector<Candidate> gaps; // gap connections in this chain
-        std::array<uint64_t, 2> hap_bp{0, 0}; // bp votes from hap1/hap2 fragments
     };
     using ChainRefs = std::array<std::vector<const Chain*>, 2>;
     struct PrimarySelection {
@@ -326,15 +265,17 @@ private:
         uint16_t k{25}, w{30};
         uint16_t best_n{5};
         int zdrop{5000};
-        uint32_t max_occ{10};
         double min_match{0.9};
         double min_ali_ratio{0.05};
         uint8_t min_mapq{30};
-        double boundary_coverage{0.8};
         std::string preset{"asm5"};
     } mm2_;
 
     std::vector<uint8_t> bubble_nodes_;
+    std::unordered_set<std::string> full_phase_samples_;  // Samples are assembled with Hi-C, Pore-C or trio-binning, and the contigs are fully phased within a single ctg.
+    std::unordered_map<std::string, uint32_t> source_ids_;  // source_ids_["HG002.hap1"] = 0; source_ids_["HG002.hap2"] = 1;
+    std::unordered_set<uint32_t> source_scope_;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> source_transitions_; // oriented P-path edge -> source IDs
     std::vector<Fragment> fragments_;
     std::map<std::string, std::array<std::vector<Chain>, 2>> sample_chains_;  // sample -> haplotype -> chains
     std::vector<GapRecord> records_;
@@ -342,7 +283,7 @@ private:
     std::vector<MisassemblyContig> misassemblies_;
     std::unordered_map<std::string, uint32_t> misassembly_index_;
     std::unordered_set<std::string> relocated_misassemblies_;
-    std::vector<Candidate> prepared_candidates_, prepared_selected_;
+    std::vector<Candidate> prepared_candidates_;
     bool candidates_prepared_{false};
 
     // ================================================= Clear state =================================================
@@ -352,27 +293,31 @@ private:
     void index_bubble_nodes_(const std::vector<GfaBubble::Bubble>& bubbles);
     void build_fragments_();
     void build_graph_order_();
+    void index_source_transitions_();
     static bool parse_path_name_(const std::string& name, std::string& sample, uint8_t& hap);
     void rebuild_fragment_index_(Fragment& fragment) const;
     static void place_contigs_(std::vector<LayoutContig>& contigs);
 
     // ================================================= Shared-node candidate evidence =================================================
     std::vector<Candidate> build_candidates_(bool include_long_gaps = false) const;
-    CandidateBatch build_sample_candidates_(const std::vector<uint32_t>& sample_fragments, const OverlapIndex& overlaps, const std::vector<std::string>& group_keys, bool include_long_gaps) const;
+    CandidateBatch build_sample_candidates_(const std::vector<uint32_t>& sample_fragments, const OverlapIndex& overlaps, bool include_long_gaps) const;
     bool ordered_pair_(const Fragment& left, const Fragment& right, bool include_long_gaps) const;
+    bool skips_backbone_(uint32_t left, uint32_t right) const;
     OverlapSupport overlap_support_(const Fragment& a, const Fragment& b, const PathOverlap& overlap) const;
     bool homolog_spans_(uint32_t left, uint32_t right, const OverlapIndex& overlaps) const;
     static double raw_phase_score_(const Candidate& candidate);
-    void update_sample_support_(std::vector<Candidate>& evidence) const;
+    void group_full_phase_candidates_(std::vector<Candidate>& candidates, const std::vector<Candidate>& phase_edges) const;
 
     // ================================================= Candidate selection =================================================
-    std::vector<Candidate> select_candidates_(std::vector<Candidate>& candidates);
+    std::vector<Candidate> select_and_walk_(std::vector<Candidate>& candidates);
+    std::vector<size_t> select_candidates_(std::vector<Candidate>& candidates);
     static bool candidate_better_(const Candidate& a, const Candidate& b);
     static bool connection_better_(const Candidate& a, const Candidate& b);
 
-    // ================================================= Refine left/bridge and bridge/right cut positions with local alignment =================================================
-    void refine_boundaries_(std::vector<Candidate>& selected, std::vector<Candidate>& candidates) const;
-    static void update_confidence_(Candidate& candidate);
+    // ================================================= Node-level gap filling =================================================
+    size_t resolve_fill_paths_(std::vector<Candidate>& candidates, std::vector<size_t>& selected) const;
+    size_t resolve_sample_fill_paths_(std::vector<Candidate>& candidates, const std::vector<size_t>& selected, size_t begin, size_t end, const std::vector<uint32_t>& sample_fragments) const;
+    bool resolve_fill_path_(Candidate& candidate, const std::vector<uint8_t>& soft_blocked, uint8_t soft_block_mask) const;
 
     // ================================================= Misassembly detection and relocation =================================================
     void check_unplaced_sequence_(std::vector<Candidate>& candidates) const;
@@ -394,9 +339,9 @@ private:
     // ================================================= Sequence, chain, and output helpers =================================================
     void print_summary_(size_t selected) const;
     void write_html_(const std::vector<Candidate>& candidates) const;
-    void save_haplotype_(const std::string& label, uint8_t hap, const std::vector<const Chain*>& chains, const std::string& prefix, const std::string& command_line, bool primary = false, const char* primary_kind = "pr");
+    void save_haplotype_(const std::string& label, uint8_t hap, const std::vector<const Chain*>& chains, const std::string& prefix, const std::string& command_line, bool primary = false, const char* primary_kind = "pr", std::vector<GfaBubble::ReferencePath>* reference_paths = nullptr);
     
-    // ================================================= helpers =================================================
+    // ================================================= Sequence helpers =================================================
     std::string fragment_sequence_(const Fragment& fragment, uint32_t begin, uint32_t end) const;
     std::string fragment_subsequence_(const Fragment& fragment, uint64_t begin, uint64_t end) const;
     uint64_t chain_length_(const Chain& chain) const;
