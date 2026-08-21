@@ -133,6 +133,7 @@ private:
         uint64_t bp{0};  // contig length
         int64_t start{0};  // layout position
         bool reverse{false};  // need reverse
+        bool placed{false};  // fixed on a backbone or placed by graph propagation
         std::vector<LayoutAnchor> anchors;
     };
 
@@ -277,6 +278,7 @@ private:
     std::unordered_set<uint32_t> source_scope_;
     std::unordered_map<uint64_t, std::vector<uint32_t>> source_transitions_; // oriented P-path edge -> source IDs
     std::vector<Fragment> fragments_;
+    std::unordered_map<uint32_t, uint64_t> backbone_bp_;  // component -> backbone path length
     std::map<std::string, std::array<std::vector<Chain>, 2>> sample_chains_;  // sample -> haplotype -> chains
     std::vector<GapRecord> records_;
     std::vector<RelocationRecord> relocations_;
@@ -296,6 +298,7 @@ private:
     void index_source_transitions_();
     static bool parse_path_name_(const std::string& name, std::string& sample, uint8_t& hap);
     void rebuild_fragment_index_(Fragment& fragment) const;
+    size_t place_contigs_on_backbones_(std::vector<LayoutContig>& contigs);
     static void place_contigs_(std::vector<LayoutContig>& contigs);
 
     // ================================================= Shared-node candidate evidence =================================================

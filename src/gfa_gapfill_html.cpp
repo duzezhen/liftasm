@@ -47,8 +47,10 @@ void GfaGapfill::write_html_(const std::vector<Candidate>& candidates) const {
     for (uint32_t i = 0; i < fragments_.size(); ++i) {
         const Fragment& fragment = fragments_[i];
         if (!fragment.eligible) continue;
+        const auto backbone = backbone_bp_.find(fragment.component);
         contigs.push_back({
             i, fragment.component, fragment.hap, fragment.length,
+            backbone == backbone_bp_.end() ? 0 : backbone->second,
             fragment.layout_start, fragment.reverse,
             paths_[fragment.path_id].name, fragment.sample,
             nodes_[Vertex::get_segment_id(fragment.vertices.front())].name +
@@ -144,7 +146,8 @@ const N=)HTML");
         std::ostringstream line;
         line << "{i:" << contig.id << ",c:" << contig.component
              << ",h:" << static_cast<uint32_t>(contig.hap)
-             << ",b:" << contig.bp << ",x:" << contig.start
+             << ",b:" << contig.bp << ",bb:" << contig.backbone_bp
+             << ",x:" << contig.start
              << ",rv:" << (contig.reverse ? 1 : 0)
              << ",n:" << json_string(contig.name)
              << ",s:" << json_string(contig.sample)
@@ -202,7 +205,7 @@ function render(){
   const nodes=focused?allNodes.filter(function(n){return nodeIds.has(n.i)}):allNodes;
   const edges=focused?[focus]:allEdges;
   const rows=[...new Set(nodes.map(function(n){return n.s+'\t'+n.h}))].sort(function(a,b){const x=a.split('\t'),y=b.split('\t');return x[0].localeCompare(y[0])||Number(x[1])-Number(y[1])});
-  let origin=0,end=Math.max(1,...nodes.map(function(n){return n.x+n.b}));
+  let origin=0,end=Math.max(1,...nodes.map(function(n){return Math.max(n.x+n.b,n.bb)}));
   if(focused){const positions=[anchorPosition(byId.get(focus.l),focus.lp),anchorPosition(byId.get(focus.b),focus.bl),anchorPosition(byId.get(focus.b),focus.br),anchorPosition(byId.get(focus.r),focus.rp)],range=Math.max(1,Math.max(...positions)-Math.min(...positions)),padding=Math.max(500000,range*.16);origin=Math.max(0,Math.min(...positions)-padding);end=Math.max(...positions)+padding}
   const left=170,rowHeight=focused?86:58,top=58,span=Math.max(1,end-origin),factor=Number(zoom.value);
   const plotWidth=Math.max(1000,$('view').clientWidth-left-40)*factor,scale=plotWidth/span,width=left+plotWidth+35,height=Math.max(300,top+rows.length*rowHeight+45),pos=new Map();

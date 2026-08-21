@@ -97,6 +97,16 @@ std::string output_contig_name(const std::string& name, const std::string& sampl
         compact.substr(prefix.size()) : compact;
 }
 
+bool is_backbone_name(const std::string& name) {
+    constexpr char prefix[] = "component";
+    constexpr size_t prefix_length = sizeof(prefix) - 1;
+    return name.size() > prefix_length &&
+        name.compare(0, prefix_length, prefix) == 0 &&
+        std::all_of(name.begin() + prefix_length, name.end(), [](unsigned char c) {
+            return std::isdigit(c);
+        });
+}
+
 // Shared nodes of a contig pair
 struct PlotRelation {
     uint32_t a{0}, b{0};   // contig indexes
@@ -104,7 +114,7 @@ struct PlotRelation {
     std::vector<std::pair<uint64_t, uint64_t>> anchors;  // shared graph-node offsets on contig a and b
 };
 
-int64_t layout_median(std::vector<int64_t> values) {
+int64_t layout_median(std::vector<int64_t>& values) {
     if (values.empty()) return 0;
     const size_t mid = values.size() / 2;
     std::nth_element(values.begin(), values.begin() + mid, values.end());
@@ -156,6 +166,7 @@ void GfaGapfill::clear_state_() {
     prepared_candidates_.clear();
     candidates_prepared_ = false;
     fragments_.clear();
+    backbone_bp_.clear();
     source_ids_.clear();
     source_scope_.clear();
     source_transitions_.clear();
@@ -472,7 +483,8 @@ void GfaGapfill::build_graph_order_() {
     }
 
     // ------------------------------------------------ Place contigs on graph coordinates ------------------------------------------------
-    place_contigs_(layout);
+    const size_t backbone_placed = place_contigs_on_backbones_(layout);
+    if (backbone_placed < layout.size()) place_contigs_(layout);
 
     // ------------------------------------------------ Apply layout and orientation ------------------------------------------------
     for (const LayoutContig& contig : layout) {
@@ -574,6 +586,103 @@ void GfaGapfill::rebuild_fragment_index_(Fragment& fragment) const {
     fragment.length = fragment.path_bp.back();
 }
 
+size_t GfaGapfill::place_contigs_on_backbones_(std::vector<LayoutContig>& contigs) {
+    struct BackbonePath {
+        size_t path_id{0};
+        uint64_t bp{0};
+    };
+    struct BackboneNode {
+        uint64_t offset{0};
+        uint32_t component{UINT32_MAX};
+        bool unique{false};
+    };
+
+    // ------------------------------------------------ Select one backbone per graph component ------------------------------------------------
+    std::unordered_map<uint32_t, BackbonePath> backbones;
+    for (size_t path_id = 0; path_id < paths_.size(); ++path_id) {
+        const GfaPath& path = paths_[path_id];
+        if (!is_backbone_name(path.name) || path.segments.empty()) continue;
+
+        uint32_t component = UINT32_MAX;
+        uint64_t bp = 0;
+        bool valid = true;
+        for (const PathSegment& segment : path.segments) {
+            const uint32_t sid = static_cast<uint32_t>(segment.node_id);
+            if (sid >= nodes_.size() || nodes_[sid].deleted) {
+                valid = false;
+                break;
+            }
+            const uint32_t node_component = connectivity_index_[sid];
+            if (component == UINT32_MAX) component = node_component;
+            else if (component != node_component) {
+                valid = false;
+                break;
+            }
+            bp += nodes_[sid].length;
+        }
+        if (!valid) continue;
+
+        auto found = backbones.find(component);
+        if (found == backbones.end() || bp > found->second.bp) {
+            backbones[component] = {path_id, bp};
+        }
+    }
+    if (backbones.empty()) return 0;
+
+    // ------------------------------------------------ Index unambiguous backbone node coordinates ------------------------------------------------
+    std::vector<BackboneNode> backbone_nodes(nodes_.size());
+    for (const auto& item : backbones) {
+        const uint32_t component = item.first;
+        const BackbonePath& backbone = item.second;
+        const GfaPath& path = paths_[backbone.path_id];
+        uint64_t offset = 0;
+        for (const PathSegment& segment : path.segments) {
+            const uint32_t sid = static_cast<uint32_t>(segment.node_id);
+            BackboneNode& node = backbone_nodes[sid];
+            if (node.component == UINT32_MAX) {
+                node.offset = offset + nodes_[sid].length / 2;
+                node.component = component;
+                node.unique = true;
+            } else {
+                node.unique = false;
+            }
+            offset += nodes_[sid].length;
+        }
+        backbone_bp_[component] = backbone.bp;
+    }
+
+    // ------------------------------------------------ Project each contig directly onto its backbone ------------------------------------------------
+    size_t placed = 0;
+    for (LayoutContig& contig : contigs) {
+        if (!backbones.count(contig.component)) continue;
+
+        std::vector<int64_t> forward, reverse;
+        forward.reserve(contig.anchors.size());
+        reverse.reserve(contig.anchors.size());
+        for (const LayoutAnchor& anchor : contig.anchors) {
+            const BackboneNode& node = backbone_nodes[anchor.segment];
+            if (!node.unique || node.component != contig.component) continue;
+            const int64_t backbone_offset = static_cast<int64_t>(node.offset);
+            forward.push_back(backbone_offset - static_cast<int64_t>(anchor.offset));
+            reverse.push_back(backbone_offset - static_cast<int64_t>(contig.bp - anchor.offset));
+        }
+        if (forward.empty()) continue;
+
+        const int64_t forward_start = layout_median(forward);
+        const int64_t reverse_start = layout_median(reverse);
+        contig.reverse = layout_deviation(reverse, reverse_start) <
+            layout_deviation(forward, forward_start);
+        contig.start = contig.reverse ? reverse_start : forward_start;
+        contig.placed = true;
+        ++placed;
+    }
+
+    log_stream() << "  - Backbone paths indexed: " << backbones.size() << '\n';
+    log_stream() << "  - Contigs placed on backbone: " << placed << '\n';
+    log_stream() << "  - Contigs requiring graph fallback: " << contigs.size() - placed << '\n';
+    return placed;
+}
+
 void GfaGapfill::place_contigs_(std::vector<LayoutContig>& contigs) {
     // ------------------------------------------------ Index shared nodes ------------------------------------------------
     struct Occurrence {
@@ -582,12 +691,23 @@ void GfaGapfill::place_contigs_(std::vector<LayoutContig>& contigs) {
         uint32_t length;  // node length
     };
 
+    // Only nodes touched by an unplaced contig can contribute to fallback.
+    std::unordered_set<uint64_t> fallback_nodes;
+    for (const LayoutContig& contig : contigs) {
+        if (contig.placed) continue;
+        for (const LayoutAnchor& anchor : contig.anchors) {
+            fallback_nodes.insert((static_cast<uint64_t>(contig.component) << 32) | anchor.segment);
+        }
+    }
+
     //  Input: contig -> node
     // Output:   node -> contig
     std::unordered_map<uint64_t, std::vector<Occurrence>> occurrences;
+    occurrences.reserve(fallback_nodes.size());
     for (uint32_t i = 0; i < contigs.size(); ++i) {
         for (const auto& anchor : contigs[i].anchors) {
             const uint64_t key = (static_cast<uint64_t>(contigs[i].component) << 32) | anchor.segment;
+            if (!fallback_nodes.count(key)) continue;
             occurrences[key].push_back({i, anchor.offset, anchor.length});
         }
     }
@@ -600,6 +720,7 @@ void GfaGapfill::place_contigs_(std::vector<LayoutContig>& contigs) {
             for (size_t j = i + 1; j < found.size(); ++j) {
                 if (found[i].contig == found[j].contig) continue;
                 uint32_t a = found[i].contig, b = found[j].contig;
+                if (contigs[a].placed && contigs[b].placed) continue;
                 uint64_t ao = found[i].offset, bo = found[j].offset;
                 if (a > b) { std::swap(a, b); std::swap(ao, bo); }
                 const uint64_t key = (static_cast<uint64_t>(a) << 32) | b;  // key = (contig_a << 32) | contig_b
@@ -626,29 +747,33 @@ void GfaGapfill::place_contigs_(std::vector<LayoutContig>& contigs) {
     std::map<uint32_t, std::vector<uint32_t>> components;
     for (uint32_t i = 0; i < contigs.size(); ++i) components[contigs[i].component].push_back(i);
     std::vector<uint8_t> placed(contigs.size(), 0);
+    for (uint32_t i = 0; i < contigs.size(); ++i) placed[i] = contigs[i].placed;
+
+    using QueueItem = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>;  // (shared_bp, relation_id, from, to)
 
     for (const auto& component : components) {
         int64_t cursor = 0;
-        size_t remaining = component.second.size();
-        while (remaining > 0) {
-            // ------------------------------------------------ Start a new layout chain ------------------------------------------------
-            uint32_t root = UINT32_MAX;
-            for (uint32_t index : component.second) {
-                if (!placed[index] && (root == UINT32_MAX || contigs[index].bp > contigs[root].bp)) root = index;
+        size_t remaining = 0;
+        bool backbone_seeded = false;
+        for (uint32_t index : component.second) {
+            if (placed[index]) {
+                backbone_seeded = true;
+                cursor = std::max(cursor, contigs[index].start + static_cast<int64_t>(contigs[index].bp));
+            } else {
+                ++remaining;
             }
-            contigs[root].start = cursor;
-            contigs[root].reverse = false;
-            placed[root] = 1;
-            --remaining;
+        }
 
-            using QueueItem = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>;  // (shared_bp, relation_id, from, to)
-            // ------------------------------------------------ Expand by strongest shared nodes ------------------------------------------------
-            std::priority_queue<QueueItem> queue;
-            for (uint32_t relation : adjacency[root]) {
+        // ------------------------------------------------ Expand from all fixed backbone placements ------------------------------------------------
+        std::priority_queue<QueueItem> queue;
+        auto queue_from = [&](uint32_t from) {
+            for (uint32_t relation : adjacency[from]) {
                 const PlotRelation& edge = relations[relation];
-                queue.emplace(edge.shared_bp, relation, root, edge.a == root ? edge.b : edge.a);
+                const uint32_t to = edge.a == from ? edge.b : edge.a;
+                if (!placed[to]) queue.emplace(edge.shared_bp, relation, from, to);
             }
-
+        };
+        auto expand = [&]() {
             while (!queue.empty()) {
                 const auto [weight, relation_id, from, to] = queue.top();
                 queue.pop();
@@ -668,32 +793,60 @@ void GfaGapfill::place_contigs_(std::vector<LayoutContig>& contigs) {
                     forward.push_back(global - static_cast<int64_t>(to_offset));
                     reverse.push_back(global - static_cast<int64_t>(contigs[to].bp - to_offset));
                 }
-                // ------------------------------------------------ Choose orientation and position ------------------------------------------------
                 const int64_t forward_start = layout_median(forward);
                 const int64_t reverse_start = layout_median(reverse);
-                contigs[to].reverse = layout_deviation(reverse, reverse_start) < layout_deviation(forward, forward_start);
+                contigs[to].reverse = layout_deviation(reverse, reverse_start) <
+                    layout_deviation(forward, forward_start);
                 contigs[to].start = contigs[to].reverse ? reverse_start : forward_start;
+                contigs[to].placed = true;
                 placed[to] = 1;
                 --remaining;
-                for (uint32_t next_relation : adjacency[to]) {
-                    const PlotRelation& edge = relations[next_relation];
-                    const uint32_t next = edge.a == to ? edge.b : edge.a;
-                    if (!placed[next]) queue.emplace(edge.shared_bp, next_relation, to, next);
-                }
+                queue_from(to);
             }
+        };
 
-            int64_t end = cursor;
+        if (backbone_seeded) {
             for (uint32_t index : component.second) {
-                if (placed[index]) end = std::max(end, contigs[index].start + static_cast<int64_t>(contigs[index].bp));
+                if (placed[index]) queue_from(index);
             }
-            // Leave space for unconnected contigs.
-            cursor = end + std::max<int64_t>(1'000'000, end / 100);
+            expand();
+        } else {
+            cursor = 0;
         }
 
-        // ------------------------------------------------ Normalize component start ------------------------------------------------
-        int64_t begin = contigs[component.second.front()].start;
-        for (uint32_t index : component.second) begin = std::min(begin, contigs[index].start);
-        for (uint32_t index : component.second) contigs[index].start -= begin;
+        bool have_layout = backbone_seeded;
+        while (remaining > 0) {
+            if (have_layout) {
+                int64_t end = cursor;
+                for (uint32_t index : component.second) {
+                    if (placed[index]) end = std::max(
+                        end, contigs[index].start + static_cast<int64_t>(contigs[index].bp)
+                    );
+                }
+                cursor = end + std::max<int64_t>(1'000'000, end / 100);
+            }
+
+            // ------------------------------------------------ Start a new layout chain ------------------------------------------------
+            uint32_t root = UINT32_MAX;
+            for (uint32_t index : component.second) {
+                if (!placed[index] && (root == UINT32_MAX || contigs[index].bp > contigs[root].bp)) root = index;
+            }
+            contigs[root].start = cursor;
+            contigs[root].reverse = false;
+            contigs[root].placed = true;
+            placed[root] = 1;
+            --remaining;
+            queue_from(root);
+            expand();
+            have_layout = true;
+        }
+
+        // Preserve absolute backbone coordinates; normalize reference-free layouts.
+        if (!backbone_seeded) {
+            int64_t begin = contigs[component.second.front()].start;
+            for (uint32_t index : component.second) begin = std::min(begin, contigs[index].start);
+            for (uint32_t index : component.second) contigs[index].start -= begin;
+        }
     }
 }
 

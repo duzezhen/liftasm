@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.3-r24 (2026-08-20)
+
+### Fixed
+
+- Fixed incorrect contig layout during gap filling.
+
 ## v0.1.3-r23 (2026-08-19)
 
 ### Added

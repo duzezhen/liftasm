@@ -9,7 +9,7 @@ namespace gapfill_html {
 struct Contig {
     uint32_t id{0}, component{0};
     uint8_t hap{0};
-    uint64_t bp{0};
+    uint64_t bp{0}, backbone_bp{0};
     int64_t start{0};
     bool reverse{false};
     std::string name, sample, first_vertex, last_vertex;
