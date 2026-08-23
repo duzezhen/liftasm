@@ -2,10 +2,10 @@
 
 `liftasm` is a toolkit for de-overlapping and collapsing [hifiasm](https://github.com/chhylp123/hifiasm) assembly graphs. It works directly with `hifiasm` GFA output and can merge multiple GFA graphs, especially assemblies from different tissues of the same individual.
 
-The central `collapse` command has two modes:
+The central `collapse` command reads a header-driven sample/GFA table and selects one of two modes from its columns:
 
-- **p_utg mode:** accepts one or more `p_utg` GFAs, de-overlaps them when necessary, and collapses homologous graph sequence.
-- **p_ctg mode:** accepts paired haplotype-contig (`p_ctg`) GFAs from different tissues or samples and merges them into a combined graph. The final graph can be passed to `gapfill` to fill supported gaps and identify variants between haplotypes or tissues.
+- **p_utg mode:** every row contains a sample name and one `p_utg` GFA. The graphs are de-overlapped when necessary and homologous graph sequence is collapsed.
+- **p_ctg mode:** every row contains a sample name and its paired haplotype-contig (`p_ctg`) GFAs. The final combined graph can be passed to `gapfill` to fill supported gaps and identify variants between haplotypes or tissues.
 
 liftasm also writes coordinate maps that can be used for `liftover` and `mapq_boost`.
 
@@ -41,38 +41,72 @@ unset _liftasm_completion_file
 
 Reload the configuration with `source ~/.bashrc`. You can then type `liftasm` followed by <kbd>Tab</kbd> to complete subcommands.
 
+## Collapse input table
+
+`collapse -i FILE` requires a header. The first non-empty, non-comment line is the header, and its lowercase column names may appear in any order. Input may be separated by spaces or tabs; tabs are recommended. Blank lines and lines beginning with `#` are ignored.
+
+| Column | Meaning |
+| --- | --- |
+| `sample` | Unique sample name; required in every mode. |
+| `gfa` | UTG-mode GFA. |
+| `hap1_gfa` | Haplotype-1 GFA in CTG mode. |
+| `hap2_gfa` | Haplotype-2 GFA in CTG mode. |
+| `vcf` | Optional per-sample VCF in CTG mode. Use `.` when a sample has no VCF. |
+
+The accepted header combinations are `sample + gfa` for UTG mode and `sample + hap1_gfa + hap2_gfa [+ vcf]` for CTG mode. `gfa` cannot be mixed with the CTG columns, and `vcf` is not supported in UTG mode. Unknown or duplicate columns, missing required columns, repeated sample names, and rows whose field count differs from the header are reported with the file and line number.
+
 ## Quick start: collapse a p_utg graph
 
 Use **UTG mode** when the input is one or more `p_utg`-style GFA graphs. You can pass the original overlap graph directly: `collapse` de-overlaps it internally when necessary. Running `deoverlap` first is optional, not required.
 
+Create an input table containing the `sample` and `gfa` columns:
+
+```text
+sample    gfa
+blood     blood.p_utg.gfa
+heart     heart.p_utg.gfa
+```
+
+The same input table can be generated from the shell:
+
+```bash
+{ printf "sample\tgfa\n"; for s in blood heart; do printf "%s\t%s.p_utg.gfa\n" "$s" "$s"; done; } > samples.utg.tsv
+```
+
 ```bash
 liftasm collapse \
   -t 16 \
-  -g blood.p_utg.gfa \
-  -n blood
+  -i samples.utg.tsv
 ```
-
-To merge graphs from different tissues of one individual, list GFAs and names in the same order:
-
-```bash
-liftasm collapse \
-  -t 16 \
-  -g blood.p_utg.gfa heart.p_utg.gfa \
-  -n blood heart
-```
-
-The two names after `-n` correspond to the two GFAs in the same order.
 
 ## Quick start: collapse haplotype contigs, then fill gaps
 
-Use **CTG mode** when each tissue or sample has paired haplotype-contig GFAs. `--c1` contains haplotype 1 GFAs, `--c2` contains haplotype 2 GFAs, and the entries must be in the same order. The `-n` list labels those pairs.
+Use **CTG mode** when each tissue or sample has paired haplotype-contig GFAs. Haplotype 1 and haplotype 2 are paired on the same row:
+
+```text
+sample    hap1_gfa                     hap2_gfa
+blood     blood.hap1.p_ctg.gfa         blood.hap2.p_ctg.gfa
+heart     heart.hap1.p_ctg.gfa         heart.hap2.p_ctg.gfa
+```
+
+The same input table can be generated from the shell:
+
+```bash
+{ printf "sample\thap1_gfa\thap2_gfa\n"; for s in blood heart; do printf "%s\t%s.hap1.p_ctg.gfa\t%s.hap2.p_ctg.gfa\n" "$s" "$s" "$s"; done; } > samples.ctg.tsv
+```
 
 ```bash
 liftasm collapse \
   -t 16 \
-  --c1 blood.hap1.p_ctg.gfa heart.hap1.p_ctg.gfa \
-  --c2 blood.hap2.p_ctg.gfa heart.hap2.p_ctg.gfa \
-  -n blood heart
+  -i samples.ctg.tsv
+```
+
+To add variants, include a `vcf` column. Every row must still contain the same number of fields; use `.` for samples without a VCF:
+
+```text
+sample    hap1_gfa                     hap2_gfa                     vcf
+blood     blood.hap1.p_ctg.gfa         blood.hap2.p_ctg.gfa         blood.vcf.gz
+heart     heart.hap1.p_ctg.gfa         heart.hap2.p_ctg.gfa         .
 ```
 
 Run gap filling on the final CTG-mode graph:
@@ -99,7 +133,7 @@ This command is intended for the final graph from CTG-mode `collapse`. A real sp
 
 ### `deoverlap`
 
-Use `deoverlap` when you need a non-overlap GFA as a standalone output, for another tool, or for inspection. It is not a prerequisite for `collapse -g`.
+Use `deoverlap` when you need a non-overlap GFA as a standalone output, for another tool, or for inspection. It is not a prerequisite for UTG-mode `collapse`.
 
 ```bash
 liftasm deoverlap \

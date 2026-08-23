@@ -2,19 +2,20 @@
 
 This guide explains how to choose a command, what each command produces, and which parameters are worth changing in practice. It deliberately focuses on decisions a user needs to make; use `liftasm <command> --help` or `--advanced` for the complete interface and exact defaults.
 
-## Names and threads
+## Inputs and threads
 
 Graph commands take more than filenames because liftasm needs to know which sample each graph belongs to.
 
-- `-n, --name` is a list of input labels, in the same order as the GFA files. For different tissues from one individual, `-n blood heart` labels the blood and heart graphs. In CTG mode, names are required. In UTG mode, explicit names are recommended and are required if the GFA lacks liftasm sample tags.
+- `collapse -i FILE` reads one sample per row from a header-driven, whitespace-delimited table. Column order is arbitrary. The header selects UTG or CTG mode, and sample names must be unique.
+- Other graph commands that accept multiple GFAs use `-n, --name` for input labels in the same order as their GFA files.
 - `-t, --threads` controls compute threads. Use it with `collapse`, `deoverlap`, `gapfill`, `liftover`, and `mapq_boost`. `collapse` may need about 5 GB RAM for each thread, so choose a lower value on memory-limited machines.
 
 ## Which workflow fits the input?
 
 | Input you have | Command to start with | What it does |
 | --- | --- | --- |
-| One or more hifiasm `p_utg` GFAs | `collapse -g` | UTG mode: directly collapses homologous graph sequence. Overlap is handled internally when needed. |
-| Paired hap1/hap2 `p_ctg` GFAs from different tissues or samples | `collapse --c1 --c2` | CTG mode: compares paired contigs and builds a combined graph. |
+| One or more hifiasm `p_utg` GFAs | `collapse -i samples.utg.tsv` | UTG mode: directly collapses homologous graph sequence. Overlap is handled internally when needed. |
+| Paired hap1/hap2 `p_ctg` GFAs from different tissues or samples | `collapse -i samples.ctg.tsv` | CTG mode: compares paired contigs and builds a combined graph. |
 | Final graph from CTG mode | `gapfill -g` | Uses spanning-contig evidence and source-aware graph walks to fill conservative contig gaps. |
 | BED coordinates plus graph/assembly relationships | `liftover -m -b` | Transfers BED intervals through one or more coordinate maps. |
 | SAM/BAM with low MAPQ in known homologous regions | `mapq_boost -m` | Removes homology-only ambiguity from MAPQ decisions. |
@@ -24,18 +25,43 @@ Graph commands take more than filenames because liftasm needs to know which samp
 
 `collapse` finds equivalent sequence in bubbles and longer homologous paths, then replaces supported duplicate sequence with shared graph nodes. It creates a `.map` file at every collapse iteration; these maps are the link between the simplified graph and the original coordinates.
 
+### Input table format
+
+The first non-empty, non-comment line is a required header. Column names are lowercase and may appear in any order. Spaces and tabs are accepted as separators, although tabs are recommended. Blank lines and lines beginning with `#` are ignored. Because whitespace separates fields, sample names and paths cannot themselves contain spaces or tabs.
+
+| Column | Required in | Description |
+| --- | --- | --- |
+| `sample` | UTG and CTG | Unique sample name. |
+| `gfa` | UTG | Unitig GFA; cannot be combined with CTG columns. |
+| `hap1_gfa` | CTG | Haplotype-1 contig GFA. |
+| `hap2_gfa` | CTG | Haplotype-2 contig GFA; must occur together with `hap1_gfa`. |
+| `vcf` | Optional CTG | Per-sample VCF. Use `.` when the sample has no VCF. |
+
+Column order is arbitrary, but only these schemas are accepted:
+
+- UTG: `sample`, `gfa`
+- CTG: `sample`, `hap1_gfa`, `hap2_gfa`
+- CTG with variants: `sample`, `hap1_gfa`, `hap2_gfa`, `vcf`
+
+Unknown or repeated header columns, incompatible column combinations, duplicate sample names, and data rows whose field count differs from the header terminate with exit code 1. The error identifies the configuration file, line number, and reason; row errors also show the sample when available.
+
 ### UTG mode: input `p_utg` GFA directly
 
-Use `-g` for one or more unitig graphs. A separate `deoverlap` command is not needed: `collapse` accepts an overlap or a non-overlap GFA and de-overlaps internally when required.
+Use a table containing `sample` and `gfa` for one or more unitig graphs. A separate `deoverlap` command is not needed: `collapse` accepts an overlap or a non-overlap GFA and de-overlaps internally when required.
+
+```text
+sample    gfa
+blood     blood.p_utg.gfa
+heart     heart.p_utg.gfa
+```
 
 ```bash
 liftasm collapse \
   -t 16 \
-  -g blood.p_utg.gfa heart.p_utg.gfa \
-  -n blood heart
+  -i samples.utg.tsv
 ```
 
-The first GFA is labelled `blood` and the second `heart`. With the default output prefix and three rounds, the final files include:
+With the default output prefix and three rounds, the final files include:
 
 - `out.iter3.collapse.gfa`: graph with sequence.
 - `out.iter3.collapse.noseq.gfa`: graph topology without sequence.
@@ -43,28 +69,31 @@ The first GFA is labelled `blood` and the second `heart`. With the default outpu
 
 ### CTG mode: paired haplotype-contig inputs
 
-Use CTG mode for different tissues from one individual, or for multiple samples, with one haplotype-1 and one haplotype-2 `p_ctg` GFA per input. Each `--c1` entry must pair with the `--c2` entry in the same position; `-n` follows that same order.
+Use CTG mode for different tissues from one individual, or for multiple samples, with one haplotype-1 and one haplotype-2 `p_ctg` GFA on each input row.
+
+```text
+sample    hap1_gfa                     hap2_gfa
+blood     blood.hap1.p_ctg.gfa         blood.hap2.p_ctg.gfa
+heart     heart.hap1.p_ctg.gfa         heart.hap2.p_ctg.gfa
+```
 
 ```bash
 liftasm collapse \
   -t 16 \
-  --c1 blood.hap1.p_ctg.gfa heart.hap1.p_ctg.gfa \
-  --c2 blood.hap2.p_ctg.gfa heart.hap2.p_ctg.gfa \
-  -n blood heart \
-  --paf
+  -i samples.ctg.tsv
 ```
 
-This command first writes collapsed GFAs for each tissue, then writes the combined graph (`out.iter3.collapse.gfa` by default). `--paf` additionally saves the raw and filtered component alignments, which is useful when checking how contigs were connected. If VCFs should be carried into the output, add `-v blood.vcf.gz heart.vcf.gz` in the same order as the inputs.
+This command first writes collapsed GFAs for each tissue, then writes the combined graph (`out.iter3.collapse.gfa` by default). CTG mode also saves raw and filtered component alignments, which is useful when checking how contigs were connected. To carry variants into the output, add the `vcf` header column and place each VCF on the same row as its sample; use `.` when a sample has no VCF.
 
 ### Parameters users commonly change
 
 | Option | What it controls | When to change it |
 | --- | --- | --- |
 | `--iterations INT` `[3]` | Number of collapse rounds. | Increase only when later rounds still make useful merges. For comma-separated parameter lists, the last value is reused if the list is shorter than the number of rounds. |
-| `--min_match FLOAT[,..]` `[0.9,0.95,0.95]` | Required matching-base fraction in a retained alignment. | Raise for stricter merges; lower only for more divergent assemblies. |
+| `--min_match FLOAT[,..]` `[0.9]` | Required matching-base fraction in a retained alignment. | Raise for stricter merges; lower only for more divergent assemblies. |
 | `--min_ali_ratio FLOAT[,..]` `[0.05,0.01,0.001]` | Minimum aligned fraction of a sequence. | Raise to ignore short local similarities. |
 | `--min_mapq INT` `[30]` | Minimum mapping quality for graph alignments. | Raise when repetitive regions introduce weak matches. |
-| `--min_jaccard FLOAT[,..]` `[0.9]` | How similar two path memberships must be before grouping. | Raise to make path grouping more conservative. |
+| `--min_jaccard FLOAT[,..]` `[0.8]` | How similar two path memberships must be before grouping. | Raise to make path grouping more conservative. |
 | `--min_eq INT[,..]` `[1000,3,3]` | Minimum exact-match length used to introduce graph cut points. | The default uses `1000` bp in round 1 to avoid over-cutting, then `3` bp in later rounds to refine existing homologous regions. Raise it for fewer, more conservative cuts; lower it only when finer collapse is needed and the graph is well supported. |
 | `--depth INT` `[100kb]` | Maximum graph distance explored inside a bubble. | Increase for long bubbles; it can increase run time. |
 | `--paths INT` `[0]` | Maximum alternative paths kept per bubble. | Raise only if a real bubble has more alternatives than the default retains. |
@@ -85,7 +114,7 @@ liftasm gapfill \
 
 With the default prefix, the report is `out.gapfill.tsv`. The command also writes a relocation report and an HTML report, plus per-tissue, primary, and low-quality haplotype GFAs. Bubbles that map unambiguously to the final primary node paths are written separately as `out.primary.hap1.gapfill.bubbles.vcf` and `out.primary.hap2.gapfill.bubbles.vcf`; each file uses its own primary haplotype as the reference coordinate system and standard 1-based VCF coordinates.
 
-`--full_phase` accepts one or more base sample names (the names supplied to `collapse -n`). Full-phase targets may exchange haplotype contigs according to local bubble-phase evidence, and only listed full-phase samples may supply their bridges. Samples not listed are joined within the original haplotype.
+`--full_phase` accepts one or more base sample names (the first column of the `collapse` input table). Full-phase targets may exchange haplotype contigs according to local bubble-phase evidence, and only listed full-phase samples may supply their bridges. Samples not listed are joined within the original haplotype.
 
 | Option | What it controls | When to change it |
 | --- | --- | --- |

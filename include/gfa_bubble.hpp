@@ -16,6 +16,7 @@
 
 #include "logger.hpp"
 #include "gfa_parser.hpp"
+#include "gfa_walker.hpp"
 #include "gfa_bubble_types.hpp"
 
 #include "bloom_filter.hpp"
@@ -80,6 +81,13 @@ private:
     bool is_strict_sink_(Vertex vtx, Vertex w) const;  // Check whether w is a strict sink
 
     bool find_common_nearest_sink_(Vertex source, const std::vector<Vertex>& seeds, uint64_t bfs_limit, uint32_t& best_sink, std::unordered_set<uint32_t>& local_nodes);
+    std::vector<std::vector<uint32_t>> enumerate_bubble_paths_(
+        uint32_t source,
+        uint32_t sink,
+        const std::unordered_set<uint32_t>& region_set,
+        uint32_t max_depth,
+        bool& hit_limits
+    ) const;
 
     Bubble detect_closed_bubble_from_source_(Vertex src, uint64_t bfs_limit);
     GfaBubble::BubbleBranchPairs_ build_bubble_branch_pairs_() const;
@@ -96,6 +104,7 @@ private:
 private:
     const uint32_t    thread_;
     const GfaGraph&   graph_;
+    const GfaPathWalker path_walker_;
     const uint32_t    DEPTH_MARGIN_ = 50;  // Margin added to BFS max sink depth to limit DFS path enumeration
 
     const uint32_t    max_depth_;
@@ -169,21 +178,6 @@ public:
         const std::vector<std::vector<uint32_t>>& paths
     ) const;
 
-    void stop_final_intersected_pair(
-        Vertex a_start,
-        Vertex a_end,
-        Vertex b_start,
-        Vertex b_end,
-        uint32_t rank
-    ) const;
-
-    void stop_intersected_branch(
-        Vertex start,
-        Vertex end,
-        Vertex by,
-        uint32_t rank
-    ) const;
-
 private:
     const GfaGraph& graph_;
 };
@@ -215,6 +209,7 @@ private:
     bool extend_path_(size_t i, bool include_current);
 
     std::pair<double, double> pair_containments_(size_t i, size_t j) const;
+    bool pair_eligible_(size_t i, size_t j) const;
     bool pair_supported_(size_t i, size_t j, const std::pair<double, double>& c) const;
 
     bool pair_can_still_change_(
@@ -224,8 +219,6 @@ private:
         const std::vector<uint8_t>& need_move
     ) const;
 
-    size_t pair_cache_index_(size_t i, size_t j) const;
-
     bool compute_pair_stats_(double& min_hi, double& max_hi);
 
     void collect_alive_active_(std::vector<size_t>& alive_idx, std::vector<size_t>& active_idx) const;
@@ -233,9 +226,7 @@ private:
     bool plan_moves_(
         const std::vector<size_t>& alive_idx,
         std::vector<uint8_t>& need_move,
-        std::vector<uint8_t>& still_supported,
-        std::vector<std::pair<double, double>>& pair_cache,
-        std::vector<uint8_t>& pair_cache_valid
+        std::vector<uint8_t>& still_supported
     );
 
     bool extend_needed_paths_(
@@ -247,15 +238,14 @@ private:
         std::vector<std::unique_ptr<PathSketch>>& next_sketch,
         std::vector<std::unique_ptr<std::unordered_set<uint32_t>>>& next_visited,
         std::vector<std::unique_ptr<std::unordered_set<uint32_t>>>& next_visited_seg,
-        std::vector<std::unique_ptr<std::vector<uint32_t>>>& next_walks
+        std::vector<std::unique_ptr<std::vector<uint32_t>>>& next_walks,
+        std::vector<GfaPathWalker::Cursor>& next_cursors
     );
 
     bool evaluate_next_state_(
         const std::vector<size_t>& alive_idx,
         const std::vector<uint8_t>& can_move,
         const std::vector<std::unique_ptr<PathSketch>>& next_sketch,
-        const std::vector<std::pair<double, double>>& pair_cache,
-        const std::vector<uint8_t>& pair_cache_valid,
         std::vector<uint8_t>& next_supported,
         double& next_min_hi,
         double& next_max_hi
@@ -270,6 +260,7 @@ private:
         std::vector<std::unique_ptr<std::unordered_set<uint32_t>>>& next_visited,
         std::vector<std::unique_ptr<std::unordered_set<uint32_t>>>& next_visited_seg,
         std::vector<std::unique_ptr<std::vector<uint32_t>>>& next_walks,
+        const std::vector<GfaPathWalker::Cursor>& next_cursors,
         double next_min_hi,
         double next_max_hi
     );
@@ -279,7 +270,8 @@ private:
         const std::vector<uint8_t>& supported
     );
 
-    void stop_intersected_same_source_paths_();
+    void update_path_intersections_();
+    bool all_active_paths_intersected_() const;
 
     HomologousPath emit_result_();
 
@@ -299,6 +291,10 @@ private:
 
     std::vector<Vertex> starts_;
     std::vector<Vertex> owners_;
+    bool use_p_paths_{false};
+    bool use_fixed_samples_{false};
+    std::vector<GfaPathWalker::Cursor> path_cursors_;
+    std::vector<uint32_t> required_samples_;
 
     std::vector<Vertex> cur_;
     std::vector<Vertex> ends_;
@@ -309,6 +305,9 @@ private:
     std::vector<std::unordered_set<uint32_t>> visited_seg_;
     std::vector<std::vector<uint32_t>> walks_;
     std::vector<PathSketch> sketches_;
+
+    std::vector<size_t> intersection_scan_pos_;
+    std::vector<uint8_t> paths_intersected_;
 };
 /* ================================================================================================================
  *                                          HOMOLOGOUS PATH ENUMERATION END

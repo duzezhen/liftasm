@@ -128,27 +128,4 @@ void HomologousPathEnumeratorLogger::enumerate(
     }
 }
 
-void HomologousPathEnumeratorLogger::stop_final_intersected_pair(
-    Vertex a_start,
-    Vertex a_end,
-    Vertex b_start,
-    Vertex b_end,
-    uint32_t rank
-) const {
-    if (!DEBUG_ENABLED) return;
-
-    debug_stream() << "    - stop final intersected pair: " << fmt(a_start) << " -> " << fmt(a_end) << "  and " << fmt(b_start) << " -> " << fmt(b_end) << "  step=" << rank << "\n";
-}
-
-void HomologousPathEnumeratorLogger::stop_intersected_branch(
-    Vertex start,
-    Vertex end,
-    Vertex by,
-    uint32_t rank
-) const {
-    if (!DEBUG_ENABLED) return;
-
-    debug_stream() << "    - stop intersected branch: " << fmt(start) << " -> " << fmt(end) << "  by " << fmt(by) << "  step=" << rank << "\n";
-}
-
 } // namespace GfaBubble

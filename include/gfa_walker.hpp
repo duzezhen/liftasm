@@ -59,6 +59,7 @@ public:
         uint32_t sink,
         const std::unordered_set<uint32_t>& region_set,
         bool skip_comp,
+        uint32_t required_sample,
         const GfaWalkerLogger& log
     );
 
@@ -95,6 +96,7 @@ private:
     uint32_t sink_{UINT32_MAX};
     const std::unordered_set<uint32_t>& region_set_;
     bool skip_comp_{false};
+    uint32_t required_sample_{UINT32_MAX};
 
     bool use_topo_filter_{false};
     uint32_t src_rank_{UINT32_MAX};
@@ -123,7 +125,8 @@ public:
         bool skip_comp,
         bool& hit_limits,
         uint64_t DFS_guard,
-        uint32_t stall_round_limit = 2
+        uint32_t stall_round_limit = 2,
+        uint32_t required_sample = UINT32_MAX
     ) const;
 
     std::vector<std::vector<uint32_t>> open_walk(
@@ -133,7 +136,8 @@ public:
         bool skip_comp,
         uint64_t DFS_guard,
         uint64_t walk_bp,
-        const std::unordered_set<uint32_t>* blocked_seg = nullptr
+        const std::unordered_set<uint32_t>* blocked_seg = nullptr,
+        uint32_t required_sample = UINT32_MAX
     ) const;
 
 private:
@@ -144,6 +148,54 @@ private:
 };
 /* ================================================================================================================
  *                                            GFA WALKER END
+ * ================================================================================================================ */
+
+
+/* ================================================================================================================
+ *                                           P-PATH WALKER START
+ * ================================================================================================================ */
+class GfaPathWalker {
+public:
+    struct Cursor {
+        uint32_t path_id{UINT32_MAX};
+        uint32_t position{UINT32_MAX};
+        bool reverse{false};
+
+        bool valid() const { return path_id != UINT32_MAX; }
+    };
+
+    explicit GfaPathWalker(const GfaGraph& graph);
+
+    bool empty() const { return positions_.empty(); }
+    std::vector<Cursor> locate(uint32_t vertex) const;
+    bool preceded_by(const Cursor& cursor, uint32_t vertex) const;
+    bool next(Cursor& cursor, uint32_t& vertex) const;
+
+    std::vector<std::vector<uint32_t>> paths_between(
+        uint32_t source,
+        uint32_t sink,
+        uint32_t max_paths
+    ) const;
+
+    std::vector<uint32_t> extend(Cursor& cursor, uint64_t walk_bp) const;
+
+private:
+    struct Position {
+        uint32_t path_id{UINT32_MAX};
+        uint32_t position{UINT32_MAX};
+    };
+
+    uint32_t vertex_at_(const Cursor& cursor) const;
+    bool advance_(Cursor& cursor) const;
+    bool valid_step_(uint32_t from, uint32_t to) const;
+
+private:
+    const GfaGraph& graph_;
+    std::vector<uint64_t> offsets_;  // segment ID -> range in positions_
+    std::vector<Position> positions_;
+};
+/* ================================================================================================================
+ *                                            P-PATH WALKER END
  * ================================================================================================================ */
 
 

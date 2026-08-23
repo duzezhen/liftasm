@@ -3,11 +3,27 @@
 #include "../include/ThreadPool.hpp"
 
 #include <iomanip>
+#include <iterator>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <type_traits>
 
 namespace GfaBubble {
+
+static std::vector<uint32_t> common_samples(
+    const GfaGraph& graph,
+    uint32_t first,
+    uint32_t second
+) {
+    const auto& a = graph.getNodeSampleIds(Vertex::get_segment_id(first));
+    const auto& b = graph.getNodeSampleIds(Vertex::get_segment_id(second));
+
+    std::vector<uint32_t> out;
+    out.reserve(std::min(a.size(), b.size()));
+    std::set_intersection(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(out));
+    return out;
+}
 
 GfaBubbleFinder::GfaBubbleFinder(
     const GfaGraph& g, uint32_t md, uint16_t mp, uint64_t dfs_guard, 
@@ -18,16 +34,14 @@ GfaBubbleFinder::GfaBubbleFinder(
         uint32_t homo_extend_bp, uint64_t homo_bloom_bits, uint32_t homo_bloom_hash, 
         uint32_t thread
     )
-    : graph_(g), max_depth_(md), max_paths_(mp), dfs_guard_(dfs_guard), 
+    : thread_(thread), graph_(g), path_walker_(g),
+    max_depth_(md), max_paths_(mp), dfs_guard_(dfs_guard),
     path_diff_(path_diff), stall_round_limit_(stall_round_limit), skip_comp_(sc), keep_nested_(keep_nested), 
     same_sim_(same_sim), same_min_len_(same_min_len),
     diff_min_src_(diff_min_src), diff_sim_(diff_sim), diff_min_len_(diff_min_len), homo_num_(std::max<uint32_t>(1, homo_num)),
     homo_extend_bp_(homo_extend_bp), homo_bloom_bits_(homo_bloom_bits), homo_bloom_hash_(homo_bloom_hash),
-    mm_opt_{/*k=*/homo_k, /*w=*/homo_w, /*seek_reverse=*/false, /*seed=*/0x8a5cd789635d2dffULL},
-    thread_(thread)
-{
-    const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
-}
+    mm_opt_{/*k=*/homo_k, /*w=*/homo_w, /*seek_reverse=*/false, /*seed=*/0x8a5cd789635d2dffULL}
+{}
 
 std::vector<uint32_t> GfaBubbleFinder::trim_path_cluster_anchors(const std::vector<uint32_t>& path, Type type) {
     if (type == Type::SameSource) {
@@ -470,6 +484,74 @@ bool GfaBubbleFinder::find_common_nearest_sink_(
     return best_sink != UINT32_MAX;
 }
 
+std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_bubble_paths_(
+    uint32_t source,
+    uint32_t sink,
+    const std::unordered_set<uint32_t>& region_set,
+    uint32_t max_depth,
+    bool& hit_limits
+) const {
+    hit_limits = false;
+
+    // A real contig path is authoritative. Synthetic component paths are not indexed.
+    if (!path_walker_.empty()) {
+        std::vector<std::vector<uint32_t>> paths = path_walker_.paths_between(
+            source, sink, max_paths_
+        );
+        if (paths.size() >= 2) return paths;
+    }
+
+    const std::vector<uint32_t> samples = common_samples(graph_, source, sink);
+    if (samples.empty()) {
+        return graph_.enumerate_paths_greedy_DFS(
+            source, sink, region_set, max_depth,
+            max_paths_, skip_comp_, hit_limits, dfs_guard_, stall_round_limit_
+        );
+    }
+
+    // Keep one sample fixed for the complete path, then merge samples fairly.
+    std::vector<std::vector<std::vector<uint32_t>>> candidates;
+    candidates.reserve(samples.size());
+    size_t rounds = 0;
+
+    for (uint32_t sample : samples) {
+        bool sample_hit_limits = false;
+        candidates.push_back(graph_.enumerate_paths_greedy_DFS(
+            source, sink, region_set, max_depth,
+            max_paths_, skip_comp_, sample_hit_limits, dfs_guard_, stall_round_limit_, sample
+        ));
+        hit_limits = hit_limits || sample_hit_limits;
+        rounds = std::max(rounds, candidates.back().size());
+    }
+
+    std::vector<std::vector<uint32_t>> paths;
+    paths.reserve(max_paths_);
+
+    for (size_t rank = 0; rank < rounds; ++rank) {
+        for (const auto& sample_paths : candidates) {
+            if (rank >= sample_paths.size()) continue;
+            if (std::find(paths.begin(), paths.end(), sample_paths[rank]) != paths.end()) continue;
+
+            paths.push_back(sample_paths[rank]);
+            if (max_paths_ > 0 && paths.size() >= max_paths_) {
+                return paths.size() >= 2 ? std::move(paths) : std::vector<std::vector<uint32_t>>{};
+            }
+        }
+    }
+
+    if (paths.size() >= 2) return paths;
+
+    // No guide produced a complete bubble; keep the original graph walk as
+    // the final task-level fallback.
+    bool legacy_hit_limits = false;
+    std::vector<std::vector<uint32_t>> legacy = graph_.enumerate_paths_greedy_DFS(
+        source, sink, region_set, max_depth,
+        max_paths_, skip_comp_, legacy_hit_limits, dfs_guard_, stall_round_limit_
+    );
+    hit_limits = hit_limits || legacy_hit_limits;
+    return legacy;
+}
+
 Bubble GfaBubbleFinder::detect_closed_bubble_from_source_(Vertex v, uint64_t bfs_limit)
 {
     Bubble bb;
@@ -569,11 +651,10 @@ Bubble GfaBubbleFinder::detect_closed_bubble_from_source_(Vertex v, uint64_t bfs
         debug_stream() << log_indent(2) << "local nodes    : " << local_nodes.size() << "\n";
     }
 
-    // 4. DFS to enumerate paths from source to sink within local nodes and depth limit
+    // 4. Resolve paths by P-line, fixed sample, or legacy DFS
     bool hit_limits = false;
-    auto paths = graph_.enumerate_paths_greedy_DFS(
-        v.vertex_id(), sink, local_nodes, eff_max_depth,
-        max_paths_, skip_comp_, hit_limits, dfs_guard_, stall_round_limit_
+    auto paths = enumerate_bubble_paths_(
+        v.vertex_id(), sink, local_nodes, eff_max_depth, hit_limits
     );
 
     if (DEBUG_ENABLED) {
@@ -1418,6 +1499,7 @@ void GfaBubbleFinder::filter_diff_source_context_()
 {
     struct Anchor {
         size_t path_id{0};
+        uint64_t source_pair{0};
         std::array<uint32_t, 2> components{};
         std::array<Vertex, 2> sources{};
         std::array<Vertex, 2> starts{};
@@ -1502,6 +1584,14 @@ void GfaBubbleFinder::filter_diff_source_context_()
                 anchor.starts = {hp.starts[first], hp.starts[second]};
                 anchor.ends = {hp.ends[first], hp.ends[second]};
 
+                const uint32_t source_a = std::min(
+                    hp.sources[first].segment_id(), hp.sources[second].segment_id()
+                );
+                const uint32_t source_b = std::max(
+                    hp.sources[first].segment_id(), hp.sources[second].segment_id()
+                );
+                anchor.source_pair = (uint64_t(source_a) << 32) | source_b;
+
                 const uint64_t key = (uint64_t(anchor.components[0]) << 32) | anchor.components[1];
                 component_pairs[key].push_back(anchors.size());
                 anchors.push_back(anchor);
@@ -1510,9 +1600,27 @@ void GfaBubbleFinder::filter_diff_source_context_()
     }
 
     std::vector<uint8_t> rejected(homologous_paths_.size(), 0);
+    size_t current_path = SIZE_MAX;
+    std::unordered_map<uint64_t, bool> source_pair_supported;
+
+    auto finish_path = [&]() {
+        if (current_path == SIZE_MAX) return;
+        for (const auto& pair : source_pair_supported) {
+            if (!pair.second) {
+                rejected[current_path] = 1;
+                break;
+            }
+        }
+        source_pair_supported.clear();
+    };
 
     for (size_t anchor_id = 0; anchor_id < anchors.size(); ++anchor_id) {
         const Anchor& anchor = anchors[anchor_id];
+        if (anchor.path_id != current_path) {
+            finish_path();
+            current_path = anchor.path_id;
+        }
+
         const uint64_t key = (uint64_t(anchor.components[0]) << 32) | anchor.components[1];
         const std::vector<size_t>& peers = component_pairs.at(key);
 
@@ -1525,11 +1633,9 @@ void GfaBubbleFinder::filter_diff_source_context_()
         bool right_supported = right_a < context_bp || right_b < context_bp;
         const bool relative_reverse = anchor.sources[0].is_reverse() != anchor.sources[1].is_reverse();
 
-        for (size_t peer_id : peers) {
-            if (peer_id == anchor_id) continue;
+        auto check_peer = [&](size_t peer_id) {
             const Anchor& peer = anchors[peer_id];
-            if (peer.path_id == anchor.path_id) continue;
-            if ((peer.sources[0].is_reverse() != peer.sources[1].is_reverse()) != relative_reverse) continue;
+            if ((peer.sources[0].is_reverse() != peer.sources[1].is_reverse()) != relative_reverse) return;
 
             std::array<Vertex, 2> peer_starts = peer.starts;
             std::array<Vertex, 2> peer_ends = peer.ends;
@@ -1550,12 +1656,35 @@ void GfaBubbleFinder::filter_diff_source_context_()
 
             left_supported = left_supported || before;
             right_supported = right_supported || after;
-            if (left_supported && right_supported) break;
+        };
+
+        // Anchors are appended in path order. Skip this path as one range
+        // instead of comparing every pair of its P-line occurrences.
+        auto own_begin = std::lower_bound(
+            peers.begin(), peers.end(), anchor.path_id,
+            [&](size_t peer_id, size_t path_id) {
+                return anchors[peer_id].path_id < path_id;
+            }
+        );
+        auto own_end = std::upper_bound(
+            own_begin, peers.end(), anchor.path_id,
+            [&](size_t path_id, size_t peer_id) {
+                return path_id < anchors[peer_id].path_id;
+            }
+        );
+
+        for (auto it = peers.begin(); it != own_begin && !(left_supported && right_supported); ++it) {
+            check_peer(*it);
+        }
+        for (auto it = own_end; it != peers.end() && !(left_supported && right_supported); ++it) {
+            check_peer(*it);
         }
 
-        if (left_supported && right_supported) continue;
-        rejected[anchor.path_id] = 1;
+        // One logical source may occur on several P-lines. Keep the pair when
+        // any occurrence combination has collinear context on both sides.
+        source_pair_supported[anchor.source_pair] |= left_supported && right_supported;
     }
+    finish_path();
 
     size_t next = 0;
     size_t removed = 0;
@@ -1668,10 +1797,12 @@ void GfaBubbleFinder::find_homologous_paths()
     for (auto& f : futs) {
         HomologousPath hp = f.get();
 
-        if (hp.sources.empty()) continue;
-        if (hp.starts.size() < 2) continue;
-        if (hp.ends.size() != hp.starts.size()) continue;
-        if (hp.paths.empty()) continue;
+        const size_t path_count = hp.paths.size();
+        if (path_count < 2) continue;
+        if (hp.sources.size() != path_count || hp.starts.size() != path_count ||
+            hp.ends.size() != path_count || hp.lens.size() != path_count) {
+            continue;
+        }
 
         homologous_paths_.emplace_back(std::move(hp));
     }
@@ -1742,6 +1873,7 @@ HomologousPath HomologousPathEnumerator::run()
         log_.return_reason("invalid starts size");
         return out_;
     }
+    out_.path_guided = use_p_paths_;
 
     log_.starts(starts_);
 
@@ -1758,8 +1890,6 @@ HomologousPath HomologousPathEnumerator::run()
         log_.return_reason("no supported pairs");
         return HomologousPath();
     }
-
-    stop_intersected_same_source_paths_();
 
     const size_t N = starts_.size();
 
@@ -1780,9 +1910,7 @@ HomologousPath HomologousPathEnumerator::run()
     std::vector<std::unique_ptr<std::unordered_set<uint32_t>>> next_visited(N);
     std::vector<std::unique_ptr<std::unordered_set<uint32_t>>> next_visited_seg(N);
     std::vector<std::unique_ptr<std::vector<uint32_t>>> next_walks(N);
-
-    std::vector<std::pair<double, double>> pair_cache(N * N, {0.0, 0.0});
-    std::vector<uint8_t> pair_cache_valid(N * N, 0);
+    std::vector<GfaPathWalker::Cursor> next_cursors(N);
 
     uint32_t dfs_step = 0;
     uint64_t dfs_states = 0;
@@ -1809,7 +1937,6 @@ HomologousPath HomologousPathEnumerator::run()
         std::fill(still_supported.begin(), still_supported.end(), 0);
         std::fill(can_move.begin(), can_move.end(), 0);
         std::fill(next_supported.begin(), next_supported.end(), 0);
-        std::fill(pair_cache_valid.begin(), pair_cache_valid.end(), 0);
 
         for (size_t i = 0; i < N; ++i) {
             next_vtxs[i] = Vertex(UINT32_MAX);
@@ -1818,9 +1945,15 @@ HomologousPath HomologousPathEnumerator::run()
             next_visited[i].reset();
             next_visited_seg[i].reset();
             next_walks[i].reset();
+            next_cursors[i] = GfaPathWalker::Cursor{};
         }
 
-        if (!plan_moves_(alive_idx, need_move, still_supported, pair_cache, pair_cache_valid)) {
+        if (!plan_moves_(alive_idx, need_move, still_supported)) {
+            break;
+        }
+
+        if (all_active_paths_intersected_()) {
+            log_.break_reason("all active paths intersected");
             break;
         }
 
@@ -1833,7 +1966,8 @@ HomologousPath HomologousPathEnumerator::run()
                 next_sketch,
                 next_visited,
                 next_visited_seg,
-                next_walks
+                next_walks,
+                next_cursors
             )
         ) {
             break;
@@ -1848,8 +1982,6 @@ HomologousPath HomologousPathEnumerator::run()
                 alive_idx,
                 can_move,
                 next_sketch,
-                pair_cache,
-                pair_cache_valid,
                 next_supported,
                 next_min_hi,
                 next_max_hi
@@ -1867,15 +1999,18 @@ HomologousPath HomologousPathEnumerator::run()
             next_visited,
             next_visited_seg,
             next_walks,
+            next_cursors,
             next_min_hi,
             next_max_hi
         );
 
-        // Stop at the first shared segment if two branches have intersected
-        stop_intersected_same_source_paths_();
-
         // Paths that are not supported by any pair in the next state
         kill_unsupported_(alive_idx, next_supported);
+
+        if (all_active_paths_intersected_()) {
+            log_.break_reason("all active paths intersected");
+            break;
+        }
 
         ++dfs_step;
     }
@@ -1939,9 +2074,15 @@ bool HomologousPathEnumerator::prepare_starts_()
 {
     starts_.clear();
     owners_.clear();
+    path_cursors_.clear();
+    required_samples_.clear();
+    use_p_paths_ = false;
+    use_fixed_samples_ = false;
 
-    starts_.reserve(std::max<size_t>(8, srcs_.size()));
-    owners_.reserve(std::max<size_t>(8, srcs_.size()));
+    std::vector<Vertex> raw_starts;
+    std::vector<Vertex> raw_owners;
+    raw_starts.reserve(std::max<size_t>(8, srcs_.size()));
+    raw_owners.reserve(std::max<size_t>(8, srcs_.size()));
 
     const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
 
@@ -1963,11 +2104,11 @@ bool HomologousPathEnumerator::prepare_starts_()
             const uint32_t sid = w.segment_id();
             if (!seen_seg.insert(sid).second) continue;
 
-            starts_.push_back(w);
-            owners_.push_back(src);
+            raw_starts.push_back(w);
+            raw_owners.push_back(src);
         }
 
-        if (starts_.size() >= 2 && share_one_bubble_group_(starts_)) {
+        if (raw_starts.size() >= 2 && share_one_bubble_group_(raw_starts)) {
             log_.return_reason("bubble branch group hit");
             return false;
         }
@@ -1980,12 +2121,86 @@ bool HomologousPathEnumerator::prepare_starts_()
             if (graph_.getNodeDeleted(s.segment_id())) continue;
             if (!seen_seg.insert(s.segment_id()).second) continue;
 
-            starts_.push_back(s);
-            owners_.push_back(s);
+            raw_starts.push_back(s);
+            raw_owners.push_back(s);
         }
     }
 
-    return starts_.size() >= 2;
+    if (raw_starts.size() < 2) return false;
+
+    auto has_two_groups = [&]() {
+        std::unordered_set<uint32_t> groups;
+        groups.reserve(starts_.size());
+
+        for (size_t i = 0; i < starts_.size(); ++i) {
+            const Vertex anchor = params_.type == Type::SameSource ? starts_[i] : owners_[i];
+            groups.insert(anchor.segment_id());
+        }
+        return groups.size() >= 2;
+    };
+
+    // With real P-lines, every state follows one exact oriented contig occurrence.
+    if (!finder_.path_walker_.empty()) {
+        for (size_t i = 0; i < raw_starts.size(); ++i) {
+            for (const GfaPathWalker::Cursor& cursor : finder_.path_walker_.locate(raw_starts[i].vertex_id())) {
+                if (params_.type == Type::SameSource &&
+                    !finder_.path_walker_.preceded_by(cursor, raw_owners[i].vertex_id())) {
+                    continue;
+                }
+
+                starts_.push_back(raw_starts[i]);
+                owners_.push_back(raw_owners[i]);
+                path_cursors_.push_back(cursor);
+                required_samples_.push_back(UINT32_MAX);
+            }
+        }
+
+        use_p_paths_ = true;
+        if (has_two_groups()) return true;
+
+        starts_.clear();
+        owners_.clear();
+        path_cursors_.clear();
+        required_samples_.clear();
+        use_p_paths_ = false;
+    }
+
+    // Without P-lines, duplicate each graph start by its fixed SN label.
+    for (size_t i = 0; i < raw_starts.size(); ++i) {
+        std::vector<uint32_t> samples;
+        if (params_.type == Type::SameSource) {
+            samples = common_samples(
+                graph_, raw_owners[i].vertex_id(), raw_starts[i].vertex_id()
+            );
+        } else {
+            samples = graph_.getNodeSampleIds(raw_starts[i].segment_id());
+        }
+
+        for (uint32_t sample : samples) {
+            starts_.push_back(raw_starts[i]);
+            owners_.push_back(raw_owners[i]);
+            path_cursors_.emplace_back();
+            required_samples_.push_back(sample);
+        }
+    }
+
+    if (!starts_.empty()) {
+        use_fixed_samples_ = true;
+        if (has_two_groups()) return true;
+
+        starts_.clear();
+        owners_.clear();
+        path_cursors_.clear();
+        required_samples_.clear();
+        use_fixed_samples_ = false;
+    }
+
+    // Legacy greedy walk is used only when the graph has no usable P or SN evidence.
+    starts_ = std::move(raw_starts);
+    owners_ = std::move(raw_owners);
+    path_cursors_.resize(starts_.size());
+    required_samples_.assign(starts_.size(), UINT32_MAX);
+    return true;
 }
 
 bool HomologousPathEnumerator::initialize_states_()
@@ -1993,6 +2208,7 @@ bool HomologousPathEnumerator::initialize_states_()
     // ------------------------------------------------ Initialize path states ------------------------------------------------
     const size_t N = starts_.size();
     if (N < 2) return false;
+    if (owners_.size() != N || path_cursors_.size() != N || required_samples_.size() != N) return false;
 
     cur_.assign(N, Vertex(UINT32_MAX));
     ends_.assign(N, Vertex(UINT32_MAX));
@@ -2002,6 +2218,7 @@ bool HomologousPathEnumerator::initialize_states_()
 
     visited_.clear();
     visited_seg_.clear();
+    walks_.clear();
 
     visited_.resize(N);
     visited_seg_.resize(N);
@@ -2015,6 +2232,13 @@ bool HomologousPathEnumerator::initialize_states_()
 
     sketches_.clear();
     sketches_.reserve(N);
+
+    intersection_scan_pos_.clear();
+    paths_intersected_.clear();
+    if (params_.type == Type::SameSource) {
+        intersection_scan_pos_.assign(N, 0);
+        paths_intersected_.assign(N * N, 0);
+    }
 
     for (size_t i = 0; i < N; ++i) {
         const Vertex v = starts_[i];
@@ -2042,6 +2266,8 @@ bool HomologousPathEnumerator::bootstrap_()
 
         extend_path_(i, true);
     }
+
+    update_path_intersections_();
 
     return true;
 }
@@ -2084,15 +2310,26 @@ bool HomologousPathEnumerator::extend_path_(size_t i, bool include_current)
         DEBUG_ENABLED = false;
     }
 
-    std::vector<std::vector<uint32_t>> paths = graph_.open_walk(
-        cur_[i].vertex_id(),
-        region_set,
-        DFS_DEPTH_,
-        finder_.skip_comp_,
-        DFS_GUARD_,
-        finder_.homo_extend_bp_,
-        &visited_seg_[i]
-    );
+    GfaPathWalker::Cursor next_cursor = path_cursors_[i];
+    std::vector<std::vector<uint32_t>> paths;
+
+    if (use_p_paths_) {
+        std::vector<uint32_t> path = finder_.path_walker_.extend(
+            next_cursor, finder_.homo_extend_bp_
+        );
+        if (!path.empty()) paths.push_back(std::move(path));
+    } else {
+        paths = graph_.open_walk(
+            cur_[i].vertex_id(),
+            region_set,
+            DFS_DEPTH_,
+            finder_.skip_comp_,
+            DFS_GUARD_,
+            finder_.homo_extend_bp_,
+            &visited_seg_[i],
+            required_samples_[i]
+        );
+    }
 
     if (old_debug) DEBUG_ENABLED = true;
 
@@ -2134,6 +2371,7 @@ bool HomologousPathEnumerator::extend_path_(size_t i, bool include_current)
         visited_seg_[i].insert(v.segment_id());
         walks_[i].push_back(v.vertex_id());
     }
+    if (use_p_paths_) path_cursors_[i] = next_cursor;
 
     log_.sequence(std::to_string(added_seq.size()));
 
@@ -2143,6 +2381,14 @@ bool HomologousPathEnumerator::extend_path_(size_t i, bool include_current)
 std::pair<double, double> HomologousPathEnumerator::pair_containments_(size_t i, size_t j) const
 {
     return sketches_[i].bit_containments(sketches_[j]);
+}
+
+bool HomologousPathEnumerator::pair_eligible_(size_t i, size_t j) const
+{
+    if (params_.type == Type::SameSource) {
+        return starts_[i].segment_id() != starts_[j].segment_id();
+    }
+    return owners_[i].segment_id() != owners_[j].segment_id();
 }
 
 bool HomologousPathEnumerator::pair_supported_(size_t i, size_t j, const std::pair<double, double>& c) const
@@ -2170,11 +2416,6 @@ bool HomologousPathEnumerator::pair_can_still_change_(
     if (active_[i] == PATH_ACTIVE && active_[j] == PATH_ACTIVE) return !need_move[i] || !need_move[j];
 
     return false;
-}
-
-size_t HomologousPathEnumerator::pair_cache_index_(size_t i, size_t j) const {
-    if (i > j) std::swap(i, j);
-    return i * starts_.size() + j;
 }
 
 bool HomologousPathEnumerator::compute_pair_stats_(
@@ -2209,6 +2450,8 @@ bool HomologousPathEnumerator::compute_pair_stats_(
 
         for (size_t aj = ai + 1; aj < alive.size(); ++aj) {
             const size_t j = alive[aj];
+            if (!pair_eligible_(i, j)) continue;
+
             const std::pair<double, double> c = pair_containments_(i, j);
             const double hi = std::max(c.first, c.second);
 
@@ -2263,9 +2506,7 @@ void HomologousPathEnumerator::collect_alive_active_(
 bool HomologousPathEnumerator::plan_moves_(
     const std::vector<size_t>& alive_idx,
     std::vector<uint8_t>& need_move,
-    std::vector<uint8_t>& still_supported,
-    std::vector<std::pair<double, double>>& pair_cache,
-    std::vector<uint8_t>& pair_cache_valid
+    std::vector<uint8_t>& still_supported
 ) {
     bool any_need_move = false;
 
@@ -2275,14 +2516,11 @@ bool HomologousPathEnumerator::plan_moves_(
 
         for (size_t aj = ai + 1; aj < alive_idx.size(); ++aj) {
             const size_t j = alive_idx[aj];
+            if (!pair_eligible_(i, j)) continue;
 
             if (!pair_can_still_change_(i, j, still_supported, need_move)) continue;
 
             const std::pair<double, double> c = pair_containments_(i, j);
-
-            const size_t cache_idx = pair_cache_index_(i, j);
-            pair_cache[cache_idx] = c;
-            pair_cache_valid[cache_idx] = 1;
 
             const bool first_good  = c.first  >= params_.min_similarity;
             const bool second_good = c.second >= params_.min_similarity;
@@ -2348,7 +2586,8 @@ bool HomologousPathEnumerator::extend_needed_paths_(
     std::vector<std::unique_ptr<PathSketch>>& next_sketch,
     std::vector<std::unique_ptr<std::unordered_set<uint32_t>>>& next_visited,
     std::vector<std::unique_ptr<std::unordered_set<uint32_t>>>& next_visited_seg,
-    std::vector<std::unique_ptr<std::vector<uint32_t>>>& next_walks
+    std::vector<std::unique_ptr<std::vector<uint32_t>>>& next_walks,
+    std::vector<GfaPathWalker::Cursor>& next_cursors
 ) {
     bool any_move = false;
 
@@ -2359,6 +2598,7 @@ bool HomologousPathEnumerator::extend_needed_paths_(
         Vertex old_cur = cur_[i];
         Vertex old_end = ends_[i];
         uint64_t old_bp = acc_bp_[i];
+        const GfaPathWalker::Cursor old_cursor = path_cursors_[i];
 
         std::unordered_set<uint32_t> old_visited = std::move(visited_[i]);
         std::unordered_set<uint32_t> old_visited_seg = std::move(visited_seg_[i]);
@@ -2378,6 +2618,7 @@ bool HomologousPathEnumerator::extend_needed_paths_(
             visited_seg_[i] = std::move(old_visited_seg);
             walks_[i] = std::move(old_walk);
             sketches_[i] = std::move(old_sketch);
+            path_cursors_[i] = old_cursor;
             continue;
         }
 
@@ -2388,6 +2629,7 @@ bool HomologousPathEnumerator::extend_needed_paths_(
         next_visited[i] = std::make_unique<std::unordered_set<uint32_t>>(std::move(visited_[i]));
         next_visited_seg[i] = std::make_unique<std::unordered_set<uint32_t>>(std::move(visited_seg_[i]));
         next_walks[i] = std::make_unique<std::vector<uint32_t>>(std::move(walks_[i]));
+        next_cursors[i] = path_cursors_[i];
 
         cur_[i] = old_cur;
         ends_[i] = old_end;
@@ -2396,6 +2638,7 @@ bool HomologousPathEnumerator::extend_needed_paths_(
         visited_seg_[i] = std::move(old_visited_seg);
         walks_[i] = std::move(old_walk);
         sketches_[i] = std::move(old_sketch);
+        path_cursors_[i] = old_cursor;
 
         can_move[i] = 1;
         any_move = true;
@@ -2408,8 +2651,6 @@ bool HomologousPathEnumerator::evaluate_next_state_(
     const std::vector<size_t>& alive_idx,
     const std::vector<uint8_t>& can_move,
     const std::vector<std::unique_ptr<PathSketch>>& next_sketch,
-    const std::vector<std::pair<double, double>>& pair_cache,
-    const std::vector<uint8_t>& pair_cache_valid,
     std::vector<uint8_t>& next_supported,
     double& next_min_hi,
     double& next_max_hi
@@ -2423,23 +2664,11 @@ bool HomologousPathEnumerator::evaluate_next_state_(
 
         for (size_t aj = ai + 1; aj < alive_idx.size(); ++aj) {
             const size_t j = alive_idx[aj];
+            if (!pair_eligible_(i, j)) continue;
 
-            std::pair<double, double> c;
-
-            if (!can_move[i] && !can_move[j]) {
-                const size_t cache_idx = pair_cache_index_(i, j);
-
-                if (pair_cache_valid[cache_idx]) {
-                    c = pair_cache[cache_idx];
-                } else {
-                    c = pair_containments_(i, j);
-                }
-            } else {
-                const PathSketch& si = can_move[i] ? *next_sketch[i] : sketches_[i];
-                const PathSketch& sj = can_move[j] ? *next_sketch[j] : sketches_[j];
-
-                c = si.bit_containments(sj);
-            }
+            const PathSketch& si = can_move[i] ? *next_sketch[i] : sketches_[i];
+            const PathSketch& sj = can_move[j] ? *next_sketch[j] : sketches_[j];
+            const std::pair<double, double> c = si.bit_containments(sj);
 
             const double hi = std::max(c.first, c.second);
 
@@ -2482,6 +2711,7 @@ void HomologousPathEnumerator::commit_next_state_(
     std::vector<std::unique_ptr<std::unordered_set<uint32_t>>>& next_visited,
     std::vector<std::unique_ptr<std::unordered_set<uint32_t>>>& next_visited_seg,
     std::vector<std::unique_ptr<std::vector<uint32_t>>>& next_walks,
+    const std::vector<GfaPathWalker::Cursor>& next_cursors,
     double next_min_hi,
     double next_max_hi
 ) {
@@ -2501,7 +2731,10 @@ void HomologousPathEnumerator::commit_next_state_(
 
         sketches_[i] = std::move(*next_sketch[i]);
         acc_bp_[i] = next_bp[i];
+        path_cursors_[i] = next_cursors[i];
     }
+
+    update_path_intersections_();
 }
 
 void HomologousPathEnumerator::kill_unsupported_(
@@ -2515,125 +2748,50 @@ void HomologousPathEnumerator::kill_unsupported_(
     }
 }
 
-void HomologousPathEnumerator::stop_intersected_same_source_paths_()
+void HomologousPathEnumerator::update_path_intersections_()
 {
-    std::vector<size_t> alive_idx;
-    alive_idx.reserve(starts_.size());
+    const size_t N = walks_.size();
+    if (intersection_scan_pos_.size() != N || paths_intersected_.size() != N * N) return;
 
-    for (size_t i = 0; i < starts_.size(); ++i) {
-        if (active_[i] != PATH_DEAD) {
-            alive_idx.push_back(i);
+    // Index only newly committed nodes. A path pair stays intersected once it has shared any segment.
+    for (size_t i = 0; i < N; ++i) {
+        size_t& pos = intersection_scan_pos_[i];
+
+        for (; pos < walks_[i].size(); ++pos) {
+            const uint32_t segment = Vertex(walks_[i][pos]).segment_id();
+
+            for (size_t j = 0; j < N; ++j) {
+                if (i == j || visited_seg_[j].find(segment) == visited_seg_[j].end()) continue;
+                paths_intersected_[i * N + j] = 1;
+                paths_intersected_[j * N + i] = 1;
+            }
+        }
+    }
+}
+
+bool HomologousPathEnumerator::all_active_paths_intersected_() const
+{
+    if (params_.type != Type::SameSource) return false;
+
+    const size_t N = starts_.size();
+    if (paths_intersected_.size() != N * N) return false;
+
+    size_t pair_count = 0;
+
+    // Frozen paths cannot reach a future intersection. Keep them for similarity,
+    // but let only movable paths decide when extension can stop.
+    for (size_t i = 0; i + 1 < N; ++i) {
+        if (active_[i] != PATH_ACTIVE) continue;
+
+        for (size_t j = i + 1; j < N; ++j) {
+            if (active_[j] != PATH_ACTIVE || !pair_eligible_(i, j)) continue;
+            ++pair_count;
+
+            if (!paths_intersected_[i * N + j]) return false;
         }
     }
 
-    if (alive_idx.size() < 2) return;
-
-    size_t alive_count = alive_idx.size();
-
-    auto trim_to = [&](size_t i, size_t pos) {
-        std::vector<uint32_t>& walk = walks_[i];
-        if (pos >= walk.size()) return;
-
-        walk.resize(pos + 1);
-        cur_[i] = Vertex(walk.back());
-        ends_[i] = cur_[i];
-
-        visited_[i].clear();
-        visited_seg_[i].clear();
-        visited_seg_[i].insert(owners_[i].segment_id());
-
-        uint64_t bp = graph_.getNodeLength(Vertex(walk.front()).segment_id());
-
-        for (size_t p = 0; p < walk.size(); ++p) {
-            visited_[i].insert(walk[p]);
-            visited_seg_[i].insert(Vertex(walk[p]).segment_id());
-
-            if (p == 0) continue;
-
-            const uint32_t sid = Vertex(walk[p]).segment_id();
-            const uint32_t len = graph_.getNodeLength(sid);
-            const uint32_t ow = graph_.get_edge_ow(walk[p - 1], walk[p]);
-            bp += len > ow ? uint64_t(len - ow) : 0;
-        }
-
-        acc_bp_[i] = bp;
-    };
-
-    for (size_t x = 0; x + 1 < alive_idx.size(); ++x) {
-        const size_t i = alive_idx[x];
-        if (active_[i] == PATH_DEAD) continue;
-
-        for (size_t y = x + 1; y < alive_idx.size(); ++y) {
-            const size_t j = alive_idx[y];
-            if (active_[j] == PATH_DEAD) continue;
-            if (owners_[i] != owners_[j]) continue;
-
-            std::unordered_map<uint32_t, size_t> j_pos;
-            j_pos.reserve(walks_[j].size() * 2 + 1);
-
-            for (size_t p = 0; p < walks_[j].size(); ++p) {
-                j_pos.emplace(Vertex(walks_[j][p]).segment_id(), p);
-            }
-
-            bool found = false;
-            size_t best_i_pos = 0;
-            size_t best_j_pos = 0;
-            size_t best_max_pos = std::numeric_limits<size_t>::max();
-            size_t best_sum_pos = std::numeric_limits<size_t>::max();
-
-            for (size_t p = 0; p < walks_[i].size(); ++p) {
-                const uint32_t sid = Vertex(walks_[i][p]).segment_id();
-                const auto it = j_pos.find(sid);
-                if (it == j_pos.end()) continue;
-
-                const size_t q = it->second;
-                const size_t max_pos = std::max(p, q);
-                const size_t sum_pos = p + q;
-
-                if (!found || max_pos < best_max_pos || (max_pos == best_max_pos && sum_pos < best_sum_pos)) {
-                    found = true;
-                    best_i_pos = p;
-                    best_j_pos = q;
-                    best_max_pos = max_pos;
-                    best_sum_pos = sum_pos;
-                }
-            }
-
-            if (!found) continue;
-
-            const uint32_t step = static_cast<uint32_t>(
-                std::min(best_max_pos, size_t(UINT32_MAX))
-            );
-
-            if (alive_count == 2) {
-                trim_to(i, best_i_pos);
-                trim_to(j, best_j_pos);
-                active_[i] = PATH_DEAD;
-                active_[j] = PATH_DEAD;
-
-                log_.stop_final_intersected_pair(
-                    starts_[i],
-                    ends_[i],
-                    starts_[j],
-                    ends_[j],
-                    step
-                );
-
-                break;
-            }
-
-            trim_to(j, best_j_pos);
-            active_[j] = PATH_DEAD;
-            --alive_count;
-
-            log_.stop_intersected_branch(
-                starts_[j],
-                ends_[j],
-                starts_[i],
-                step
-            );
-        }
-    }
+    return pair_count > 0;
 }
 
 HomologousPath HomologousPathEnumerator::emit_result_()
@@ -2644,30 +2802,60 @@ HomologousPath HomologousPathEnumerator::emit_result_()
     out_.lens.clear();
     out_.paths.clear();
 
-    std::vector<std::unordered_set<uint32_t>> visited_sets;
-    visited_sets.reserve(starts_.size());
+    log_.kept(starts_, ends_, acc_bp_, keep_);
+    std::set<std::vector<Vertex>> seen_paths;
+
+    auto path_bp = [&](const std::vector<uint32_t>& path) {
+        uint64_t bp = 0;
+
+        for (size_t p = 0; p < path.size(); ++p) {
+            const uint32_t segment = Vertex::get_segment_id(path[p]);
+            if (graph_.getNodeDeleted(segment)) return uint64_t(0);
+
+            const uint32_t length = graph_.getNodeLength(segment);
+            if (p == 0) {
+                bp += length;
+            } else {
+                const uint32_t overlap = graph_.get_edge_ow(path[p - 1], path[p]);
+                bp += length - std::min(length, overlap);
+            }
+        }
+        return bp;
+    };
+
+    auto append_path = [&](size_t state, const std::vector<uint32_t>& path) {
+        if (path.empty()) return;
+
+        const uint64_t bp = path_bp(path);
+        if (bp < params_.min_path_bp) return;
+
+        std::vector<Vertex> vertices;
+        vertices.reserve(path.size() + (out_.type == Type::SameSource));
+        if (out_.type == Type::SameSource) vertices.push_back(owners_[state]);
+        for (uint32_t vertex : path) vertices.emplace_back(vertex);
+
+        if (!seen_paths.insert(vertices).second) return;
+
+        out_.sources.push_back(owners_[state]);
+        out_.starts.emplace_back(path.front());
+        out_.ends.emplace_back(path.back());
+        out_.lens.push_back(bp);
+        out_.paths.push_back(std::move(vertices));
+    };
 
     for (size_t i = 0; i < starts_.size(); ++i) {
         if (!keep_[i]) continue;
-        if (acc_bp_[i] < params_.min_path_bp) continue;
 
-        out_.sources.push_back(owners_[i]);
-        out_.starts.push_back(starts_[i]);
-        out_.ends.push_back(ends_[i]);
-        out_.lens.push_back(acc_bp_[i]);
+        if (use_p_paths_) {
+            append_path(i, walks_[i]);
+            log_.enumerate(starts_[i], ends_[i], {walks_[i]});
+            continue;
+        }
 
-        visited_sets.push_back(std::move(visited_[i]));
-    }
-
-    log_.kept(starts_, ends_, acc_bp_, keep_);
-
-    out_.paths.clear();
-    out_.paths.reserve(out_.starts.size());
-
-    for (size_t i = 0; i < out_.starts.size(); ++i) {
         static const std::unordered_set<uint32_t> empty_region;
 
-        const std::unordered_set<uint32_t>& visited_set = params_.type == Type::DiffSource ? visited_sets[i] : (finder_.homo_num_ == 1 ? visited_sets[i] : empty_region);
+        const std::unordered_set<uint32_t>& visited_set = params_.type == Type::DiffSource ?
+            visited_[i] : (finder_.homo_num_ == 1 ? visited_[i] : empty_region);
 
         uint32_t eff_max_depth = DFS_DEPTH_;
 
@@ -2682,33 +2870,20 @@ HomologousPath HomologousPathEnumerator::emit_result_()
         bool hit_limits = false;
 
         std::vector<std::vector<uint32_t>> paths = graph_.enumerate_paths_greedy_DFS(
-            out_.starts[i].vertex_id(),
-            out_.ends[i].vertex_id(),
+            starts_[i].vertex_id(),
+            ends_[i].vertex_id(),
             visited_set,
             eff_max_depth,
             finder_.homo_num_,
             finder_.skip_comp_,
             hit_limits,
             DFS_GUARD_,
-            finder_.stall_round_limit_
+            finder_.stall_round_limit_,
+            required_samples_[i]
         );
 
-        for (const std::vector<uint32_t>& path : paths) {
-            std::vector<Vertex> vpath;
-            vpath.reserve(path.size() + 1);
-
-            if (out_.type == Type::SameSource) {
-                vpath.push_back(out_.sources[i]);
-            }
-
-            for (uint32_t vid : path) {
-                vpath.emplace_back(Vertex(vid));
-            }
-
-            out_.paths.push_back(std::move(vpath));
-        }
-
-        log_.enumerate(out_.starts[i], out_.ends[i], paths);
+        for (const std::vector<uint32_t>& path : paths) append_path(i, path);
+        log_.enumerate(starts_[i], ends_[i], paths);
     }
 
     if (DEBUG_ENABLED) {
@@ -3116,6 +3291,7 @@ bool HomologousPathDeduplicator::build_trimmed_piece_(
     out.type = hp.type;
     out.min_hi_similarity = hp.min_hi_similarity;
     out.max_hi_similarity = hp.max_hi_similarity;
+    out.path_guided = hp.path_guided;
 
     for (size_t i = 0; i < hp.paths.size(); ++i) {
         const std::vector<Vertex>& old_path = hp.paths[i];
@@ -3336,6 +3512,26 @@ void GfaBubbleFinder::label_path_clusters()
 
     for (HomologousPath& hp : homologous_paths_) {
         homo_futs.push_back(pool.submit([&clusterer, &hp, &prog]() {
+            if (hp.path_guided && hp.type == Type::DiffSource) {
+                std::unordered_set<uint32_t> owners;
+                bool duplicate_owner = false;
+
+                for (Vertex source : hp.sources) {
+                    if (!owners.insert(source.vertex_id()).second) {
+                        duplicate_owner = true;
+                        break;
+                    }
+                }
+
+                // Every occurrence must remain a representative when one source has multiple contig paths.
+                if (duplicate_owner) {
+                    std::vector<uint32_t> clusters(hp.paths.size());
+                    std::iota(clusters.begin(), clusters.end(), 0);
+                    prog.hit();
+                    return clusters;
+                }
+            }
+
             std::vector<std::vector<uint32_t>> paths;
             paths.reserve(hp.paths.size());
 

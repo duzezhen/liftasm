@@ -97,7 +97,8 @@ public:
     std::vector<std::vector<uint32_t>> enumerate_paths_greedy_DFS(
         const uint32_t src, const uint32_t sink, const std::unordered_set<uint32_t>& region_set,
         const uint32_t max_depth, const uint32_t max_paths,
-        const bool skip_comp, bool& hit_limits, const uint64_t DFS_guard, const uint32_t stall_round_limit
+        const bool skip_comp, bool& hit_limits, const uint64_t DFS_guard, const uint32_t stall_round_limit,
+        const uint32_t required_sample = UINT32_MAX
     ) const;
     std::vector<std::vector<uint32_t>> open_walk(
         const uint32_t src,
@@ -106,7 +107,8 @@ public:
         const bool skip_comp,
         const uint64_t DFS_guard,
         const uint64_t walk_bp,
-        const std::unordered_set<uint32_t>* blocked_seg = nullptr
+        const std::unordered_set<uint32_t>* blocked_seg = nullptr,
+        const uint32_t required_sample = UINT32_MAX
     ) const;
 
     // Connectivity index
@@ -210,9 +212,9 @@ protected:
 
     /* line parsers */
     bool parseSLine(std::stringstream& ss, const std::string& sample_name);
-    bool parseLLine(std::stringstream& ss);
-    bool parsePLine(std::stringstream& ss);
-    bool parseALine(std::stringstream& ss);
+    bool parseLLine(std::stringstream& ss, const std::string& filename, uint64_t line_no);
+    bool parsePLine(std::stringstream& ss, const std::string& filename, uint64_t line_no);
+    bool parseALine(std::stringstream& ss, const std::string& filename, uint64_t line_no);
 
 
     /* ---------- finalize steps ---------- */

@@ -1286,7 +1286,9 @@ std::vector<std::string> GfaCtgCollapser::collapse_samples(
         }
 
         const std::string sample_prefix = prefix + "." + unique_name;
-        const std::vector<std::string> sample_vcf = vcf_files.empty() ? std::vector<std::string>{} : std::vector<std::string>{vcf_files[i]};
+        const std::vector<std::string> sample_vcf = vcf_files.empty() || vcf_files[i].empty()
+            ? std::vector<std::string>{}
+            : std::vector<std::string>{vcf_files[i]};
 
         log_stream() << "Processing contig sample " << (i + 1) << '/' << hap1_files.size() << " (" << unique_name << ") ...\n\n";
         GfaCtgCollapser sample(*this);

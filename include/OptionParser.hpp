@@ -100,6 +100,7 @@ struct BubbleOpts {
 };
 
 struct CollapseOpts {
+    std::string configFile;            // sample/GFA input table
     std::vector<std::string> gfaFiles;  // input GFA
     std::vector<std::string> hap1Files; // haplotype-1 contig GFA
     std::vector<std::string> hap2Files; // haplotype-2 contig GFA
@@ -109,7 +110,7 @@ struct CollapseOpts {
 
     std::string mm2_preset = "asm5";
     double min_match_ratio = 0.9;  // minimum CIGAR match ratio for non-iterative commands
-    std::vector<double> min_match_ratios = {0.9, 0.95, 0.95};  // collapse defaults by iteration
+    std::vector<double> min_match_ratios = {0.9};  // collapse defaults by iteration
     double min_ali_ratio = 0.001;  // minimum aligned length ratio to keep (deoverlap default)
     std::vector<double> min_ali_ratios = {0.05, 0.01, 0.001};  // minimum aligned length ratio to keep (collapse default)
     uint8_t min_mapq = 30;  // minimum mapping quality to keep
@@ -124,7 +125,7 @@ struct CollapseOpts {
     double ctg_end_fraction = 0.01;     // terminal overhang fraction allowed for end-to-end component support
     bool ctg_anchor_only = false;       // align only shared-read anchor blocks in contig collapse
     uint32_t iterations = 3;            // number of collapse rounds
-    std::vector<double>   min_jaccards     = {0.9};  // collapse
+    std::vector<double>   min_jaccards     = {0.8};  // collapse
     std::vector<double>   same_sims        = {0.9};
     std::vector<uint32_t> same_min_lens    = {1000000};
     std::vector<uint32_t> diff_min_srcs    = {500000};

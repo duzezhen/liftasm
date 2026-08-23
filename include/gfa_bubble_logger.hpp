@@ -47,21 +47,6 @@ public:
         const std::vector<std::vector<uint32_t>>& paths
     ) const;
 
-    void stop_final_intersected_pair(
-        Vertex a_start,
-        Vertex a_end,
-        Vertex b_start,
-        Vertex b_end,
-        uint32_t rank
-    ) const;
-
-    void stop_intersected_branch(
-        Vertex start,
-        Vertex end,
-        Vertex by,
-        uint32_t rank
-    ) const;
-
 private:
     const GfaGraph& graph_;
 };

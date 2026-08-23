@@ -204,7 +204,9 @@ void GfaGraph::load_from_GFA(
 
         GzChunkReader zr(filename);
         std::string line;
+        uint64_t line_no = 0;
         while (zr.readLine(line)) {
+            ++line_no;
             if (line.empty()) continue;
             if (line.back() == '\n' || line.back() == '\r') line.pop_back();
 
@@ -218,9 +220,9 @@ void GfaGraph::load_from_GFA(
 
             switch (type) {
                 case 'S': parseSLine(ss, sample_name); break;
-                case 'L': if (read_links) parseLLine(ss); break;
-                case 'P': parsePLine(ss); break;
-                case 'A': parseALine(ss); break;
+                case 'L': if (read_links) parseLLine(ss, filename, line_no); break;
+                case 'P': parsePLine(ss, filename, line_no); break;
+                case 'A': parseALine(ss, filename, line_no); break;
                 default:  break;
             }
         }
@@ -567,7 +569,7 @@ bool GfaGraph::parseSLine(std::stringstream& ss, const std::string& sample_name)
 /*------------------------------------------------------------*/
 /*                      L-line parser                         */
 /*------------------------------------------------------------*/
-bool GfaGraph::parseLLine(std::stringstream& ss) {
+bool GfaGraph::parseLLine(std::stringstream& ss, const std::string& filename, uint64_t line_no) {
     char c;
     std::string v_name, w_name;
     char v_ori, w_ori;
@@ -575,11 +577,23 @@ bool GfaGraph::parseLLine(std::stringstream& ss) {
     ss >> c >> v_name >> v_ori >> w_name >> w_ori >> ovlap_field;
     std::string rest; std::getline(ss, rest);
 
-    uint32_t v_seg = get_or_add_segment(v_name);
+    // All valid segments were registered from S-lines in pass-1.
+    auto v_it = name_to_id_map_.find(v_name);
+    auto w_it = name_to_id_map_.find(w_name);
+    if (v_it == name_to_id_map_.end() || w_it == name_to_id_map_.end()) {
+        const std::string& missing = v_it == name_to_id_map_.end() ? v_name : w_name;
+        error_stream() << "Invalid L-line: edge references an undefined segment\n";
+        error_stream() << "  - File: " << filename << ":" << line_no << "\n";
+        error_stream() << "  - Edge: " << v_name << v_ori << " -> " << w_name << w_ori << "\n";
+        error_stream() << "  - Segment: " << missing << "\n";
+        std::exit(1);
+    }
+
+    uint32_t v_seg = static_cast<uint32_t>(v_it->second);
     bool v_rev = (v_ori == '-');
     uint32_t v_vertex = (v_seg << 1) | (v_rev ? 1 : 0);
 
-    uint32_t w_seg = get_or_add_segment(w_name);
+    uint32_t w_seg = static_cast<uint32_t>(w_it->second);
     bool w_rev = (w_ori == '-');
     uint32_t w_vertex = (w_seg << 1) | (w_rev ? 1 : 0);
 
@@ -684,7 +698,7 @@ bool GfaGraph::parseLLine(std::stringstream& ss) {
 /*------------------------------------------------------------*/
 /*                      P-line parser                         */
 /*------------------------------------------------------------*/
-bool GfaGraph::parsePLine(std::stringstream& ss) {
+bool GfaGraph::parsePLine(std::stringstream& ss, const std::string& filename, uint64_t line_no) {
     char c; std::string pname, segs, cigar;
     ss >> c >> pname >> segs >> cigar;
     if (pname.empty() || segs.empty()) return false;
@@ -698,8 +712,12 @@ bool GfaGraph::parsePLine(std::stringstream& ss) {
         char ori = tok.back();
         auto it = name_to_id_map_.find(seg_name);
         if (it == name_to_id_map_.end()) {
-            warning_stream() << "  ! Path references undefined segment '" << seg_name << "'\n";
-            continue;
+            // A path with a missing segment is invalid
+            error_stream() << "Invalid P-line: path references an undefined segment\n";
+            error_stream() << "  - File: " << filename << ":" << line_no << "\n";
+            error_stream() << "  - Path: " << pname << "\n";
+            error_stream() << "  - Segment: " << seg_name << "\n";
+            std::exit(1);
         }
         p.segments.push_back({it->second, ori=='-'});
     }
@@ -710,7 +728,7 @@ bool GfaGraph::parsePLine(std::stringstream& ss) {
 /*------------------------------------------------------------*/
 /*                      A-line parser                         */
 /*------------------------------------------------------------*/
-bool GfaGraph::parseALine(std::stringstream& ss) {
+bool GfaGraph::parseALine(std::stringstream& ss, const std::string& filename, uint64_t line_no) {
     char c; std::string unitig; uint32_t pos; char strand; std::string rname;
     uint32_t rstart, rend;
     ss >> c >> unitig >> pos >> strand >> rname >> rstart >> rend;
@@ -718,8 +736,11 @@ bool GfaGraph::parseALine(std::stringstream& ss) {
 
     auto it = name_to_id_map_.find(unitig);
     if (it == name_to_id_map_.end()) {
-        warning_stream() << "  ! A-line refers undefined unitig '" << unitig << "'\n";
-        return false;
+        error_stream() << "Invalid A-line: alignment references an undefined segment\n";
+        error_stream() << "  - File: " << filename << ":" << line_no << "\n";
+        error_stream() << "  - Read: " << rname << "\n";
+        error_stream() << "  - Segment: " << unitig << "\n";
+        std::exit(1);
     }
     GfaAlignment a;
     a.unitig_node_id = it->second;
@@ -1037,10 +1058,11 @@ std::vector<const GfaArc*> GfaGraph::getArcsToVertex(uint32_t v, bool skip_self)
 std::vector<std::vector<uint32_t>> GfaGraph::enumerate_paths_greedy_DFS(
     const uint32_t src, const uint32_t sink, const std::unordered_set<uint32_t>& region_set,
     const uint32_t max_depth, const uint32_t max_paths,
-    const bool skip_comp, bool& hit_limits, const uint64_t DFS_guard, const uint32_t stall_round_limit
+    const bool skip_comp, bool& hit_limits, const uint64_t DFS_guard, const uint32_t stall_round_limit,
+    const uint32_t required_sample
 ) const {
     GfaWalker walker(*this);
-    return walker.enumerate_paths_greedy_DFS(src, sink, region_set, max_depth, max_paths, skip_comp, hit_limits, DFS_guard, stall_round_limit);
+    return walker.enumerate_paths_greedy_DFS(src, sink, region_set, max_depth, max_paths, skip_comp, hit_limits, DFS_guard, stall_round_limit, required_sample);
 };
 
 std::vector<std::vector<uint32_t>> GfaGraph::open_walk(
@@ -1050,10 +1072,11 @@ std::vector<std::vector<uint32_t>> GfaGraph::open_walk(
     const bool skip_comp,
     const uint64_t DFS_guard,
     const uint64_t walk_bp,
-    const std::unordered_set<uint32_t>* blocked_seg
+    const std::unordered_set<uint32_t>* blocked_seg,
+    const uint32_t required_sample
 ) const {
     GfaWalker walker(*this);
-    return walker.open_walk(src, region_set, max_depth, skip_comp, DFS_guard, walk_bp, blocked_seg);
+    return walker.open_walk(src, region_set, max_depth, skip_comp, DFS_guard, walk_bp, blocked_seg, required_sample);
 }
 
 

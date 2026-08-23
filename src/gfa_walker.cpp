@@ -2,12 +2,43 @@
 #include "../include/gfa_walker_logger.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <queue>
+#include <string_view>
 
 
 static inline uint64_t edge_key(uint32_t a, uint32_t b) {
     return (uint64_t(a) << 32) | uint64_t(b);
+}
+
+static bool vertex_has_sample(const GfaGraph& graph, uint32_t vertex, uint32_t sample) {
+    if (sample == UINT32_MAX) return true;
+    const auto& samples = graph.getNodeSampleIds(NodeHandle::get_segment_id(vertex));
+    return std::binary_search(samples.begin(), samples.end(), sample);
+}
+
+static bool is_component_path(std::string_view name) {
+    constexpr std::string_view component = "component";
+
+    if (name.starts_with(component)) {
+        const size_t first = component.size();
+        if (first < name.size() &&
+            std::all_of(name.begin() + first, name.end(), [](unsigned char c) {
+                return std::isdigit(c);
+            })) {
+            return true;
+        }
+    }
+
+    const size_t marker = name.rfind(".component");
+    if (marker == std::string_view::npos) return false;
+
+    const size_t first = marker + component.size() + 1;
+    return first < name.size() &&
+        std::all_of(name.begin() + first, name.end(), [](unsigned char c) {
+            return std::isdigit(c);
+        });
 }
 
 
@@ -84,6 +115,7 @@ GreedyDfsContext::GreedyDfsContext(
     uint32_t sink,
     const std::unordered_set<uint32_t>& region_set,
     bool skip_comp,
+    uint32_t required_sample,
     const GfaWalkerLogger& log
 )
     : graph_(graph),
@@ -91,7 +123,8 @@ GreedyDfsContext::GreedyDfsContext(
       src_(src),
       sink_(sink),
       region_set_(region_set),
-      skip_comp_(skip_comp)
+      skip_comp_(skip_comp),
+      required_sample_(required_sample)
 {
     const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
 
@@ -149,6 +182,7 @@ void GreedyDfsContext::build_sink_reachable_() {
 
             const uint32_t sid = NodeHandle::get_segment_id(u);
             if (graph_.getNodeDeleted(sid)) continue;
+            if (!vertex_has_sample(graph_, u, required_sample_)) continue;
 
             if (sink_reachable_.insert(u).second) {
                 q.push(u);
@@ -171,6 +205,7 @@ std::string GreedyDfsContext::reject_reason(uint32_t from, uint32_t w, const std
 
     const uint32_t sid = NodeHandle::get_segment_id(w);
     if (graph_.getNodeDeleted(sid)) return "deleted-node";
+    if (!vertex_has_sample(graph_, w, required_sample_)) return "different-sample";
     if (on_path_seg.find(sid) != on_path_seg.end()) return "cycle-on-path";
 
     return "";
@@ -317,21 +352,23 @@ std::vector<std::vector<uint32_t>> GfaWalker::enumerate_paths_greedy_DFS(
     bool skip_comp,
     bool& hit_limits,
     uint64_t DFS_guard,
-    uint32_t stall_round_limit
+    uint32_t stall_round_limit,
+    uint32_t required_sample
 ) const {
     std::vector<std::vector<uint32_t>> out;
     hit_limits = false;
+
+    const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
+    if (V == 0 || src >= V || sink >= V) return out;
+    if (!vertex_has_sample(graph_, src, required_sample) || !vertex_has_sample(graph_, sink, required_sample)) return out;
 
     if (src == sink) {
         out.push_back({src});
         return out;
     }
 
-    const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
-    if (V == 0 || src >= V || sink >= V) return out;
-
     GfaWalkerLogger log(graph_);
-    GreedyDfsContext ctx(graph_, src, sink, region_set, skip_comp, log);
+    GreedyDfsContext ctx(graph_, src, sink, region_set, skip_comp, required_sample, log);
 
     log.greedy_header(
         src,
@@ -506,12 +543,14 @@ std::vector<std::vector<uint32_t>> GfaWalker::open_walk(
     bool skip_comp,
     uint64_t DFS_guard,
     uint64_t walk_bp,
-    const std::unordered_set<uint32_t>* blocked_seg
+    const std::unordered_set<uint32_t>* blocked_seg,
+    uint32_t required_sample
 ) const {
     std::vector<std::vector<uint32_t>> out;
 
     const uint64_t V = graph_.getNumNodes() * 2;
     if (V == 0 || src >= V || walk_bp == 0) return out;
+    if (!vertex_has_sample(graph_, src, required_sample)) return out;
 
     const uint32_t depth_limit = max_depth == 0 ? static_cast<uint32_t>(std::min<uint64_t>(V, UINT32_MAX)) : max_depth;
 
@@ -553,6 +592,7 @@ std::vector<std::vector<uint32_t>> GfaWalker::open_walk(
 
             const uint32_t sid = NodeHandle::get_segment_id(next);
             if (sid == from_sid || graph_.getNodeDeleted(sid) || used_seg.count(sid)) continue;
+            if (!vertex_has_sample(graph_, next, required_sample)) continue;
 
             return true;
         }
@@ -585,6 +625,7 @@ std::vector<std::vector<uint32_t>> GfaWalker::open_walk(
 
             const uint32_t sid = NodeHandle::get_segment_id(next);
             if (graph_.getNodeDeleted(sid) || used_seg.count(sid)) continue;
+            if (!vertex_has_sample(graph_, next, required_sample)) continue;
 
             const uint32_t len = graph_.getNodeLength(sid);
             const bool dead_end = !has_continuation(next, guard_hit);
@@ -634,6 +675,232 @@ std::vector<std::vector<uint32_t>> GfaWalker::open_walk(
 }
 /* ================================================================================================================
  *                                            GFA WALKER END
+ * ================================================================================================================ */
+
+
+/* ================================================================================================================
+ *                                           P-PATH WALKER START
+ * ================================================================================================================ */
+GfaPathWalker::GfaPathWalker(const GfaGraph& graph)
+    : graph_(graph)
+{
+    const auto& paths = graph_.getPaths();
+    const size_t node_count = graph_.getNumNodes();
+    if (paths.empty()) return;
+
+    const bool have_contig_path = std::any_of(paths.begin(), paths.end(), [](const GfaPath& path) {
+        return !path.segments.empty() && path.segments.size() <= UINT32_MAX &&
+            !is_component_path(path.name);
+    });
+    if (!have_contig_path) return;
+
+    offsets_.assign(node_count + 1, 0);
+
+    // Component paths are generated backbones, not original contigs.
+    for (const GfaPath& path : paths) {
+        if (is_component_path(path.name) || path.segments.size() > UINT32_MAX) continue;
+        for (const PathSegment& segment : path.segments) {
+            if (segment.node_id < node_count) ++offsets_[segment.node_id + 1];
+        }
+    }
+    for (size_t i = 1; i < offsets_.size(); ++i) offsets_[i] += offsets_[i - 1];
+
+    positions_.resize(offsets_.back());
+    std::vector<uint64_t> next = offsets_;
+
+    for (size_t path_id = 0; path_id < paths.size(); ++path_id) {
+        const GfaPath& path = paths[path_id];
+        if (is_component_path(path.name) || path.segments.size() > UINT32_MAX) continue;
+
+        for (size_t position = 0; position < path.segments.size(); ++position) {
+            const uint64_t segment = path.segments[position].node_id;
+            if (segment >= node_count) continue;
+            positions_[next[segment]++] = {
+                static_cast<uint32_t>(path_id),
+                static_cast<uint32_t>(position)
+            };
+        }
+    }
+}
+
+uint32_t GfaPathWalker::vertex_at_(const Cursor& cursor) const
+{
+    const auto& paths = graph_.getPaths();
+    if (!cursor.valid() || cursor.path_id >= paths.size()) return UINT32_MAX;
+
+    const GfaPath& path = paths[cursor.path_id];
+    if (cursor.position >= path.segments.size()) return UINT32_MAX;
+
+    const PathSegment& segment = path.segments[cursor.position];
+    if (segment.node_id > UINT32_MAX / 2) return UINT32_MAX;
+
+    const uint32_t vertex = Vertex::make_vertex(
+        static_cast<uint32_t>(segment.node_id), segment.is_reverse
+    );
+    return cursor.reverse ? vertex ^ 1u : vertex;
+}
+
+bool GfaPathWalker::advance_(Cursor& cursor) const
+{
+    if (!cursor.valid() || cursor.path_id >= graph_.getPaths().size()) return false;
+    const size_t path_size = graph_.getPaths()[cursor.path_id].segments.size();
+
+    if (!cursor.reverse) {
+        if (cursor.position + 1 >= path_size) return false;
+        ++cursor.position;
+    } else {
+        if (cursor.position == 0) return false;
+        --cursor.position;
+    }
+    return true;
+}
+
+bool GfaPathWalker::valid_step_(uint32_t from, uint32_t to) const
+{
+    for (const GfaArc* arc : graph_.getArcsFromVertex(from)) {
+        if (arc && !arc->get_del() && arc->get_target_vertex_id() == to) return true;
+    }
+    return false;
+}
+
+std::vector<GfaPathWalker::Cursor> GfaPathWalker::locate(uint32_t vertex) const
+{
+    std::vector<Cursor> out;
+    const uint32_t segment = Vertex::get_segment_id(vertex);
+    if (segment + 1 >= offsets_.size()) return out;
+
+    out.reserve(offsets_[segment + 1] - offsets_[segment]);
+    for (uint64_t i = offsets_[segment]; i < offsets_[segment + 1]; ++i) {
+        Cursor cursor{positions_[i].path_id, positions_[i].position, false};
+        const uint32_t stored = vertex_at_(cursor);
+        if (stored == UINT32_MAX) continue;
+        cursor.reverse = stored != vertex;
+        if (vertex_at_(cursor) == vertex) out.push_back(cursor);
+    }
+    return out;
+}
+
+bool GfaPathWalker::preceded_by(const Cursor& cursor, uint32_t vertex) const
+{
+    Cursor previous = cursor;
+    previous.reverse = !previous.reverse;
+    if (!advance_(previous)) return false;
+    previous.reverse = cursor.reverse;
+    return vertex_at_(previous) == vertex;
+}
+
+bool GfaPathWalker::next(Cursor& cursor, uint32_t& vertex) const
+{
+    if (!advance_(cursor)) return false;
+    vertex = vertex_at_(cursor);
+    return vertex != UINT32_MAX;
+}
+
+std::vector<std::vector<uint32_t>> GfaPathWalker::paths_between(
+    uint32_t source,
+    uint32_t sink,
+    uint32_t max_paths
+) const {
+    const std::vector<Cursor> sources = locate(source);
+    std::vector<Cursor> sinks = locate(sink);
+    if (sources.empty() || sinks.empty()) return {};
+
+    if (source == sink) return {{source}};
+
+    auto cursor_less = [](const Cursor& a, const Cursor& b) {
+        if (a.path_id != b.path_id) return a.path_id < b.path_id;
+        if (a.reverse != b.reverse) return a.reverse < b.reverse;
+        return a.position < b.position;
+    };
+    std::sort(sinks.begin(), sinks.end(), cursor_less);
+
+    std::vector<std::vector<uint32_t>> out;
+    out.reserve(std::min<size_t>(sources.size(), max_paths > 0 ? max_paths : sources.size()));
+
+    for (Cursor cursor : sources) {
+        Cursor key{cursor.path_id, 0, cursor.reverse};
+        auto first = std::lower_bound(sinks.begin(), sinks.end(), key, cursor_less);
+
+        key.position = UINT32_MAX;
+        auto last = std::upper_bound(sinks.begin(), sinks.end(), key, cursor_less);
+        if (first == last) continue;
+
+        auto target = last;
+        if (!cursor.reverse) {
+            target = std::upper_bound(
+                first, last, cursor.position,
+                [](uint32_t position, const Cursor& item) {
+                    return position < item.position;
+                }
+            );
+            if (target == last) continue;
+        } else {
+            target = std::lower_bound(
+                first, last, cursor.position,
+                [](const Cursor& item, uint32_t position) {
+                    return item.position < position;
+                }
+            );
+            if (target == first) continue;
+            --target;
+        }
+
+        std::vector<uint32_t> path{source};
+        bool valid = true;
+        while (cursor.position != target->position) {
+            uint32_t vertex = UINT32_MAX;
+            if (!next(cursor, vertex) || graph_.getNodeDeleted(Vertex::get_segment_id(vertex))) {
+                valid = false;
+                break;
+            }
+            if (!valid_step_(path.back(), vertex)) {
+                valid = false;
+                break;
+            }
+            path.push_back(vertex);
+        }
+
+        if (!valid || path.back() != sink) continue;
+        if (std::find(out.begin(), out.end(), path) != out.end()) continue;
+
+        out.push_back(std::move(path));
+        if (max_paths > 0 && out.size() >= max_paths) break;
+    }
+    return out;
+}
+
+std::vector<uint32_t> GfaPathWalker::extend(Cursor& cursor, uint64_t walk_bp) const
+{
+    const uint32_t source = vertex_at_(cursor);
+    if (source == UINT32_MAX || walk_bp == 0) return {};
+
+    std::vector<uint32_t> path{source};
+    uint64_t added_bp = 0;
+
+    while (true) {
+        Cursor next = cursor;
+        if (!advance_(next)) break;
+
+        const uint32_t vertex = vertex_at_(next);
+        if (vertex == UINT32_MAX) break;
+
+        const uint32_t segment = Vertex::get_segment_id(vertex);
+        if (graph_.getNodeDeleted(segment)) break;
+        if (!valid_step_(path.back(), vertex)) break;
+
+        const uint32_t length = graph_.getNodeLength(segment);
+        const uint32_t overlap = graph_.get_edge_ow(path.back(), vertex);
+        added_bp += length - std::min(length, overlap);
+
+        cursor = next;
+        path.push_back(vertex);
+        if (added_bp >= walk_bp) break;
+    }
+
+    return path;
+}
+/* ================================================================================================================
+ *                                            P-PATH WALKER END
  * ================================================================================================================ */
 
 

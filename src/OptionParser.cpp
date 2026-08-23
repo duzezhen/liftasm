@@ -1,9 +1,9 @@
 #include "../include/OptionParser.hpp"
 #include "../include/OptionParser_helper.hpp"
+#include "../include/CollapseConfig.hpp"
 #include "../include/ProgramMetadata.hpp"
 #include "../include/logger.hpp"
 #include "../include/get_time.hpp"
-#include "../include/GZ_chunk_reader.hpp"
 
 #include <getopt.h>
 #include <cerrno>
@@ -15,22 +15,7 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
-
-static bool gfa_has_sample_tags_(const std::string& filename) {
-    GzChunkReader reader(filename);
-    std::string line;
-    while (reader.readLine(line)) {
-        if (line.empty()) continue;
-        if (line[0] == 'H' && line.find("\tSP:Z:present") != std::string::npos) return true;
-        if (line[0] == 'S') return line.find("\tSN:Z:") != std::string::npos;
-    }
-    return false;
-}
-
-static bool all_gfas_have_sample_tags_(const std::vector<std::string>& filenames) {
-    return std::all_of(filenames.begin(), filenames.end(), gfa_has_sample_tags_);
-}
-
+#include <utility>
 
 static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
     using std::left;
@@ -304,24 +289,20 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
 
         case ToolMode::collapse:
             ensure(
-                !cfg.collapse.gfaFiles.empty() || !cfg.collapse.hap1Files.empty(),
-                "either -g/--gfa or --c1/--c2 is required"
-            );
-            ensure(
-                cfg.collapse.gfaFiles.empty() || cfg.collapse.hap1Files.empty(),
-                "-g/--gfa and --c1/--c2 are mutually exclusive"
+                !cfg.collapse.configFile.empty(),
+                "-i/--input is required"
             );
             ensure(
                 cfg.collapse.hap1Files.size() == cfg.collapse.hap2Files.size(),
-                "--c1 and --c2 must have the same number of files"
+                "invalid CTG input: haplotype file counts differ"
             );
             ensure(
                 cfg.collapse.vcfFiles.empty() || !cfg.collapse.hap1Files.empty(),
-                "-v/--vcf is only supported with --c1/--c2"
+                "VCF input is only supported in CTG mode"
             );
             ensure(
                 cfg.collapse.vcfFiles.empty() || cfg.collapse.vcfFiles.size() == cfg.collapse.hap1Files.size(),
-                "-v/--vcf must provide one file for each --c1/--c2 sample"
+                "invalid CTG input: VCF and sample counts differ"
             );
             ensure(
                 cfg.collapse.ctg_anchor_coverage >= 0.0 && cfg.collapse.ctg_anchor_coverage <= 1.0,
@@ -337,15 +318,15 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
             );
             ensure(
                 !cfg.collapse.ctg_anchor_only || !cfg.collapse.hap1Files.empty(),
-                "--anchor_only is only supported with --c1/--c2"
+                "--anchor_only is only supported in CTG mode"
             );
             ensure(
                 cfg.collapse.hap1Files.empty() || cfg.collapse.gfaNames.size() == cfg.collapse.hap1Files.size(),
-                "-n/--name is required for --c1/--c2 and must match the number of samples"
+                "invalid CTG input: sample and GFA counts differ"
             );
             ensure(
-                !cfg.collapse.hap1Files.empty() || cfg.collapse.gfaNames.size() == cfg.collapse.gfaFiles.size() || (cfg.collapse.gfaNames.empty() && all_gfas_have_sample_tags_(cfg.collapse.gfaFiles)),
-                "-n/--name is required for input GFA files without sample tags"
+                !cfg.collapse.hap1Files.empty() || cfg.collapse.gfaNames.size() == cfg.collapse.gfaFiles.size(),
+                "invalid UTG input: sample and GFA counts differ"
             );
             ensure(
                 !cfg.collapse.prefix.empty(), 
@@ -1839,20 +1820,18 @@ void help_collapse(char** argv, bool advanced) {
     HelpPrinter hp(std::cerr, 20, 20);
 
     std::cerr
-        << "Usage: " << argv[0] << " " << argv[1] << " (-g FILE ... | --c1 FILE ... --c2 FILE ...) [options]\n\n"
+        << "Usage: " << argv[0] << " collapse -i FILE [options]\n\n"
         << "De-overlap (if needed) and collapse homologous sequences in GFA into single nodes\n";
 
     hp.blank();
 
     hp.section("Input/Output");
-    hp.line("-g, --gfa", "FILE ...", "input GFA file(s) (overlap or no-overlap)");
-    hp.line("--c1", "FILE ...", "haplotype-1 contig GFA file(s) with read A-lines");
-    hp.line("--c2", "FILE ...", "haplotype-2 contig GFA file(s), paired with --c1");
-    hp.line("-v, --vcf", "FILE ...", "VCF file(s) added during haplotype contig collapse");
-    hp.line("-n, --name", "STR ...", "sample names; required for --c1/--c2 and GFA files without sample tags");
+    hp.line("-i, --input", "FILE", "header-driven, whitespace-delimited sample/GFA table");
+    hp.note(" * UTG config: sample  gfa");
+    hp.note(" * CTG config: sample  hap1_gfa  hap2_gfa  [vcf]");
     hp.line("-p, --prefix", "STR", "output prefix [" + CollapseOpts().prefix + "]");
-    hp.note(" * -g: <prefix>.iterN.collapse.{gfa,noseq.gfa,map}");
-    hp.note(" * --c1/--c2: <prefix>.<name>.collapse.{gfa,noseq.gfa,map} and <prefix>.iterN.collapse.{gfa,noseq.gfa,map}");
+    hp.note(" * UTG: <prefix>.iterN.collapse.{gfa,noseq.gfa,map}");
+    hp.note(" * CTG: <prefix>.<sample>.collapse.{gfa,noseq.gfa,map} and <prefix>.iterN.collapse.{gfa,noseq.gfa,map}");
     hp.note(" * contig mode always writes filtered and raw component alignments as *.paf and *.all.paf");
 
     hp.blank();
@@ -1901,7 +1880,7 @@ void help_collapse(char** argv, bool advanced) {
     
     hp.section("Bubble Detection Options");
     hp.line("--depth", "INT", "maximum DFS depth for path exploration inside a bubble [" + format_size_arg_(BubbleOpts().max_depth) + "]");
-    hp.line("--paths", "INT", "maximum DFS paths per bubble; 0 = max(20, twice the -g/--c1 input count) [0]");
+    hp.line("--paths", "INT", "maximum DFS paths per bubble; 0 = max(20, twice the input sample count) [0]");
     if (advanced) {
         hp.line("--DFS_guard", "INT", "max DFS states [" + format_size_arg_(BubbleOpts().DFS_guard) + "]");
     }
@@ -1954,11 +1933,7 @@ AppConfig main_collapse(int argc, char** argv) {
     cfg.bubble.max_paths = 0;
 
     const struct option long_opts[] = {
-        {"gfa",             required_argument, nullptr, 'g'},
-        {"c1",              required_argument, nullptr, 0001},
-        {"c2",              required_argument, nullptr, 0002},
-        {"vcf",             required_argument, nullptr, 'v'},
-        {"name",            required_argument, nullptr, 'n'},
+        {"input",           required_argument, nullptr, 'i'},
         {"prefix",          required_argument, nullptr, 'p'},
 
         {"kmer",            required_argument, nullptr, 'k'},
@@ -2018,40 +1993,17 @@ AppConfig main_collapse(int argc, char** argv) {
         {"advanced",        no_argument,       nullptr, 'H'},
         {0,0,0,0}
     };
-    const char* short_opts = "g:v:n:p:k:w:x:z:t:dhH";
+    const char* short_opts = "i:p:k:w:x:z:t:dhH";
 
     int idx = 0, c;
     while ((c = getopt_long(argc, argv, short_opts, long_opts, &idx)) != -1) {
         switch (c) {
-            case 'g': {
-                cfg.collapse.gfaFiles.emplace_back(optarg);
-                while (optind < argc && !is_flag_(argv[optind])) {
-                    cfg.collapse.gfaFiles.emplace_back(argv[optind]);
-                    ++optind;
+            case 'i': {
+                if (!cfg.collapse.configFile.empty()) {
+                    error_stream() << "-i/--input may be specified only once\n";
+                    std::exit(1);
                 }
-                break;
-            }
-            case 0001: {
-                cfg.collapse.hap1Files.emplace_back(optarg);
-                while (optind < argc && !is_flag_(argv[optind])) cfg.collapse.hap1Files.emplace_back(argv[optind++]);
-                break;
-            }
-            case 0002: {
-                cfg.collapse.hap2Files.emplace_back(optarg);
-                while (optind < argc && !is_flag_(argv[optind])) cfg.collapse.hap2Files.emplace_back(argv[optind++]);
-                break;
-            }
-            case 'v': {
-                cfg.collapse.vcfFiles.emplace_back(optarg);
-                while (optind < argc && !is_flag_(argv[optind])) cfg.collapse.vcfFiles.emplace_back(argv[optind++]);
-                break;
-            }
-            case 'n': {
-                cfg.collapse.gfaNames.emplace_back(optarg);
-                while (optind < argc && !is_flag_(argv[optind])) {
-                    cfg.collapse.gfaNames.emplace_back(argv[optind]);
-                    ++optind;
-                }
+                cfg.collapse.configFile = optarg;
                 break;
             }
             case 'p': {
@@ -2287,6 +2239,15 @@ AppConfig main_collapse(int argc, char** argv) {
                 std::exit(1);
             }
         }
+    }
+
+    if (!cfg.collapse.configFile.empty()) {
+        CollapseConfig input = parse_collapse_config(cfg.collapse.configFile);
+        cfg.collapse.gfaNames = std::move(input.sampleNames);
+        cfg.collapse.gfaFiles = std::move(input.gfaFiles);
+        cfg.collapse.hap1Files = std::move(input.hap1Files);
+        cfg.collapse.hap2Files = std::move(input.hap2Files);
+        cfg.collapse.vcfFiles = std::move(input.vcfFiles);
     }
 
     if (cfg.bubble.max_paths == 0) {

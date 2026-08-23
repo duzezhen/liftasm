@@ -165,6 +165,7 @@ struct HomologousPath {
     double min_hi_similarity = 0.0;
     double max_hi_similarity = 0.0;
     Type type = Type::SameSource;  // "SameSource" or "DiffSource"
+    bool path_guided = false;      // paths were walked directly from contig P-lines
 
     const std::vector<std::vector<Vertex>>& get_paths() const noexcept { return paths; }
     const std::vector<uint32_t>& get_path_clusters() const noexcept { return path_clusters; }
