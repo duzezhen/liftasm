@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.3-r25 (2026-08-23)
+
+### Changed
+
+- `collapse` now reads UTG/CTG inputs and optional VCFs from a header-driven configuration table.
+
+### Improved
+
+- Improved P-line/SN-aware bubble and homologous-path enumeration.
+- Added clear errors for undefined segments referenced by GFA P/L/A lines.
+
 ## v0.1.3-r24 (2026-08-20)
 
 ### Fixed
