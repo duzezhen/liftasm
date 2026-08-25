@@ -155,6 +155,24 @@ set(HTS_SRC "${EXTERNAL_DIR}/htslib")
 set(HTS_BUILD "${EXTERNAL_BUILD_DIR}/htslib-${HTS_CURL_MODE}")
 set(HTS_LIB "${HTS_BUILD}/libhts.a")
 
+set(HTSCODECS_CONFIGURE_AC "${HTS_SRC}/htscodecs/configure.ac")
+file(STRINGS "${HTSCODECS_CONFIGURE_AC}" HTSCODECS_AC_INIT
+  LIMIT_COUNT 1
+  REGEX "^AC_INIT\\(htscodecs,"
+)
+string(REGEX MATCH "[0-9]+(\\.[0-9]+)+" HTSCODECS_VERSION "${HTSCODECS_AC_INIT}")
+if (NOT HTSCODECS_VERSION)
+  message(FATAL_ERROR "Failed to read the htscodecs version from ${HTSCODECS_CONFIGURE_AC}")
+endif()
+set(HTSCODECS_VERSION_HEADER "${CMAKE_BINARY_DIR}/generated/htscodecs_version.h")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
+file(CONFIGURE
+  OUTPUT "${HTSCODECS_VERSION_HEADER}"
+  CONTENT "#define HTSCODECS_VERSION_TEXT \"${HTSCODECS_VERSION}\"\n"
+  @ONLY
+)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${HTSCODECS_CONFIGURE_AC}")
+
 set(HTS_CURL_CONFIG_COMMAND)
 if (NOT LIFTASM_HAVE_CURL)
   list(APPEND HTS_CURL_CONFIG_COMMAND
@@ -168,12 +186,15 @@ add_custom_command(
   COMMAND ${CMAKE_COMMAND} -E copy_directory "${HTS_SRC}" "${HTS_BUILD}"
   COMMAND ${CMAKE_COMMAND} -E rm -f "${HTS_BUILD}/.git" "${HTS_BUILD}/htscodecs/.git"
   COMMAND ${CMAKE_MAKE_PROGRAM} -C "${HTS_BUILD}" distclean
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${HTSCODECS_VERSION_HEADER}" "${HTS_BUILD}/htscodecs/htscodecs/version.h"
   COMMAND ${CMAKE_MAKE_PROGRAM} -C "${HTS_BUILD}" config.h
   ${HTS_CURL_CONFIG_COMMAND}
   COMMAND ${CMAKE_MAKE_PROGRAM} -C "${HTS_BUILD}" -j ${LIFTASM_JOBS}
     "NONCONFIGURE_OBJS=${HTS_CURL_OBJECTS}"
     "htslib_default_libs=${HTS_DEFAULT_LIBS}"
     libhts.a
+  DEPENDS "${HTSCODECS_VERSION_HEADER}"
   COMMENT "Building htslib (libhts.a, ${HTS_CURL_MODE})"
   VERBATIM
 )
