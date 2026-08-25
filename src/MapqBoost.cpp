@@ -238,20 +238,20 @@ static inline double query_overlap_frac(uint32_t b1, uint32_t e1, uint32_t b2, u
     return den ? (double)ov / (double)den : 0.0;
 }
 
+static MapqBoostOpts normalize_params(MapqBoostOpts params)
+{
+    if (params.batch_size == 0) params.batch_size = 20'000;
+    if (params.threads <= 0) params.threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    params.io_threads = std::max(1, params.io_threads);
+    return params;
+}
+
 MapqBooster::MapqBooster(
-    const coordmap::CoordMap& coormap_idx, const rsite::Index& rsite_idx,
-    std::size_t batch_size, uint8_t mapq_low, uint8_t mapq_cap, bool name_check, 
-    int cm_max_hops, uint32_t cm_max_fanout, uint32_t cm_min_len, double cm_min_frac, uint32_t cm_max_total_hits, 
-    double sub_ovlp_frac,
-    double K_mapq, double K_rs, double K_as, double K_ml, double K_nm, double W_mapq, double W_rs, double W_as, double W_ml, double W_nm, double close_as_eps,
-    int threads, int io_threads
+    const coordmap::CoordMap& coormap_idx,
+    const rsite::Index& rsite_idx,
+    MapqBoostOpts params
 )
-    : coormap_idx_(coormap_idx), rsite_idx_(rsite_idx)
-    , batch_size_(batch_size >= 1 ? batch_size : 20000), mapq_low_(mapq_low), mapq_cap_(mapq_cap), name_check_(name_check)
-    , cm_max_hops_(cm_max_hops), cm_max_fanout_(cm_max_fanout), cm_min_len_(cm_min_len), cm_min_frac_(cm_min_frac), cm_max_total_hits_(cm_max_total_hits)
-    , sub_ovlp_frac_(sub_ovlp_frac)
-    , K_mapq_(K_mapq), K_rs_(K_rs), K_as_(K_as), K_ml_(K_ml), K_nm_(K_nm), W_mapq_(W_mapq), W_rs_(W_rs), W_as_(W_as), W_ml_(W_ml), W_nm_(W_nm), close_as_eps_(close_as_eps)
-    , threads_((threads <= 0) ? (int)std::max(1u, std::thread::hardware_concurrency()) : threads) , io_threads_(std::max(1, io_threads))
+    : coormap_idx_(coormap_idx), rsite_idx_(rsite_idx), params_(normalize_params(std::move(params)))
 {}
 
 // Score formula:
@@ -273,7 +273,7 @@ MapqBooster::MapqBooster(
 //   rs_good = 0.7 / (1 + closer/K_rs) + 0.3 / (1 + dvd/K_rs)
 //
 static inline double score_formula(
-    const SubRec& r, const sam_hdr_t* hdr, 
+    const SubRec& r, const sam_hdr_t* hdr,
     const double K_mapq, const double K_rs, const double K_as, const double K_ml, const double K_nm,
     const double W_mapq, const double W_rs, const double W_as, const double W_ml, const double W_nm
 ) {
@@ -311,7 +311,7 @@ static inline double score_formula(
 
 void MapqBooster::build_subgroups_by_query_overlap(
     const std::vector<bam1_t*>& group,
-    std::vector<Subgroup>& out_subgroups, 
+    std::vector<Subgroup>& out_subgroups,
     const sam_hdr_t* hdr
 ) const
 {
@@ -373,7 +373,7 @@ void MapqBooster::build_subgroups_by_query_overlap(
             r.ml = CIGAR::match_len(bam_cigar_data(b), bam_cigar_size(b));
 
             r.primary_like = is_primary_like(b);
-            
+
             // restriction sites
             if (r.tid >= 0 && r.rend > r.rbeg) {
                 const char* chr = sam_hdr_tid2name(const_cast<sam_hdr_t*>(hdr), r.tid);
@@ -394,7 +394,7 @@ void MapqBooster::build_subgroups_by_query_overlap(
                 }
             }
 
-            r.score = score_formula(r, hdr, K_mapq_, K_rs_, K_as_, K_ml_, K_nm_, W_mapq_, W_rs_, W_as_, W_ml_, W_nm_);
+            r.score = score_formula(r, hdr, params_.K_mapq, params_.K_rs, params_.K_as, params_.K_ml, params_.K_nm, params_.W_mapq, params_.W_rs, params_.W_as, params_.W_ml, params_.W_nm);
 
             return r;
         };
@@ -413,9 +413,9 @@ void MapqBooster::build_subgroups_by_query_overlap(
 
             if (items[j].qbeg >= sub_end) break;
 
-            if (sub_ovlp_frac_ > 0.0) {
+            if (params_.sub_ovlp_frac > 0.0) {
                 const double f = query_overlap_frac(sub_beg, sub_end, items[j].qbeg, items[j].qend);
-                if (f < sub_ovlp_frac_) continue;
+                if (f < params_.sub_ovlp_frac) continue;
             }
 
             used[j] = 1;
@@ -508,7 +508,7 @@ bool MapqBooster::should_boost_with_XA_(SubRec& cand, const sam_hdr_t* hdr) cons
     const bam1_t* b = cand.b;
     if (!b || !hdr) return false;
 
-    if (cand.mapq > mapq_low_) return false;
+    if (cand.mapq > params_.mapq_low) return false;
 
     const uint8_t* xa = bam_aux_get(b, "XA");
     if (!xa || bam_aux_type(xa) != 'Z') return false;
@@ -526,7 +526,7 @@ bool MapqBooster::should_boost_with_XA_(SubRec& cand, const sam_hdr_t* hdr) cons
 
     std::unordered_map<std::string, std::vector<std::pair<uint32_t,uint32_t>>> eq;
     eq.reserve(16);
-    lift_blocks_to_eq(coormap_idx_, r_pri, pri_blocks, cm_max_hops_, cm_max_fanout_, cm_min_len_, cm_min_frac_, cm_max_total_hits_, eq);
+    lift_blocks_to_eq(coormap_idx_, r_pri, pri_blocks, params_.cm_max_hops, params_.cm_max_fanout, params_.cm_min_len, params_.cm_min_frac, params_.cm_max_total_hits, eq);
     merge_eq_inplace(eq);
 
     const char* p = bam_aux2Z(xa);
@@ -598,7 +598,7 @@ bool MapqBooster::should_boost_from_group_(Subgroup& sub, const sam_hdr_t* hdr) 
     SubRec& cand = sub.recs[0];
     const bam1_t* b = cand.b;
     if (!b || !is_mapped(b)) return false;
-    if (cand.mapq > mapq_low_) return false;
+    if (cand.mapq > params_.mapq_low) return false;
 
     const uint8_t* xa = bam_aux_get(b, "XA");
     if (xa && bam_aux_type(xa) == 'Z') {
@@ -615,7 +615,7 @@ bool MapqBooster::should_boost_from_group_(Subgroup& sub, const sam_hdr_t* hdr) 
 
     std::unordered_map<std::string,std::vector<std::pair<uint32_t,uint32_t>>> eq;
     eq.reserve(16);
-    lift_blocks_to_eq(coormap_idx_, ref_c, cand_blocks, cm_max_hops_, cm_max_fanout_, cm_min_len_, cm_min_frac_, cm_max_total_hits_, eq);
+    lift_blocks_to_eq(coormap_idx_, ref_c, cand_blocks, params_.cm_max_hops, params_.cm_max_fanout, params_.cm_min_len, params_.cm_min_frac, params_.cm_max_total_hits, eq);
     merge_eq_inplace(eq);
 
     const int end_id_c = sub.end_id;
@@ -634,7 +634,7 @@ bool MapqBooster::should_boost_from_group_(Subgroup& sub, const sam_hdr_t* hdr) 
         const auto other_blocks = CIGAR::ref_blocks(r.rbeg, bam_cigar_data(o), bam_cigar_size(o));
         if (other_blocks.empty()) continue;
 
-        bool close_as = has_close_as(cand, r, close_as_eps_);  // 2026-03-22
+        bool close_as = has_close_as(cand, r, params_.close_as_eps);  // 2026-03-22
         if (close_as) cand.close_score_num++;   // 2026-03-22
 
         auto it = eq.find(std::string(r2));
@@ -691,7 +691,7 @@ void MapqBooster::process_group_(std::vector<bam1_t*>& group, const sam_hdr_t* h
         bam1_t* b = best.b;
 
         if (should_boost_from_group_(sub, hdr)) {
-            const uint8_t newq = recal_MAPQ(best, mapq_cap_);
+            const uint8_t newq = recal_MAPQ(best, params_.mapq_cap);
             if (newq != b->core.qual) {
                 b->core.qual = newq;
                 ++st_local.changed;
@@ -715,7 +715,7 @@ int MapqBooster::run(const std::string& in_path_, const std::string& out_path_) 
     htsFile* in_raw = sam_open(in_path.c_str(), "r");
     if (!in_raw) { error_stream() << in_path << ": No such file or directory\n"; std::exit(3); }
     std::unique_ptr<htsFile, void(*)(htsFile*)> in(in_raw, [](htsFile* f){ if (f) sam_close(f); });
-    hts_set_threads(in.get(), io_threads_);
+    hts_set_threads(in.get(), params_.io_threads);
 
     sam_hdr_t* hdr_raw = sam_hdr_read(in.get());
     if (!hdr_raw) { error_stream() << "Header read failed"; std::exit(3); }
@@ -726,7 +726,7 @@ int MapqBooster::run(const std::string& in_path_, const std::string& out_path_) 
     htsFile* out_raw = sam_open(out_path.c_str(), mode.c_str());
     if (!out_raw) { error_stream() << out_path << ": No such file or directory\n"; std::exit(3); }
     std::unique_ptr<htsFile, void(*)(htsFile*)> out(out_raw, [](htsFile* f){ if (f) sam_close(f); });
-    hts_set_threads(out.get(), io_threads_);
+    hts_set_threads(out.get(), params_.io_threads);
 
     if (sam_hdr_write(out.get(), hdr.get()) < 0) { error_stream() << "Header write failed"; std::exit(3); }
 
@@ -740,7 +740,7 @@ int MapqBooster::run(const std::string& in_path_, const std::string& out_path_) 
         g.recs.clear();
     };
 
-    const std::size_t B = std::max<std::size_t>(1, batch_size_);
+    const std::size_t B = std::max<std::size_t>(1, params_.batch_size);
     std::vector<Group> batch;
     batch.reserve(1024);
 
@@ -754,7 +754,7 @@ int MapqBooster::run(const std::string& in_path_, const std::string& out_path_) 
 
     std::size_t batch_records = 0;
 
-    const int T = std::max(1, threads_);
+    const int T = std::max(1, params_.threads);
     ThreadPool pool(T);
 
     auto flush_batch = [&]() -> bool {
@@ -809,7 +809,7 @@ int MapqBooster::run(const std::string& in_path_, const std::string& out_path_) 
         const std::string qn = qn_c ? std::string(qn_c) : std::string();
 
         // Auto-detect QNAME-sorted input
-        if (name_check_) {
+        if (params_.name_check) {
             if (has_last_name) {
                 if (qname_cmp(qn.c_str(), last_name.c_str()) < 0) {
                     error_stream() << "Input is not read-name sorted (QNAME not non-decreasing). Offending order: prev='" + last_name + "', curr='" + qn + "'. Please sort by name first, e.g.: samtools sort -n ...\n";

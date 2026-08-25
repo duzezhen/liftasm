@@ -1,5 +1,7 @@
 #pragma once
 
+#include "CommandOptions.hpp"
+
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -64,7 +66,7 @@ public:
 
     void clear();
 
-    void build(const std::string& fasta_path, const std::vector<std::string>& enzyme_specs, bool scan_revcomp, int threads);
+    void build(const ResSitOpts& params);
 
     size_t n_chrom() const;
     size_t n_enzyme() const;

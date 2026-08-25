@@ -25,22 +25,9 @@ static std::vector<uint32_t> common_samples(
     return out;
 }
 
-GfaBubbleFinder::GfaBubbleFinder(
-    const GfaGraph& g, uint32_t md, uint16_t mp, uint64_t dfs_guard, 
-        double path_diff, uint32_t stall_round_limit, bool sc, bool keep_nested,
-        double same_sim, uint32_t same_min_len,
-        uint32_t diff_min_src, double diff_sim, uint32_t diff_min_len, 
-        uint32_t homo_num, uint32_t homo_k, uint32_t homo_w, 
-        uint32_t homo_extend_bp, uint64_t homo_bloom_bits, uint32_t homo_bloom_hash, 
-        uint32_t thread
-    )
-    : thread_(thread), graph_(g), path_walker_(g),
-    max_depth_(md), max_paths_(mp), dfs_guard_(dfs_guard),
-    path_diff_(path_diff), stall_round_limit_(stall_round_limit), skip_comp_(sc), keep_nested_(keep_nested), 
-    same_sim_(same_sim), same_min_len_(same_min_len),
-    diff_min_src_(diff_min_src), diff_sim_(diff_sim), diff_min_len_(diff_min_len), homo_num_(std::max<uint32_t>(1, homo_num)),
-    homo_extend_bp_(homo_extend_bp), homo_bloom_bits_(homo_bloom_bits), homo_bloom_hash_(homo_bloom_hash),
-    mm_opt_{/*k=*/homo_k, /*w=*/homo_w, /*seek_reverse=*/false, /*seed=*/0x8a5cd789635d2dffULL}
+GfaBubbleFinder::GfaBubbleFinder(const GfaGraph& graph, BubbleOpts params)
+    : params_(std::move(params)), graph_(graph), path_walker_(graph),
+      mm_opt_{/*k=*/params_.homo_k, /*w=*/params_.homo_w, /*seek_reverse=*/false, /*seed=*/0x8a5cd789635d2dffULL}
 {}
 
 std::vector<uint32_t> GfaBubbleFinder::trim_path_cluster_anchors(const std::vector<uint32_t>& path, Type type) {
@@ -80,7 +67,7 @@ bool GfaBubbleFinder::is_strict_source_(Vertex vtx, std::vector<Vertex>& tgt) co
     std::unordered_set<uint32_t> seen_seg; seen_seg.reserve(8);
 
     for (const GfaArc* a : graph_.getArcsFromVertex(vtx.vertex_id())) {
-        if (!a || a->get_del() || (skip_comp_ && a->get_comp())) continue;
+        if (!a || a->get_del() || (params_.skip_comp && a->get_comp())) continue;
         Vertex w = Vertex(a->get_target_vertex_id());
         uint32_t seg = w.segment_id();
         if (!seen_seg.insert(seg).second) continue;
@@ -98,7 +85,7 @@ bool GfaBubbleFinder::is_strict_sink_(Vertex v, Vertex w) const {
             uint32_t next = UINT32_MAX;
             int fanout = 0;
             for (const GfaArc* a : graph_.getArcsFromVertex(u)) {
-                if (!a || a->get_del() || (skip_comp_ && a->get_comp())) continue;
+                if (!a || a->get_del() || (params_.skip_comp && a->get_comp())) continue;
                 uint32_t t = a->get_target_vertex_id();
                 if (t == u) continue;
                 if (++fanout > 1) return false;
@@ -114,7 +101,7 @@ bool GfaBubbleFinder::is_strict_sink_(Vertex v, Vertex w) const {
     constexpr int MAX_TUNNEL_STEPS = 4;
 
     for (const GfaArc* in : graph_.getArcsToVertex(w.vertex_id())) {
-        if (!in || in->get_del() || (skip_comp_ && in->get_comp())) continue;
+        if (!in || in->get_del() || (params_.skip_comp && in->get_comp())) continue;
         const uint32_t pv = in->get_source_vertex_id();
         if (pv == w.vertex_id() || pv == v.vertex_id()) continue;
 
@@ -122,7 +109,7 @@ bool GfaBubbleFinder::is_strict_sink_(Vertex v, Vertex w) const {
         bool all_funnel_to_w = true;
 
         for (const GfaArc* a : graph_.getArcsFromVertex(pv)) {
-            if (!a || a->get_del() || (skip_comp_ && a->get_comp())) continue;
+            if (!a || a->get_del() || (params_.skip_comp && a->get_comp())) continue;
             uint32_t x = a->get_target_vertex_id();
             if (x == pv) continue;
             ++outdeg;
@@ -198,7 +185,7 @@ void GfaBubbleFinder::find_bubbles()
     const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
     if (V == 0) return;
 
-    const uint64_t bfs_limit = static_cast<uint64_t>(std::min<std::size_t>(max_depth_ ? max_depth_ : 64, UINT64_MAX));
+    const uint64_t bfs_limit = static_cast<uint64_t>(std::min<std::size_t>(params_.max_depth ? params_.max_depth : 64, UINT64_MAX));
 
     // Closed bubbles from strict sources
     auto pair_key = [](uint32_t s0, uint32_t s1) -> uint64_t {
@@ -206,7 +193,7 @@ void GfaBubbleFinder::find_bubbles()
         return (static_cast<uint64_t>(s0) << 32) | static_cast<uint64_t>(s1);
     };
 
-    const unsigned threads = std::max(1u, thread_);
+    const unsigned threads = std::max(1u, params_.threads);
     ThreadPool pool(threads);
 
     std::vector<std::future<Bubble>> futs;
@@ -249,7 +236,7 @@ void GfaBubbleFinder::find_bubbles()
     log_stream() << "  - Total bubbles detected: " << bubbles_.size() << "\n" << "\n";
 
     // Post-processing
-    if (!keep_nested_) filter_nested_bubbles();
+    if (!params_.keep_nested) filter_nested_bubbles();
     else bubble_branch_pairs_ = build_bubble_branch_pairs_();
 
     std::sort(bubbles_.begin(), bubbles_.end(),
@@ -411,7 +398,7 @@ bool GfaBubbleFinder::find_common_nearest_sink_(
 
         const auto& arcs = graph_.getArcsFromVertex(cur);
         for (const GfaArc* a : arcs) {
-            if (!a || a->get_del() || (skip_comp_ && a->get_comp())) continue;
+            if (!a || a->get_del() || (params_.skip_comp && a->get_comp())) continue;
 
             const uint32_t nxt = a->get_target_vertex_id();
             if (nxt == cur) continue;
@@ -496,7 +483,7 @@ std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_bubble_paths_(
     // A real contig path is authoritative. Synthetic component paths are not indexed.
     if (!path_walker_.empty()) {
         std::vector<std::vector<uint32_t>> paths = path_walker_.paths_between(
-            source, sink, max_paths_
+            source, sink, params_.max_paths
         );
         if (paths.size() >= 2) return paths;
     }
@@ -505,7 +492,7 @@ std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_bubble_paths_(
     if (samples.empty()) {
         return graph_.enumerate_paths_greedy_DFS(
             source, sink, region_set, max_depth,
-            max_paths_, skip_comp_, hit_limits, dfs_guard_, stall_round_limit_
+            params_.max_paths, params_.skip_comp, hit_limits, params_.DFS_guard, params_.stall_round_limit
         );
     }
 
@@ -518,14 +505,14 @@ std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_bubble_paths_(
         bool sample_hit_limits = false;
         candidates.push_back(graph_.enumerate_paths_greedy_DFS(
             source, sink, region_set, max_depth,
-            max_paths_, skip_comp_, sample_hit_limits, dfs_guard_, stall_round_limit_, sample
+            params_.max_paths, params_.skip_comp, sample_hit_limits, params_.DFS_guard, params_.stall_round_limit, sample
         ));
         hit_limits = hit_limits || sample_hit_limits;
         rounds = std::max(rounds, candidates.back().size());
     }
 
     std::vector<std::vector<uint32_t>> paths;
-    paths.reserve(max_paths_);
+    paths.reserve(params_.max_paths);
 
     for (size_t rank = 0; rank < rounds; ++rank) {
         for (const auto& sample_paths : candidates) {
@@ -533,7 +520,7 @@ std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_bubble_paths_(
             if (std::find(paths.begin(), paths.end(), sample_paths[rank]) != paths.end()) continue;
 
             paths.push_back(sample_paths[rank]);
-            if (max_paths_ > 0 && paths.size() >= max_paths_) {
+            if (params_.max_paths > 0 && paths.size() >= params_.max_paths) {
                 return paths.size() >= 2 ? std::move(paths) : std::vector<std::vector<uint32_t>>{};
             }
         }
@@ -546,7 +533,7 @@ std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_bubble_paths_(
     bool legacy_hit_limits = false;
     std::vector<std::vector<uint32_t>> legacy = graph_.enumerate_paths_greedy_DFS(
         source, sink, region_set, max_depth,
-        max_paths_, skip_comp_, legacy_hit_limits, dfs_guard_, stall_round_limit_
+        params_.max_paths, params_.skip_comp, legacy_hit_limits, params_.DFS_guard, params_.stall_round_limit
     );
     hit_limits = hit_limits || legacy_hit_limits;
     return legacy;
@@ -636,7 +623,7 @@ Bubble GfaBubbleFinder::detect_closed_bubble_from_source_(Vertex v, uint64_t bfs
     }
 
     // 3. Use BFS sink depth to limit DFS depth
-    uint32_t eff_max_depth = max_depth_;
+    uint32_t eff_max_depth = params_.max_depth;
     if (local_nodes.size() > 0) {
         uint32_t limit = local_nodes.size() + DEPTH_MARGIN_;
         if (eff_max_depth == 0 || eff_max_depth > limit) {
@@ -905,7 +892,7 @@ void GfaBubbleFinder::find_forks()
     if (V == 0) return;
 
     // used to avoid duplicate forks
-    std::unordered_set<uint64_t> seen; 
+    std::unordered_set<uint64_t> seen;
     seen.reserve(1024);
 
     ProgressTracker prog(V);
@@ -917,7 +904,7 @@ void GfaBubbleFinder::find_forks()
         std::unordered_set<std::uint32_t> seen_sid; seen_sid.reserve(8);
 
         for (const GfaArc* a : graph_.getArcsFromVertex(v)) {
-            if (!a || a->get_del() || (skip_comp_ && a->get_comp())) continue;
+            if (!a || a->get_del() || (params_.skip_comp && a->get_comp())) continue;
             uint32_t w = a->get_target_vertex_id();
             if (w == v) continue;
 
@@ -973,7 +960,7 @@ std::vector<Vertex> GfaBubbleFinder::collect_sources_for_homo_() const
         if (graph_.getNodeDeleted(sid)) continue;
 
         const uint32_t len = graph_.getNodeLength(sid);
-        if (len >= diff_min_src_) {
+        if (len >= params_.diff_min_src) {
             sources.push_back(v);
         }
     }
@@ -998,7 +985,7 @@ std::vector<minimizerdna::Sketch> GfaBubbleFinder::build_source_mm_library_(
     const uint32_t V = static_cast<uint32_t>(graph_.getNumNodes() * 2);
     std::vector<minimizerdna::Sketch> node_sketches(V);
 
-    const unsigned threads = std::max(1u, thread_);
+    const unsigned threads = std::max(1u, params_.threads);
     ThreadPool pool(threads);
 
     std::vector<std::future<std::pair<uint32_t, minimizerdna::Sketch>>> futs;
@@ -1153,7 +1140,7 @@ std::vector<NodeGroupEntry> GfaBubbleFinder::cluster_sources_by_mm_(
         const SourceRef& a = refs[i];
         const auto& sketch_a = node_sketches[a.vtx.vertex_id()];
 
-        if (diff_sim_ <= 0.0) {
+        if (params_.diff_sim <= 0.0) {
             for (uint32_t j = i + 1; j < n; ++j) {
                 if (used[j]) continue;
                 if (refs[j].comp == a.comp) continue;
@@ -1200,16 +1187,16 @@ std::vector<NodeGroupEntry> GfaBubbleFinder::cluster_sources_by_mm_(
             const SourceRef& b = refs[j];
             const auto& sketch_b = node_sketches[b.vtx.vertex_id()];
 
-            if (diff_sim_ > 0.0) {
+            if (params_.diff_sim > 0.0) {
                 const size_t min_size = std::min(sketch_a.size(), sketch_b.size());
-                const size_t required_shared = static_cast<size_t>(std::ceil(diff_sim_ * double(min_size)));
+                const size_t required_shared = static_cast<size_t>(std::ceil(params_.diff_sim * double(min_size)));
                 if (shared < required_shared) continue;
             }
 
             const size_t min_size = std::min(sketch_a.size(), sketch_b.size());
             const double similarity = min_size == 0 ? 0.0 : static_cast<double>(shared) / static_cast<double>(min_size);
 
-            if (similarity < diff_sim_) continue;
+            if (similarity < params_.diff_sim) continue;
 
             BestHit hit;
             hit.idx = j;
@@ -1406,7 +1393,7 @@ std::vector<HomoTask_> GfaBubbleFinder::build_homo_tasks_(
     for (Vertex src : sources_) {
         std::unordered_set<uint32_t> usable_starts;
         for (const GfaArc* arc : graph_.getArcsFromVertex(src.vertex_id())) {
-            if (!arc || arc->get_del() || (skip_comp_ && arc->get_comp())) continue;
+            if (!arc || arc->get_del() || (params_.skip_comp && arc->get_comp())) continue;
             const Vertex start(arc->get_target_vertex_id());
             if (start != src && has_sequence(start)) usable_starts.insert(start.segment_id());
             if (usable_starts.size() >= 2) break;
@@ -1506,7 +1493,7 @@ void GfaBubbleFinder::filter_diff_source_context_()
         std::array<Vertex, 2> ends{};
     };
 
-    const uint32_t context_bp = diff_min_len_;
+    const uint32_t context_bp = params_.diff_min_len;
     if (context_bp == 0 || homologous_paths_.empty()) return;
 
     bool has_diff_source = false;
@@ -1542,7 +1529,7 @@ void GfaBubbleFinder::filter_diff_source_context_()
 
         uint64_t best = 0;
         for (const GfaArc* arc : graph_.getArcsFromVertex(v)) {
-            if (!arc || arc->get_del() || (skip_comp_ && arc->get_comp())) continue;
+            if (!arc || arc->get_del() || (params_.skip_comp && arc->get_comp())) continue;
 
             const uint32_t w = arc->get_target_vertex_id();
             if (w >= vertex_count) continue;
@@ -1739,15 +1726,15 @@ void GfaBubbleFinder::find_homologous_paths()
     }
 
     HomologousParam homo_sameSource_Param(
-        diff_min_src_, 
-        same_sim_, 
-        same_min_len_, 
+        params_.diff_min_src,
+        params_.same_sim,
+        params_.same_min_len,
         Type::SameSource
     );
     HomologousParam homo_diffSource_Param(
-        diff_min_src_, 
-        diff_sim_, 
-        diff_min_len_, 
+        params_.diff_min_src,
+        params_.diff_sim,
+        params_.diff_min_len,
         Type::DiffSource
     );
 
@@ -1770,7 +1757,7 @@ void GfaBubbleFinder::find_homologous_paths()
 
     ProgressTracker prog(tasks.size());
 
-    ThreadPool pool(std::max(1u, thread_));
+    ThreadPool pool(std::max(1u, params_.threads));
 
     std::vector<std::future<HomologousPath>> futs;
     futs.reserve(tasks.size());
@@ -1813,7 +1800,7 @@ void GfaBubbleFinder::find_homologous_paths()
     const size_t before_dedup = homologous_paths_.size();
 
     sort_and_dedup_homologous_paths_(
-        homo_sameSource_Param, 
+        homo_sameSource_Param,
         homo_diffSource_Param
     );
 
@@ -1855,8 +1842,8 @@ HomologousPathEnumerator::HomologousPathEnumerator(
       params_(params),
       bubble_pairs_(bubble_pairs)
 {
-    DFS_DEPTH_ = finder_.max_depth_ * 10;
-    DFS_GUARD_ = finder_.dfs_guard_ * 10;
+    DFS_DEPTH_ = finder_.params_.max_depth * 10;
+    DFS_GUARD_ = finder_.params_.DFS_guard * 10;
 }
 
 HomologousPath HomologousPathEnumerator::run()
@@ -2095,7 +2082,7 @@ bool HomologousPathEnumerator::prepare_starts_()
         seen_seg.reserve(8);
 
         for (const GfaArc* a : graph_.getArcsFromVertex(src.vertex_id())) {
-            if (!a || a->get_del() || (finder_.skip_comp_ && a->get_comp())) continue;
+            if (!a || a->get_del() || (finder_.params_.skip_comp && a->get_comp())) continue;
 
             Vertex w(a->get_target_vertex_id());
             if (w == src) continue;
@@ -2226,8 +2213,8 @@ bool HomologousPathEnumerator::initialize_states_()
 
     // ------------------------------------------------ Bloom filter initialization ------------------------------------------------
     fastbloom::BloomOptions bloom_opt;
-    bloom_opt.bits = finder_.homo_bloom_bits_;
-    bloom_opt.hashes = finder_.homo_bloom_hash_;
+    bloom_opt.bits = finder_.params_.homo_bloom_bits;
+    bloom_opt.hashes = finder_.params_.homo_bloom_hash;
     bloom_opt.use_simd = true;
 
     sketches_.clear();
@@ -2295,7 +2282,7 @@ bool HomologousPathEnumerator::extend_path_(size_t i, bool include_current)
         return include_current;
     }
 
-    if (include_current && finder_.homo_extend_bp_ > 0 && current_len >= finder_.homo_extend_bp_) {
+    if (include_current && finder_.params_.homo_extend_bp > 0 && current_len >= finder_.params_.homo_extend_bp) {
         add_to_sketch(current_seq);
         ends_[i] = cur_[i];
         log_.sequence(std::to_string(current_seq.size()));
@@ -2315,7 +2302,7 @@ bool HomologousPathEnumerator::extend_path_(size_t i, bool include_current)
 
     if (use_p_paths_) {
         std::vector<uint32_t> path = finder_.path_walker_.extend(
-            next_cursor, finder_.homo_extend_bp_
+            next_cursor, finder_.params_.homo_extend_bp
         );
         if (!path.empty()) paths.push_back(std::move(path));
     } else {
@@ -2323,9 +2310,9 @@ bool HomologousPathEnumerator::extend_path_(size_t i, bool include_current)
             cur_[i].vertex_id(),
             region_set,
             DFS_DEPTH_,
-            finder_.skip_comp_,
+            finder_.params_.skip_comp,
             DFS_GUARD_,
-            finder_.homo_extend_bp_,
+            finder_.params_.homo_extend_bp,
             &visited_seg_[i],
             required_samples_[i]
         );
@@ -2855,7 +2842,7 @@ HomologousPath HomologousPathEnumerator::emit_result_()
         static const std::unordered_set<uint32_t> empty_region;
 
         const std::unordered_set<uint32_t>& visited_set = params_.type == Type::DiffSource ?
-            visited_[i] : (finder_.homo_num_ == 1 ? visited_[i] : empty_region);
+            visited_[i] : (finder_.params_.homo_num == 1 ? visited_[i] : empty_region);
 
         uint32_t eff_max_depth = DFS_DEPTH_;
 
@@ -2874,11 +2861,11 @@ HomologousPath HomologousPathEnumerator::emit_result_()
             ends_[i].vertex_id(),
             visited_set,
             eff_max_depth,
-            finder_.homo_num_,
-            finder_.skip_comp_,
+            finder_.params_.homo_num,
+            finder_.params_.skip_comp,
             hit_limits,
             DFS_GUARD_,
-            finder_.stall_round_limit_,
+            finder_.params_.stall_round_limit,
             required_samples_[i]
         );
 
@@ -3398,12 +3385,12 @@ void HomologousPathDeduplicator::index_group_(
  * ================================================================================================================ */
 PathClusterer::PathClusterer(
     const GfaGraph& graph,
-    double max_difference,
+    double min_similarity,
     uint32_t kmer,
     uint32_t window
 )
     : graph_(graph),
-      max_difference_(max_difference),
+      min_similarity_(min_similarity),
       kmer_(kmer),
       window_(window)
 {}
@@ -3451,8 +3438,6 @@ std::vector<uint32_t> PathClusterer::cluster(
 
     std::vector<size_t> representatives;
     representatives.reserve(paths.size());
-    const double min_similarity = 1.0 - max_difference_;
-
     for (size_t i : order) {
         if (!can_cluster[i]) {
             labels[i] = static_cast<uint32_t>(representatives.size());
@@ -3464,7 +3449,7 @@ std::vector<uint32_t> PathClusterer::cluster(
             const size_t rep = representatives[cluster];
             if (!can_cluster[rep]) continue;
 
-            if (sketches[i].jaccard(sketches[rep]) >= min_similarity) {
+            if (sketches[i].jaccard(sketches[rep]) >= min_similarity_) {
                 labels[i] = static_cast<uint32_t>(cluster);
                 break;
             }
@@ -3492,8 +3477,8 @@ void GfaBubbleFinder::label_path_clusters()
         return;
     }
 
-    PathClusterer clusterer(graph_, path_diff_, mm_opt_.k, mm_opt_.w);
-    ThreadPool pool(std::max<uint32_t>(1, thread_));
+    PathClusterer clusterer(graph_, params_.path_sim, mm_opt_.k, mm_opt_.w);
+    ThreadPool pool(std::max<uint32_t>(1, params_.threads));
     ProgressTracker prog(total);
 
     std::vector<std::future<std::vector<uint32_t>>> bubble_futs;
@@ -3729,7 +3714,7 @@ BubbleWriter::BubbleWriter(
 void BubbleWriter::save_gfa(
     const std::string& output_file,
     const uint32_t min_len,
-    const uint32_t min_num, 
+    const uint32_t min_num,
     bool write_seq,
     const std::string& command_line
 ) const {

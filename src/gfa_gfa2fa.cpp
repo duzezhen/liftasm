@@ -53,20 +53,20 @@ void Gfa2fa::dump_to_stream(std::ostream& out) const {
         if (!nd || nd->deleted) continue;
 
         const uint32_t core_len = real_len_of_(*nd);
-        if (skip_unknown_ && core_len == 0) continue;
+        if (params_.skip_unknown && core_len == 0) continue;
 
         std::string core;
         if (!nd->sequence.empty() && nd->sequence != "*") {
             core.assign(nd->sequence.data(), core_len);
         }
 
-        const bool do_extend = (extend_ybp_ > 0) && (core_len < static_cast<uint32_t>(min_len_xbp_));
+        const bool do_extend = (params_.extend_ybp > 0) && (core_len < static_cast<uint32_t>(params_.min_len_xbp));
 
         std::string left, right;
         if (do_extend) {
             const uint32_t v_fw = (seg << 1) | 0; // forward vertex of this segment
-            left  = extend_left_seq_( v_fw, static_cast<uint32_t>(extend_ybp_) );
-            right = extend_right_seq_(v_fw, static_cast<uint32_t>(extend_ybp_) );
+            left  = extend_left_seq_( v_fw, static_cast<uint32_t>(params_.extend_ybp) );
+            right = extend_right_seq_(v_fw, static_cast<uint32_t>(params_.extend_ybp) );
         }
 
         std::string all; all.reserve(left.size() + core.size() + right.size());
@@ -74,7 +74,7 @@ void Gfa2fa::dump_to_stream(std::ostream& out) const {
         all.append(core);
         all.append(right);
 
-        write_fasta_record_(out, nd->name, all, static_cast<uint32_t>(wrap_width_));
+        write_fasta_record_(out, nd->name, all, static_cast<uint32_t>(params_.wrap_width));
     }
 }
 

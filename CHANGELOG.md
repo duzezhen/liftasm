@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.3-r26 (2026-08-24)
+
+### Improved
+
+- Simplified terminal misassembly detection with per-component haplotype support and cross-component confirmation.
+- Added final P-line-guided repeat-bubble normalization for contig collapse.
+
 ## v0.1.3-r25 (2026-08-23)
 
 ### Changed

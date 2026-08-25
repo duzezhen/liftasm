@@ -387,8 +387,8 @@ void GfaCollapser::normalize_homopolymer_bubbles(
 
         b.mask = build_tandem_repeat_mask_(
             b.seq,
-            REPEAT_MASK_MIN_LEN_,
-            REPEAT_MASK_MAX_PERIOD_,
+            collapser_params_.repeat_mask_min_len,
+            collapser_params_.repeat_mask_max_period,
             /*max_mismatch=*/0
         );
 
@@ -399,7 +399,7 @@ void GfaCollapser::normalize_homopolymer_bubbles(
         if (mask_all(b.mask, beg, end)) return true;
 
         const uint32_t n = static_cast<uint32_t>(b.seq.size());
-        const uint32_t pad = std::max<uint32_t>(REPEAT_MASK_MAX_PERIOD_, end - beg);
+        const uint32_t pad = std::max<uint32_t>(collapser_params_.repeat_mask_max_period, end - beg);
 
         const uint32_t ctx_beg = beg > pad ? beg - pad : 0;
         const uint32_t ctx_end = std::min<uint32_t>(n, end + pad);
@@ -590,8 +590,8 @@ void GfaCollapser::normalize_homopolymer_bubbles(
                             const char ref_base = ref.seq[xa];
                             const char query_base = query.seq[xb];
 
-                            const uint32_t query_pos = choose_insert_pos_for_repeat_base(query.seq, xb, ref_base, REPEAT_MASK_MAX_PERIOD_);
-                            const uint32_t ref_pos = choose_insert_pos_for_repeat_base(ref.seq, xa, query_base, REPEAT_MASK_MAX_PERIOD_);
+                            const uint32_t query_pos = choose_insert_pos_for_repeat_base(query.seq, xb, ref_base, collapser_params_.repeat_mask_max_period);
+                            const uint32_t ref_pos = choose_insert_pos_for_repeat_base(ref.seq, xa, query_base, collapser_params_.repeat_mask_max_period);
 
                             query_inserts.push_back(Insert{query_pos, std::string(1, ref_base)});
                             ref_inserts.push_back(Insert{ref_pos, std::string(1, query_base)});
@@ -1315,7 +1315,10 @@ std::vector<GfaCollapser::BubbleAlignment> GfaCollapser::align_subpaths_(
     if (!build(subA, spanA, seq_a, piecesA) || !build(subB, spanB, seq_b, piecesB)) return {};
 
     const minimizerdna::MinimizerBuilder mzb(mm_opt_);
-    uint32_t k_w_max = (std::max(static_cast<uint32_t>(chainOpts_.k), static_cast<uint32_t>(chainOpts_.w)) + 1);
+    uint32_t k_w_max = (std::max(
+        static_cast<uint32_t>(alignment_options_.chain.k),
+        static_cast<uint32_t>(alignment_options_.chain.w)
+    ) + 1);
     uint32_t hk_hw_max = (std::max(static_cast<uint32_t>(mm_opt_.k), static_cast<uint32_t>(mm_opt_.w)) + 1) * 5;
 
     std::string name_a, name_b;
@@ -1329,14 +1332,14 @@ std::vector<GfaCollapser::BubbleAlignment> GfaCollapser::align_subpaths_(
     }
 
     if (seq_a.size() <= k_w_max || seq_b.size() <= k_w_max) {
-        if (seq_a != seq_b && std::min(seq_a.size(), seq_b.size()) < static_cast<size_t>(MIN_EQ_FOR_CUT_)) {
+        if (seq_a != seq_b && std::min(seq_a.size(), seq_b.size()) < static_cast<size_t>(params_.min_eq)) {
             debug_stream() << "    - skip: " << name_a << " vs " << name_b << " | too short and not equal" << "\n";
             return {};
         }
     }
     
     if (seq_a.size() >= hk_hw_max && seq_b.size() >= k_w_max) {
-        if (mzb.max_containment(seq_a, seq_b) < MIN_JACCARD_FOR_ALIGN_) {
+        if (mzb.max_containment(seq_a, seq_b) < collapser_params_.min_jaccard) {
             debug_stream() << "    - skip: " << name_a << " vs " << name_b << " | jaccard: " << mzb.max_containment(seq_a, seq_b) << "\n";
             return {};
         }
@@ -1351,12 +1354,12 @@ std::vector<GfaCollapser::BubbleAlignment> GfaCollapser::align_subpaths_(
         0, static_cast<uint32_t>(seq_b.size())
     );
 
-    const std::vector<uint64_t> repeat_mask_a = build_tandem_repeat_mask_(seq_a, REPEAT_MASK_MIN_LEN_, REPEAT_MASK_MAX_PERIOD_, REPEAT_MASK_MAX_MISMATCH_);
-    const std::vector<uint64_t> repeat_mask_b = build_tandem_repeat_mask_(seq_b, REPEAT_MASK_MIN_LEN_, REPEAT_MASK_MAX_PERIOD_, REPEAT_MASK_MAX_MISMATCH_);
+    const std::vector<uint64_t> repeat_mask_a = build_tandem_repeat_mask_(seq_a, collapser_params_.repeat_mask_min_len, collapser_params_.repeat_mask_max_period, collapser_params_.repeat_mask_max_mismatch);
+    const std::vector<uint64_t> repeat_mask_b = build_tandem_repeat_mask_(seq_b, collapser_params_.repeat_mask_min_len, collapser_params_.repeat_mask_max_period, collapser_params_.repeat_mask_max_mismatch);
 
     std::vector<BubbleAlignment> outs;
     for (auto& aln : big) {
-        if (aln.ops.size() > 1) mask_repetitive_match_ops_(aln.ops, repeat_mask_a, repeat_mask_b, aln.beg_a, aln.beg_b, REPEAT_MASK_MIN_LEN_, REPEAT_MASK_MAX_PERIOD_);
+        if (aln.ops.size() > 1) mask_repetitive_match_ops_(aln.ops, repeat_mask_a, repeat_mask_b, aln.beg_a, aln.beg_b, collapser_params_.repeat_mask_min_len, collapser_params_.repeat_mask_max_period);
 
         auto v = split(piecesA, piecesB, aln);
         outs.insert(outs.end(), std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
@@ -1566,7 +1569,7 @@ std::vector<GfaCollapser::BubbleAlignment> GfaCollapser::align_paths_(
 
     bool all_paths_short = true;
     for (size_t i : candidates) {
-        if (path_lens[i] >= ALL_PAIR_LEN_) {
+        if (path_lens[i] >= collapser_params_.all_pair_len) {
             all_paths_short = false;
             break;
         }
@@ -1599,27 +1602,45 @@ std::vector<GfaCollapser::BubbleAlignment> GfaCollapser::align_paths_(
         inserted.first->second.push_back(i);
     }
 
-    std::vector<size_t> representatives;
-    representatives.reserve(cluster_order.size());
+    std::vector<size_t> cluster_refs;
+    cluster_refs.reserve(cluster_order.size());
+
+    std::vector<size_t> failed;
+    failed.reserve(candidates.size());
 
     // Align all paths in each cluster to the longest path in the cluster
     for (uint32_t cluster : cluster_order) {
         const std::vector<size_t>& members = cluster_members.at(cluster);
         const size_t ref = pick_longest(members, path_lens);
-        representatives.push_back(ref);
+        cluster_refs.push_back(ref);
 
         for (size_t member : members) {
-            if (member != ref) {
-                align_pair(ref, member);
+            if (member != ref && !align_pair(ref, member)) {
+                failed.push_back(member);
             }
         }
     }
 
-    // Align representatives of different clusters to each other
-    for (size_t a = 0; a + 1 < representatives.size(); ++a) {
-        for (size_t b = a + 1; b < representatives.size(); ++b) {
-            align_pair(representatives[a], representatives[b]);
+    // Compare the longest path from each cluster.
+    for (size_t a = 0; a + 1 < cluster_refs.size(); ++a) {
+        for (size_t b = a + 1; b < cluster_refs.size(); ++b) {
+            align_pair(cluster_refs[a], cluster_refs[b]);
         }
+    }
+
+    // Retry only failed paths, removing one reference after each round.
+    while (failed.size() > 1) {
+        const size_t ref = pick_longest(failed, path_lens);
+        std::vector<size_t> next_failed;
+        next_failed.reserve(failed.size() - 1);
+
+        for (size_t member : failed) {
+            if (member != ref && !align_pair(ref, member)) {
+                next_failed.push_back(member);
+            }
+        }
+
+        failed.swap(next_failed);
     }
 
     return outs;
@@ -1965,20 +1986,24 @@ SegReplace::Expander GfaCollapser::build_safe_expander_(size_t alignment_begin) 
         build_rulemap_(align_groups);
 
         SegReplace::Expander expander = build_SegReplace_();
-        LocalGraphComplexity checker(*this, alignment_begin);
-        const std::unordered_set<int32_t> bad = checker.find_increasing_candidates();
-        if (bad.empty()) {
-            log_stream() << "Stable after round " << round << ": no complexity-increasing candidates\n\n";
-            return expander;
-        }
 
-        const size_t removed = checker.reject_candidates(bad);
+        // Disabled on v0.1.3-r26 (2026-08-24) because the complexity check can leave valid regions incompletely collapsed.
+        return expander;
 
-        log_stream() << "Round " << round << ": removed " << bad.size() << " complexity-increasing candidates (" << removed << " alignments)\n\n";
-        if (removed == 0) {
-            log_stream() << "Stopped after round " << round << ": no matching alignment could be removed\n\n";
-            return expander;
-        }
+        // LocalGraphComplexity checker(*this, alignment_begin);
+        // const std::unordered_set<int32_t> bad = checker.find_increasing_candidates();
+        // if (bad.empty()) {
+        //     log_stream() << "Stable after round " << round << ": no complexity-increasing candidates\n\n";
+        //     return expander;
+        // }
+        //
+        // const size_t removed = checker.reject_candidates(bad);
+        //
+        // log_stream() << "Round " << round << ": removed " << bad.size() << " complexity-increasing candidates (" << removed << " alignments)\n\n";
+        // if (removed == 0) {
+        //     log_stream() << "Stopped after round " << round << ": no matching alignment could be removed\n\n";
+        //     return expander;
+        // }
     }
 }
 
@@ -1995,8 +2020,8 @@ void GfaCollapser::homologous_align_(
     log_stream() << "  - Alignment candidates: " << candidates.size() << "\n";
     log_stream() << "  - Topological conflict groups: " << groups.size() << "\n";
 
-    ThreadPool pool(alignOpts_.threads);
-    const size_t max_inflight = std::max<size_t>(1, alignOpts_.threads * 2);
+    ThreadPool pool(alignment_options_.align.threads);
+    const size_t max_inflight = std::max<size_t>(1, alignment_options_.align.threads * 2);
     std::deque<std::future<std::vector<BubbleAlignment>>> futures;
     ProgressTracker progress(candidates.size());
     size_t submitted = 0;
@@ -2144,8 +2169,8 @@ std::unordered_set<int32_t> LocalGraphComplexity::find_increasing_candidates() c
         rules_by_segment[sid].push_back(rule);
     }
 
-    ThreadPool pool(collapser_.alignOpts_.threads);
-    const size_t max_inflight = std::max<size_t>(1, collapser_.alignOpts_.threads * 2);
+    ThreadPool pool(collapser_.alignment_options_.align.threads);
+    const size_t max_inflight = std::max<size_t>(1, collapser_.alignment_options_.align.threads * 2);
     std::deque<std::future<std::pair<int32_t, bool>>> futures;
     size_t submitted = 0;
 
@@ -2167,7 +2192,7 @@ std::unordered_set<int32_t> LocalGraphComplexity::find_increasing_candidates() c
                     SegReplace::Expander expander(
                         local_rules,
                         {},
-                        collapser_.MIN_TRANS_LEN_
+                        collapser_.params_.min_trans_len
                     );
                     expander.build_index();
                     expander.filter_nonmonotonic_index();
@@ -2511,8 +2536,8 @@ std::unordered_set<SegReplace::Seg, SegReplace::U128Hash, SegReplace::U128Eq> Gf
     const std::vector<const GfaPath*>& paths,
     const SegReplace::Expander& expander
 ) const {
-    ThreadPool pool(graph_.alignOpts_.threads);
-    const size_t max_inflight = std::max<size_t>(1, graph_.alignOpts_.threads * 2);
+    ThreadPool pool(graph_.alignment_options_.align.threads);
+    const size_t max_inflight = std::max<size_t>(1, graph_.alignment_options_.align.threads * 2);
     std::deque<std::future<PathScan>> futures;
     std::unordered_set<SegReplace::Seg, SegReplace::U128Hash, SegReplace::U128Eq> bad;
     std::unordered_map<SegReplace::Seg, uint32_t, SegReplace::U128Hash, SegReplace::U128Eq> node_ids;

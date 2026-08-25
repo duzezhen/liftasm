@@ -40,12 +40,13 @@ namespace mmidx {
 
 /* ------------------------------------ Constructor ------------------------------------ */
 MinimizerIndex::MinimizerIndex(
-    const std::vector<std::string>& names,
-    const std::vector<std::string_view>& seqs,
-    const std::vector<std::vector<std::string>>& right_seqs,
-    opt::ChainOpts& chainOpts, 
-    const opt::AnchorOpts& anchorOpts
-) : names_(names), seqs_(seqs), right_seqs_(right_seqs), chainOpts_(chainOpts), anchorOpts_(anchorOpts) {
+    const ExpandedSeqs& sequences,
+    opt::AlignmentOptions& options
+) : names_(sequences.names),
+    seqs_(sequences.seqs),
+    right_seqs_(sequences.right_seqs),
+    chainOpts_(options.chain),
+    anchorOpts_(options.anchor) {
     if (chainOpts_.k == 0 || chainOpts_.k > 64)   throw std::invalid_argument("k must be 1..64");
     if (chainOpts_.w == 0 || chainOpts_.w >= 256) throw std::invalid_argument("w must be 1..255");
     mask_   = (__uint128_t(1) << (2 * chainOpts_.k)) - 1;

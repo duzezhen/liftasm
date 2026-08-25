@@ -86,8 +86,25 @@ struct AlignOpts {
     bool   outPAF;          // output PAF format instead of SAM
 };
 
+struct InitParams {
+    uint16_t k{25};
+    uint16_t w{30};
+    double sec_pri_ratio{0.8};
+    int sec_pri_num{5};
+    bool out_paf{false};
+    uint16_t threads{4};
+};
+
+struct AlignmentOptions {
+    ChainOpts chain;
+    AnchorOpts anchor;
+    ExtendOpts extend;
+    AlignOpts align;
+    bool use_wfa{false};
+};
+
 // Options initialization presets
-void init_opts(uint16_t k, uint16_t w, double sec_pri_ratio, int sec_pri_num, bool outPAF, uint16_t t, ChainOpts& chainOpts, AnchorOpts& anchorOpts, ExtendOpts& extendOpts, AlignOpts& alignOpts);
+AlignmentOptions init_opts(const InitParams& params);
 
 struct Preset {
     static void map_ont(ChainOpts&, AnchorOpts&, ExtendOpts&, AlignOpts&);

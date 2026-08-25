@@ -11,10 +11,12 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <mutex>
 
 #include "logger.hpp"
+#include "CommandOptions.hpp"
 #include "gfa_parser.hpp"
 #include "gfa_walker.hpp"
 #include "gfa_bubble_types.hpp"
@@ -36,15 +38,7 @@ class GfaBubbleFinder {
     friend class HomologousPathEnumerator;
 
 public:
-    GfaBubbleFinder(
-        const GfaGraph& graph, uint32_t max_depth, uint16_t max_paths, uint64_t dfs_guard, 
-        double path_diff, uint32_t stall_round_limit_, bool skip_comp, bool keep_nested, 
-        double same_sim, uint32_t same_min_len,
-        uint32_t diff_min_src, double diff_sim, uint32_t diff_min_len, 
-        uint32_t homo_num, uint32_t homo_k, uint32_t homo_w, 
-        uint32_t homo_extend_bp, uint64_t homo_bloom_bits, uint32_t homo_bloom_hash, 
-        uint32_t thread
-    );
+    GfaBubbleFinder(const GfaGraph& graph, BubbleOpts params);
     
     void find_bubbles();
     void filter_nested_bubbles();
@@ -102,31 +96,10 @@ private:
     HomologousPath detect_homologous_paths_from_sources_(const std::vector<Vertex>& srcs, const HomologousParam& params, const GfaBubble::BubbleBranchPairs_& bubble_pairs) const;
 
 private:
-    const uint32_t    thread_;
+    const BubbleOpts params_;
     const GfaGraph&   graph_;
     const GfaPathWalker path_walker_;
     const uint32_t    DEPTH_MARGIN_ = 50;  // Margin added to BFS max sink depth to limit DFS path enumeration
-
-    const uint32_t    max_depth_;
-    const uint16_t    max_paths_;
-    const uint64_t    dfs_guard_;           // --DFS-guard: max DFS states (stop if exceeded)
-    const double      path_diff_;           // --path-diff: diff ratio threshold (<= is same cluster)
-    const uint32_t    stall_round_limit_;   // stop DFS path search after this many rounds without a new unique path
-
-    const bool        skip_comp_;
-
-    const bool        keep_nested_;         // whether to keep bubbles contained within larger bubbles (i.e. non-local bubbles)
-
-    // Homologous path parameters
-    double same_sim_;                       // --same_sim: minimum similarity for homologous paths from the same source
-    uint32_t same_min_len_;                 // --same_len: minimum total length of each same-source homologous path
-    uint32_t diff_min_src_;                 // --diff_src_len: minimum source length for searching homologous paths between different sources
-    double diff_sim_;                       // --diff_sim: minimum similarity for homologous paths between different sources
-    uint32_t diff_min_len_;                 // --diff_len: minimum total length of each different-source homologous path
-    uint32_t homo_num_{1};                  // --homo_num: max paths per source branch
-    uint32_t homo_extend_bp_{1000000};      // --hextend: bp extended per homologous-path extension round
-    uint64_t homo_bloom_bits_{1ULL << 27};  // --hbits: Bloom filter size in bits
-    uint32_t homo_bloom_hash_{4};           // --hhash: Bloom filter hash count
 
     // Used to calculate Jaccard similarity between two homologous paths
     const minimizerdna::Options mm_opt_;
@@ -427,13 +400,13 @@ private:
  * ================================================================================================================ */
 class PathClusterer {
 public:
-    PathClusterer(const GfaGraph& graph, double max_difference, uint32_t kmer, uint32_t window);
+    PathClusterer(const GfaGraph& graph, double min_similarity, uint32_t kmer, uint32_t window);
 
     std::vector<uint32_t> cluster(const std::vector<std::vector<uint32_t>>& paths, Type type) const;
 
 private:
     const GfaGraph& graph_;
-    const double max_difference_;
+    const double min_similarity_;
     const uint32_t kmer_;
     const uint32_t window_;
 };

@@ -3,8 +3,9 @@
 
 #include <algorithm>
 #include <sstream>
+#include <utility>
 
-GfaCleaner::GfaCleaner(GfaCleanOptions options) : options_(options) {}
+GfaCleaner::GfaCleaner(CleanOpts params) : params_(std::move(params)) {}
 
 void GfaCleaner::build_ctg_read_index_(
     const std::vector<std::string>& ctg_files,
@@ -175,11 +176,11 @@ std::vector<GfaCleaner::NodeEvidence> GfaCleaner::build_utg_evidence_(
 }
 
 bool GfaCleaner::resolved_different_(const NodeEvidence& a, const NodeEvidence& b) const {
-    if (a.total < options_.min_reads || b.total < options_.min_reads) return false;
+    if (a.total < params_.min_reads || b.total < params_.min_reads) return false;
 
     const double purity_a = static_cast<double>(a.dominant_count) / a.total;
     const double purity_b = static_cast<double>(b.dominant_count) / b.total;
-    if (purity_a < options_.min_purity || purity_b < options_.min_purity) return false;
+    if (purity_a < params_.min_purity || purity_b < params_.min_purity) return false;
     return a.dominant_label != b.dominant_label;
 }
 
@@ -276,7 +277,7 @@ size_t GfaCleaner::clean(const std::vector<std::string>& ctg_files) {
     for (uint64_t key : candidate_pairs) {
         const uint32_t a = static_cast<uint32_t>(key >> 32);
         const uint32_t b = static_cast<uint32_t>(key);
-        if (component_overlap_(overlap_index, a, b) < options_.min_comp_overlap) {
+        if (component_overlap_(overlap_index, a, b) < params_.min_comp_overlap) {
             weak_pairs.insert(key);
         }
     }

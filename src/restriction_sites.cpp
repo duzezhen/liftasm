@@ -262,25 +262,25 @@ void Index::clear() {
     chrom_cuts_.clear();
 }
 
-void Index::build(const std::string& fasta_path, const std::vector<std::string>& enzyme_specs, bool scan_revcomp, int threads)
+void Index::build(const ResSitOpts& params)
 {
     clear();
 
-    log_stream() << "Building restriction site index from FASTA: " << fasta_path << "\n";
+    log_stream() << "Building restriction site index from FASTA: " << params.genome_file << "\n";
 
-    if (enzyme_specs.empty()) {
+    if (params.enzymes.empty()) {
         error_stream() << "no enzyme specs provided" << std::endl;
         std::exit(1);
     }
 
-    auto parsed = parse_enzyme_specs(enzyme_specs);
+    auto parsed = parse_enzyme_specs(params.enzymes);
     enzymes_.reserve(parsed.size());
     for (const auto& ez : parsed) {
         enzymes_.push_back(detail::compile_enzyme(ez));
     }
 
     FastaReader fr;
-    fr.load(fasta_path);
+    fr.load(params.genome_file);
 
     chrom_order_.reserve(fr.seqs.size());
     for (const auto& kv : fr.seqs) {
@@ -289,9 +289,10 @@ void Index::build(const std::string& fasta_path, const std::vector<std::string>&
 
     ProgressTracker prog(fr.seqs.size(), 10);
 
-    ThreadPool pool(std::max(1, threads));
+    ThreadPool pool(std::max(1, params.threads));
     std::vector<std::future<ChromResult>> futs;
     futs.reserve(fr.seqs.size());
+    const bool scan_revcomp = params.scan_revcomp;
 
     for (const auto& kv : fr.seqs) {
         prog.hit();

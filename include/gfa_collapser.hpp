@@ -3,6 +3,7 @@
 #include <string>
 #include <cstdint>
 #include <unordered_set>
+#include <utility>
 
 #include "gfa_parser.hpp"
 #include "logger.hpp"
@@ -22,48 +23,16 @@ class GfaPathCycleGuard;
 class GfaCollapser : public GfaAugmenter {
 
 public:
-    GfaCollapser(
-        double min_jaccard, 
-        int min_eq,
-        double min_match_ratio,
-        double min_ali_ratio,
-        uint8_t min_mapq,
-        uint32_t trim_min_len,
-        double trim_max_overlap,
-        int max_prop_iters, 
-        uint32_t homo_k, 
-        uint32_t homo_w,
-        uint32_t all_pair_len,
-        uint32_t repeat_mask_min_len,
-        uint32_t repeat_mask_max_period,
-        uint32_t repeat_mask_max_mismatch, 
-        uint32_t max_abnormal_cut_len,
-        uint32_t min_abnormal_cut_count, 
-        uint32_t min_trans_len,
-        std::string mm2_preset
-    )
-        : GfaAugmenter(
-            min_eq,
-            min_match_ratio,
-            min_ali_ratio,
-            min_mapq,
-            trim_min_len,
-            trim_max_overlap,
-            max_prop_iters,
-            max_abnormal_cut_len,
-            min_abnormal_cut_count,
-            min_trans_len,
-            mm2_preset
-        ),
-        mm_opt_{/*k=*/homo_k, /*w=*/homo_w, /*seek_reverse=*/false, /*seed=*/0x8a5cd789635d2dffULL},
-        ALL_PAIR_LEN_(all_pair_len)
-    {
-        MIN_JACCARD_FOR_ALIGN_ = min_jaccard;
-        REPEAT_MASK_MIN_LEN_ = repeat_mask_min_len;
-        REPEAT_MASK_MAX_PERIOD_ = repeat_mask_max_period;
-        REPEAT_MASK_MAX_MISMATCH_ = repeat_mask_max_mismatch;
-        // set_forbid_overlap(true);
-    }
+    explicit GfaCollapser(CollapseOpts params)
+        : GfaAugmenter(params),
+          collapser_params_(std::move(params)),
+          mm_opt_{
+              /*k=*/collapser_params_.homologous_k,
+              /*w=*/collapser_params_.homologous_window,
+              /*seek_reverse=*/false,
+              /*seed=*/0x8a5cd789635d2dffULL
+          }
+    {}
 
     /**
      * @brief Merge linear chains in a de-overlap graph.
@@ -83,9 +52,9 @@ public:
     );
 
     void disable_repeat_mask() {
-        REPEAT_MASK_MIN_LEN_ = 0;
-        REPEAT_MASK_MAX_PERIOD_ = 0;
-        REPEAT_MASK_MAX_MISMATCH_ = 0;
+        collapser_params_.repeat_mask_min_len = 0;
+        collapser_params_.repeat_mask_max_period = 0;
+        collapser_params_.repeat_mask_max_mismatch = 0;
     }
 
     void set_complex_marking(bool enabled) noexcept {
@@ -109,12 +78,8 @@ public:
 
 protected:
 
-    float MIN_JACCARD_FOR_ALIGN_ = 0.8;      // Threshold: only when Jaccard >= 0.8, perform alignment
-    uint32_t REPEAT_MASK_MIN_LEN_ = 24;      // minimum tandem-repeat span to mask
-    uint32_t REPEAT_MASK_MAX_PERIOD_ = 12;   // maximum tandem-repeat period to test
-    uint32_t REPEAT_MASK_MAX_MISMATCH_ = 2;  // maximum mismatches allowed in a repeat window
+    CollapseOpts collapser_params_;
     const minimizerdna::Options mm_opt_;     // Used to calculate Jaccard similarity between two homologous paths
-    const uint32_t ALL_PAIR_LEN_;
 
 private:
     friend class LocalGraphComplexity;

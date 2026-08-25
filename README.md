@@ -131,6 +131,8 @@ The most useful controls are `--iterations` (how many rounds to run), `--min_mat
 
 This command is intended for the final graph from CTG-mode `collapse`. A real spanning contig first establishes the connection and trusted shared-node boundaries; the gap sequence is then chosen by a source-aware node walk rather than copied from that contig. `--full_phase` lists samples with chromosome-scale phase information. Their haplotypes may be paired across a gap using local bubble phase, and only listed full-phase samples can support those connections. Other samples are joined within each haplotype.
 
+Before filling gaps, long low-support contig ends are checked against trusted haplotypes from other components. `--ms_haps` sets the support threshold per component, and `--ms_sim` requires one other component to cover the end by itself.
+
 ### `deoverlap`
 
 Use `deoverlap` when you need a non-overlap GFA as a standalone output, for another tool, or for inspection. It is not a prerequisite for UTG-mode `collapse`.

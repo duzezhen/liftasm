@@ -8,6 +8,7 @@
 #include <cmath>
 
 #include "mmidx_types.hpp"
+#include "gfa_parser_types.hpp"
 #include "seq_utils.hpp"
 #include "options.hpp"
 #include "logger.hpp"
@@ -17,8 +18,7 @@ class GfaGraph;
 /*
  * 
  * Usage:
- *   std::vector<std::pair<std::string,std::string_view>> name_seqs = vector<sequence_name, sequence>
- *   mmidx::MinimizerIndex idx(name_seqs, k, w, threads);
+ *   mmidx::MinimizerIndex idx(sequences, alignment_options);
  *   idx.build();
  *   std::vector<mmidx::MinimizerIndex::Seed> seeds;
  *   idx.collect_seeds(read, seeds);
@@ -30,13 +30,7 @@ namespace mmidx {
 
 class MinimizerIndex {
 public:
-    MinimizerIndex(
-        const std::vector<std::string>& names, 
-        const std::vector<std::string_view>& seqs, 
-        const std::vector<std::vector<std::string>>& right_seqs,
-        opt::ChainOpts& chainOpts, 
-        const opt::AnchorOpts& anchorOpts
-    );
+    MinimizerIndex(const ExpandedSeqs& sequences, opt::AlignmentOptions& options);
 
     void build_mm(bool expand_right = false);
 

@@ -166,8 +166,8 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--cx_min_branches must be >= 1"
             );
             ensure(
-                cfg.bubble.path_diff >= 0.0 && cfg.bubble.path_diff <= 1.0, 
-                "--path_diff must be in [0,1]"
+                cfg.bubble.path_sim >= 0.0 && cfg.bubble.path_sim <= 1.0,
+                "--path_sim must be in [0,1]"
             );
             ensure(
                 cfg.bubble.stall_round_limit >= 0, 
@@ -293,15 +293,15 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "-i/--input is required"
             );
             ensure(
-                cfg.collapse.hap1Files.size() == cfg.collapse.hap2Files.size(),
+                cfg.collapse.input.hap1Files.size() == cfg.collapse.input.hap2Files.size(),
                 "invalid CTG input: haplotype file counts differ"
             );
             ensure(
-                cfg.collapse.vcfFiles.empty() || !cfg.collapse.hap1Files.empty(),
+                cfg.collapse.input.vcfFiles.empty() || !cfg.collapse.input.hap1Files.empty(),
                 "VCF input is only supported in CTG mode"
             );
             ensure(
-                cfg.collapse.vcfFiles.empty() || cfg.collapse.vcfFiles.size() == cfg.collapse.hap1Files.size(),
+                cfg.collapse.input.vcfFiles.empty() || cfg.collapse.input.vcfFiles.size() == cfg.collapse.input.hap1Files.size(),
                 "invalid CTG input: VCF and sample counts differ"
             );
             ensure(
@@ -317,15 +317,15 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--ctg_end must be in [0,1]"
             );
             ensure(
-                !cfg.collapse.ctg_anchor_only || !cfg.collapse.hap1Files.empty(),
+                !cfg.collapse.ctg_anchor_only || !cfg.collapse.input.hap1Files.empty(),
                 "--anchor_only is only supported in CTG mode"
             );
             ensure(
-                cfg.collapse.hap1Files.empty() || cfg.collapse.gfaNames.size() == cfg.collapse.hap1Files.size(),
+                cfg.collapse.input.hap1Files.empty() || cfg.collapse.input.sampleNames.size() == cfg.collapse.input.hap1Files.size(),
                 "invalid CTG input: sample and GFA counts differ"
             );
             ensure(
-                !cfg.collapse.hap1Files.empty() || cfg.collapse.gfaNames.size() == cfg.collapse.gfaFiles.size(),
+                !cfg.collapse.input.hap1Files.empty() || cfg.collapse.input.sampleNames.size() == cfg.collapse.input.gfaFiles.size(),
                 "invalid UTG input: sample and GFA counts differ"
             );
             ensure(
@@ -421,8 +421,8 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--cx_min_branches must be >= 1"
             );
             ensure(
-                cfg.bubble.path_diff >= 0.0 && cfg.bubble.path_diff <= 1.0, 
-                "--path_diff must be in [0,1]"
+                cfg.bubble.path_sim >= 0.0 && cfg.bubble.path_sim <= 1.0,
+                "--path_sim must be in [0,1]"
             );
             ensure(
                 cfg.bubble.stall_round_limit >= 0, 
@@ -528,7 +528,7 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
 
         case ToolMode::file2map:
             ensure(
-                !cfg.file2map.inputFiles.empty(), 
+                !cfg.file2map.input_files.empty(),
                 "-i/--input is required"
             );
             ensure(
@@ -841,8 +841,8 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--DFS_guard must be >= 1"
             );
             ensure(
-                cfg.gapfill.path_diff >= 0.0 && cfg.gapfill.path_diff <= 1.0,
-                "--path_diff must be in [0,1]"
+                cfg.gapfill.path_sim >= 0.0 && cfg.gapfill.path_sim <= 1.0,
+                "--path_sim must be in [0,1]"
             );
             ensure(
                 cfg.gapfill.phase_path_len > 0,
@@ -873,8 +873,8 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--max_overlap must be in [0,1]"
             );
             ensure(
-                cfg.gapfill.misassembly_similarity >= 0.0 && cfg.gapfill.misassembly_similarity <= 1.0,
-                "--misassembly_similarity must be in [0,1]"
+                cfg.gapfill.ms_sim >= 0.0 && cfg.gapfill.ms_sim <= 1.0,
+                "--ms_sim must be in [0,1]"
             );
             ensure(
                 cfg.gapfill.dedup_similarity >= 0.0 && cfg.gapfill.dedup_similarity <= 1.0,
@@ -893,7 +893,7 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--min_ali_ratio must be in [0,1]"
             );
             ensure(
-                cfg.collapse.mm2_preset == "asm5" || cfg.collapse.mm2_preset == "asm10" || cfg.collapse.mm2_preset == "asm20" || cfg.collapse.mm2_preset == "sr" || cfg.collapse.mm2_preset == "lr:hq",
+                cfg.gapfill.mm2_preset == "asm5" || cfg.gapfill.mm2_preset == "asm10" || cfg.gapfill.mm2_preset == "asm20" || cfg.gapfill.mm2_preset == "sr" || cfg.gapfill.mm2_preset == "lr:hq",
                 "--preset must be asm5, asm10, asm20, sr, or lr:hq"
             );
             break;
@@ -1345,7 +1345,7 @@ void help_bubble(char** argv, bool advanced) {
     if (advanced) {
         hp.line("--DFS_guard", "INT", "max DFS states [" + format_size_arg_(BubbleOpts().DFS_guard) + "]");
     }
-    hp.line("--path_diff", "FLOAT", "sequence similarity difference threshold for path clustering [" + format_double_(BubbleOpts().path_diff) + "]");
+    hp.line("--path_sim", "FLOAT", "minimum minimizer Jaccard for path clustering [" + format_double_(BubbleOpts().path_sim) + "]");
     hp.line("--stall_rounds", "INT", "stop DFS path search after this many rounds without a new unique path [" + format_size_arg_(BubbleOpts().stall_round_limit) + "]");
     hp.line("--min_len", "INT", "minimum total sequence length of a bubble for output (0 = no filter) [" + format_size_arg_(BubbleOpts().min_len) + "]");
     hp.line("--min_num", "INT", "minimum number of nodes inside a bubble required for output (0 = no filter) [" + format_size_arg_(BubbleOpts().min_num) + "]");
@@ -1403,7 +1403,7 @@ AppConfig main_bubble(int argc, char** argv) {
         {"depth",           required_argument, nullptr, 1001},
         {"paths",           required_argument, nullptr, 1002},
         {"DFS_guard",       required_argument, nullptr, 1003},
-        {"path_diff",       required_argument, nullptr, 1004},
+        {"path_sim",        required_argument, nullptr, 1004},
         {"stall_rounds",    required_argument, nullptr, 1005},
         {"min_len",         required_argument, nullptr, 1006},
         {"min_num",         required_argument, nullptr, 1007},
@@ -1491,7 +1491,7 @@ AppConfig main_bubble(int argc, char** argv) {
                 break;
             }
             case 1004: {
-                cfg.bubble.path_diff = std::stod(optarg);
+                cfg.bubble.path_sim = std::stod(optarg);
                 break;
             }
             case 1005: {
@@ -1868,9 +1868,10 @@ void help_collapse(char** argv, bool advanced) {
     hp.line("--max_iters", "INT", "maximum iterations for cut point propagation [" + format_size_arg_(CollapseOpts().max_iters) + "]");
     hp.line("--ctg_min_len", "INT", "ignore shorter input contigs in contig mode; 0 disables [" + format_size_arg_(CollapseOpts().ctg_min_len) + "]");
     if (advanced) {
-        hp.line("--repeat_mask", "INT,INT,INT", "tandem-repeat masking as MIN_LEN,MAX_PERIOD,MAX_MISMATCH [" + std::to_string(CollapseOpts().repeat_mask_min_len) + "," + std::to_string(CollapseOpts().repeat_mask_max_period) + "," + std::to_string(CollapseOpts().repeat_mask_max_mismatch) + "]");
+        hp.line("--repeat_mask", "INT,INT,INT", "tandem-repeat detection as MIN_LEN,MAX_PERIOD,MAX_MISMATCH [" + std::to_string(CollapseOpts().repeat_mask_min_len) + "," + std::to_string(CollapseOpts().repeat_mask_max_period) + "," + std::to_string(CollapseOpts().repeat_mask_max_mismatch) + "]");
+        hp.note(" * UTG masks repeat matches during alignment; CTG normalizes repeat-only P-line bubbles after the final collapse");
         hp.note(" * e.g. ATATATGATCG contains a 9 bp repeat with period 2 (AT) and 1 mismatch (G), detectable by 8,12,1");
-        hp.line("--repeat_norm_len", "INT", "max single-node bubble path length for tandem-repeat normalization; 0 disables [" + format_size_arg_(CollapseOpts().repeat_norm_len) + "]");
+        hp.line("--repeat_norm_len", "INT", "max single-node bubble path length for UTG repeat normalization; 0 disables [" + format_size_arg_(CollapseOpts().repeat_norm_len) + "]");
         hp.line("--abnormal_cut", "INT,INT", "prune abnormal cut points after propagation as MAX_LEN,MIN_COUNT [" + std::to_string(CollapseOpts().max_abnormal_cut_len) + "," + std::to_string(CollapseOpts().min_abnormal_cut_count) + "]");
         hp.note(" * e.g. 0-3-6-9-100 -> 0-9-100 when 4,2 due to consecutive short segments");
         hp.line("--min_trans_len", "INT", "minimum interval length to allow transitive replacement expansion [" + format_size_arg_(CollapseOpts().min_trans_len) + "]");
@@ -1884,7 +1885,7 @@ void help_collapse(char** argv, bool advanced) {
     if (advanced) {
         hp.line("--DFS_guard", "INT", "max DFS states [" + format_size_arg_(BubbleOpts().DFS_guard) + "]");
     }
-    hp.line("--path_diff", "FLOAT", "sequence similarity difference threshold for path clustering [" + format_double_(BubbleOpts().path_diff) + "]");
+    hp.line("--path_sim", "FLOAT", "minimum minimizer Jaccard for path clustering [" + format_double_(BubbleOpts().path_sim) + "]");
     hp.line("--stall_rounds", "INT", "stop DFS path search after this many rounds without a new unique path [" + format_size_arg_(BubbleOpts().stall_round_limit) + "]");
     hp.line("--no_cx", "", "disable complex graph region detection");
     if (advanced) {
@@ -1963,7 +1964,7 @@ AppConfig main_collapse(int argc, char** argv) {
         {"depth",           required_argument, nullptr, 4001},
         {"paths",           required_argument, nullptr, 4002},
         {"DFS_guard",       required_argument, nullptr, 4003},
-        {"path_diff",       required_argument, nullptr, 4004},
+        {"path_sim",        required_argument, nullptr, 4004},
         {"stall_rounds",    required_argument, nullptr, 4005},
         {"no_cx",           no_argument,       nullptr, 4006},
         {"cx_branch_deg",   required_argument, nullptr, 4007},
@@ -2129,7 +2130,7 @@ AppConfig main_collapse(int argc, char** argv) {
                 break;
             }
             case 4004: {
-                cfg.bubble.path_diff = std::stod(optarg);
+                cfg.bubble.path_sim = std::stod(optarg);
                 break;
             }
             case 4005: {
@@ -2242,16 +2243,13 @@ AppConfig main_collapse(int argc, char** argv) {
     }
 
     if (!cfg.collapse.configFile.empty()) {
-        CollapseConfig input = parse_collapse_config(cfg.collapse.configFile);
-        cfg.collapse.gfaNames = std::move(input.sampleNames);
-        cfg.collapse.gfaFiles = std::move(input.gfaFiles);
-        cfg.collapse.hap1Files = std::move(input.hap1Files);
-        cfg.collapse.hap2Files = std::move(input.hap2Files);
-        cfg.collapse.vcfFiles = std::move(input.vcfFiles);
+        cfg.collapse.input = parse_collapse_config(cfg.collapse.configFile);
     }
 
     if (cfg.bubble.max_paths == 0) {
-        const size_t input_count = cfg.collapse.hap1Files.empty() ? cfg.collapse.gfaFiles.size() : cfg.collapse.hap1Files.size();
+        const size_t input_count = cfg.collapse.input.hap1Files.empty()
+            ? cfg.collapse.input.gfaFiles.size()
+            : cfg.collapse.input.hap1Files.size();
         const size_t automatic = std::max<size_t>(20, input_count * 2);
         cfg.bubble.max_paths = static_cast<uint16_t>(
             std::min<size_t>(automatic, std::numeric_limits<uint16_t>::max())
@@ -2323,15 +2321,15 @@ AppConfig main_file2map(int argc, char** argv) {
     while ((c = getopt_long(argc, argv, short_opts, long_opts, &idx)) != -1) {
         switch (c) {
             case 'i': {
-                cfg.file2map.inputFiles.emplace_back(optarg);
+                cfg.file2map.input_files.emplace_back(optarg);
                 while (optind < argc && !is_flag_(argv[optind])) {
-                    cfg.file2map.inputFiles.emplace_back(argv[optind]);
+                    cfg.file2map.input_files.emplace_back(argv[optind]);
                     ++optind;
                 }
                 break;
             }
             case 'o': {
-                cfg.file2map.outFile = optarg;
+                cfg.file2map.output_file = optarg;
                 break;
             }
             case 1001: {
@@ -2357,7 +2355,7 @@ AppConfig main_file2map(int argc, char** argv) {
         }
     }
 
-    if (cfg.file2map.outFile.empty()) cfg.file2map.outFile = "-";
+    if (cfg.file2map.output_file.empty()) cfg.file2map.output_file = "-";
 
     validate_and_print(argc, argv, cfg);
 
@@ -3518,7 +3516,7 @@ AppConfig main_clean(int argc, char** argv) {
 }
 
 void help_gapfill(char** argv) {
-    HelpPrinter hp(std::cerr, 27, 13);
+    HelpPrinter hp(std::cerr, 20, 13);
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE [options]\n\n"
         << "Fill supported contig gaps with source-aware node walks between trusted graph anchors.\n";
@@ -3555,7 +3553,7 @@ void help_gapfill(char** argv) {
     hp.line("--depth", "INT", "maximum graph distance searched for one bubble or gap walk [" + format_size_arg_(GapfillOpts().max_depth) + "]");
     hp.line("--paths", "INT", "maximum alternative paths kept for one bubble [" + format_size_arg_(GapfillOpts().max_paths) + "]");
     hp.line("--DFS_guard", "INT", "stop one bubble or gap walk after this many visited states [" + format_size_arg_(GapfillOpts().DFS_guard) + "]");
-    hp.line("--path_diff", "FLOAT", "group bubble paths whose minimizer difference is at most this [" + format_double_(GapfillOpts().path_diff) + "]");
+    hp.line("--path_sim", "FLOAT", "minimum minimizer Jaccard for path clustering [" + format_double_(GapfillOpts().path_sim) + "]");
     hp.line("--stall_rounds", "INT", "stop after this many rounds find no new path [" + format_size_arg_(GapfillOpts().stall_round_limit) + "]");
 
     hp.blank();
@@ -3578,8 +3576,10 @@ void help_gapfill(char** argv) {
     hp.blank();
 
     hp.section("Misassembly options");
-    hp.line("--misassembly_len", "INT", "check an unmatched contig end when it is at least this long [" + format_size_arg_(GapfillOpts().misassembly_len) + "]");
-    hp.line("--misassembly_similarity", "FLOAT", "matching fraction needed to keep a long unmatched end at this gap [" + format_double_(GapfillOpts().misassembly_similarity) + "]");
+    hp.line("--ms_len", "INT", "minimum low-support sequence at a contig end [" + format_size_arg_(GapfillOpts().ms_len) + "]");
+    hp.line("--ms_sim", "FLOAT", "minimum fraction covered by one other component [" + format_double_(GapfillOpts().ms_sim) + "]");
+    hp.line("--ms_haps", "INT|auto", "minimum supporting haplotypes in each component [auto]");
+    hp.note(" * auto: disabled for <=2 haplotypes; 1 for 3-4; 2 otherwise");
 
     hp.blank();
 
@@ -3619,7 +3619,7 @@ AppConfig main_gapfill(int argc, char** argv) {
         {"depth",                  required_argument, nullptr, 3001},
         {"paths",                  required_argument, nullptr, 3002},
         {"DFS_guard",              required_argument, nullptr, 3003},
-        {"path_diff",              required_argument, nullptr, 3004},
+        {"path_sim",               required_argument, nullptr, 3004},
         {"stall_rounds",           required_argument, nullptr, 3005},
 
         {"full_phase",             required_argument, nullptr, 4001},
@@ -3632,8 +3632,9 @@ AppConfig main_gapfill(int argc, char** argv) {
         {"min_overlap",            required_argument, nullptr, 5005},
         {"min_similarity",         required_argument, nullptr, 5006},
 
-        {"misassembly_len",        required_argument, nullptr, 6001},
-        {"misassembly_similarity", required_argument, nullptr, 6002},
+        {"ms_len",                 required_argument, nullptr, 6001},
+        {"ms_sim",                 required_argument, nullptr, 6002},
+        {"ms_haps",                required_argument, nullptr, 6003},
 
         {"dedup_sim",              required_argument, nullptr, 7001},
         {"dedup_component",        required_argument, nullptr, 7002},
@@ -3666,7 +3667,7 @@ AppConfig main_gapfill(int argc, char** argv) {
                 break;
             }
             case 'x': {
-                cfg.collapse.mm2_preset = optarg; 
+                cfg.gapfill.mm2_preset = optarg;
                 break;
             }
             case 'z': {
@@ -3704,7 +3705,7 @@ AppConfig main_gapfill(int argc, char** argv) {
                 break;
             }
             case 3004: {
-                cfg.gapfill.path_diff = std::stod(optarg); 
+                cfg.gapfill.path_sim = std::stod(optarg);
                 break;
             }
             case 3005: {
@@ -3748,11 +3749,16 @@ AppConfig main_gapfill(int argc, char** argv) {
                 break;
             }
             case 6001: {
-                cfg.gapfill.misassembly_len = parse_size_arg_u64_(optarg, argc, argv, optind, "--misassembly_len");
+                cfg.gapfill.ms_len = parse_size_arg_u64_(optarg, argc, argv, optind, "--ms_len");
                 break;
             }
             case 6002: {
-                cfg.gapfill.misassembly_similarity = std::stod(optarg);
+                cfg.gapfill.ms_sim = std::stod(optarg);
+                break;
+            }
+            case 6003: {
+                cfg.gapfill.ms_haps = std::string(optarg) == "auto" ? 0 :
+                    parse_size_arg_u32_(optarg, argc, argv, optind, "--ms_haps");
                 break;
             }
 
@@ -3796,12 +3802,19 @@ AppConfig main_gapfill(int argc, char** argv) {
 }
 
 void finalize_opt_cfg(AppConfig& cfg) {
-    init_opts(
-        cfg.global.kmerLen, cfg.global.minimizerW,
-        cfg.map.sec_pri_ratio, cfg.map.sec_pri_num,
-        cfg.map.outPAF, cfg.global.threads,
-        cfg.map.chainOpts, cfg.map.anchorOpts, cfg.map.extendOpts, cfg.map.alignOpts
-    );
+    opt::InitParams params;
+    params.k = cfg.global.kmerLen;
+    params.w = cfg.global.minimizerW;
+    params.sec_pri_ratio = cfg.map.sec_pri_ratio;
+    params.sec_pri_num = cfg.map.sec_pri_num;
+    params.out_paf = cfg.map.outPAF;
+    params.threads = cfg.global.threads;
+
+    opt::AlignmentOptions options = opt::init_opts(params);
+    cfg.map.chainOpts = std::move(options.chain);
+    cfg.map.anchorOpts = std::move(options.anchor);
+    cfg.map.extendOpts = std::move(options.extend);
+    cfg.map.alignOpts = std::move(options.align);
 
     if (cfg.mode == ToolMode::collapse || cfg.mode == ToolMode::deoverlap || cfg.mode == ToolMode::augment || cfg.mode == ToolMode::gapfill) {
         opt::Preset::map_asm_5(cfg.map.chainOpts, cfg.map.anchorOpts, cfg.map.extendOpts, cfg.map.alignOpts);

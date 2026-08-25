@@ -2,7 +2,7 @@
 
 #include "gfa_parser.hpp"
 #include "gfa_bubble_types.hpp"
-#include "options.hpp"
+#include "CommandOptions.hpp"
 
 #include <array>
 #include <cstdint>
@@ -14,6 +14,7 @@
 #include <vector>
 
 class GfaGapfill;
+class GfaGapfillMisassembly;
 
 
 /* =================================================================================================================
@@ -74,53 +75,17 @@ public:
         uint32_t source_component{UINT32_MAX};
     };
 
-    struct Params {
-        // Bubble phase evidence and graph-walk limits.
-        uint32_t max_depth{100'000};
-        uint64_t dfs_guard{1'000'000};
-        double path_difference{0.05};
-        std::vector<std::string> full_phase_samples;
-        uint32_t phase_path_len{10};
-        uint64_t phase_window_bp{500'000};
-
-        // Gap anchors and spanning evidence.
-        uint64_t min_contig_bp{1'000'000};
-        uint64_t max_gap_bp{10'000'000};
-        double max_target_overlap{0.1};
-        uint64_t min_overlap_bp{1'000'000};
-        double min_similarity{0.7};
-
-        // Misassembly detection and output deduplication.
-        uint64_t misassembly_check_bp{10'000'000};
-        double misassembly_similarity{0.7};
-        double dedup_similarity{0.95};
-        uint64_t dedup_component_bp{10'000'000};
-        uint32_t threads{1};
-        std::string html_file;
-    };
-
-    explicit GfaGapfill(Params params);
+    explicit GfaGapfill(GapfillOpts options);
     ~GfaGapfill() = default;
 
-    // Copy minimap2/index settings used by relocation and deduplication checks.
-    void set_alignment_options(
-        const opt::ChainOpts& chain,
-        const opt::AnchorOpts& anchor,
-        const opt::ExtendOpts& extend,
-        const opt::AlignOpts& align,
-        const std::string& preset,
-        double min_match,
-        double min_ali_ratio,
-        uint8_t min_mapq
-    );
-
     size_t gapfill(const std::vector<GfaBubble::Bubble>& bubbles);
-    std::vector<MisassemblyContig> prepare_misassemblies(const std::vector<GfaBubble::Bubble>& bubbles);
+    std::vector<MisassemblyContig> prepare_misassemblies();
     void set_misassemblies(const std::vector<MisassemblyContig>& records, const std::unordered_set<std::string>& relocated);
     PrimaryPaths save_samples(const std::string& prefix, const std::string& command_line);
 
 private:
     friend class GfaGapfillBoundary;
+    friend class GfaGapfillMisassembly;
 
     /* Graph layout records used to order contigs without reference coordinates. */
     struct LayoutAnchor {
@@ -195,11 +160,8 @@ private:
         uint32_t left{UINT32_MAX}, right{UINT32_MAX}, bridge{UINT32_MAX}; // left -> bridge -> right
         Boundary left_boundary, right_boundary;
         uint64_t left_shared{0}, right_shared{0}; // shared bp on both sides
-        uint64_t left_unplaced{0}, right_unplaced{0};
         uint64_t target_distance{0}; // gap or overlap size
         bool target_overlaps{false};  // whether the target contigs overlap in the graph
-        double left_unplaced_similarity{-1.0}, right_unplaced_similarity{-1.0};
-        bool left_misassembly{false}, right_misassembly{false};
         bool homolog_span{false};
         uint32_t phase_group{UINT32_MAX}; // reciprocal full-phase connections selected as one unit
         uint32_t phase_locus{UINT32_MAX}; // alternative straight/cross units for one overlapping diploid gap
@@ -261,7 +223,7 @@ private:
     };
 
     /* Configuration followed by pipeline state in production order. */
-    Params params_;
+    GapfillOpts params_;
     struct Mm2Options {
         uint16_t k{25}, w{30};
         uint16_t best_n{5};
@@ -285,8 +247,6 @@ private:
     std::vector<MisassemblyContig> misassemblies_;
     std::unordered_map<std::string, uint32_t> misassembly_index_;
     std::unordered_set<std::string> relocated_misassemblies_;
-    std::vector<Candidate> prepared_candidates_;
-    bool candidates_prepared_{false};
 
     // ================================================= Clear state =================================================
     void clear_state_();
@@ -323,8 +283,6 @@ private:
     bool resolve_fill_path_(Candidate& candidate, const std::vector<uint8_t>& soft_blocked, uint8_t soft_block_mask) const;
 
     // ================================================= Misassembly detection and relocation =================================================
-    void check_unplaced_sequence_(std::vector<Candidate>& candidates) const;
-    std::vector<MisassemblyContig> split_misassemblies_(const std::vector<Candidate>& candidates);
     void mark_used_relocations_(const std::vector<Candidate>& selected);
 
     // ================================================= Assign haplotypes =================================================
@@ -350,3 +308,45 @@ private:
     uint64_t chain_length_(const Chain& chain) const;
     static uint64_t ng50_(std::vector<uint64_t> lengths, uint64_t component_bp);
 };
+
+
+/* =================================================================================================================
+ *                                         TERMINAL MISASSEMBLY START
+ * ================================================================================================================= */
+// Finds low-support contig ends and confirms them against one other graph component.
+class GfaGapfillMisassembly {
+public:
+    explicit GfaGapfillMisassembly(GfaGapfill& graph) : graph_(graph) {}
+
+    std::vector<GfaGapfill::MisassemblyContig> run();
+
+private:
+    struct Terminal {
+        uint32_t fragment{UINT32_MAX}, begin{0}, end{0}; // Normalized P-path range [begin, end).
+        uint32_t target_component{UINT32_MAX};
+        uint64_t length{0};
+        double coverage{0.0};
+        bool left{false}, confirmed{false};
+        std::string sequence;
+    };
+
+    struct Alignment {
+        uint32_t terminal{0}, component{0}, begin{0}, end{0};
+    };
+
+    GfaGapfill& graph_;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> component_haplotypes_;
+    std::vector<Terminal> terminals_;
+
+    uint32_t source_id_(const GfaGapfill::Fragment& fragment) const;
+    uint32_t min_haplotypes_(uint32_t component) const;
+    uint32_t node_support_(const GfaGapfill::Fragment& fragment, uint32_t segment) const;
+    void index_haplotypes_();
+    void find_terminals_();
+    std::vector<uint32_t> select_references_() const;
+    void confirm_terminals_(const std::vector<uint32_t>& references);
+    std::vector<GfaGapfill::MisassemblyContig> split_confirmed_();
+};
+/* =================================================================================================================
+ *                                          TERMINAL MISASSEMBLY END
+ * ================================================================================================================= */

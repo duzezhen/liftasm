@@ -73,53 +73,6 @@ namespace detail {
 } // namespace detail
 
 
-RunOpts set_opts(
-    std::vector<std::string> map_files, std::string bed_file, std::string ref_file, std::string out_file, 
-    std::string regex, double min_frac, 
-    uint32_t flank_win, uint32_t max_flank, uint32_t max_gap, uint16_t max_hit,
-    std::string paf_file, uint32_t min_mapq, uint32_t min_len,
-    bool do_check, uint32_t win, uint32_t step, uint32_t max_examples, 
-    int cm_max_hops, uint32_t cm_max_fanout, uint32_t cm_min_len, double cm_min_frac, uint32_t cm_max_total_hits,
-    int threads
-) {
-    RunOpts o;
-    o.map_files         = map_files;
-    o.bed_file          = bed_file;
-    o.ref_file          = ref_file;
-    o.out_file          = out_file;
-    o.regex             = regex;
-    o.min_frac          = min_frac;
-    o.flank_win         = flank_win;
-    o.max_flank         = max_flank;
-    o.max_gap           = max_gap;
-    o.max_hit           = max_hit;
-
-    o.paf_file          = paf_file;
-    o.min_mapq          = min_mapq;
-    o.min_len           = min_len;
-
-    o.do_check          = do_check;
-    o.win               = win;
-    o.step              = step;
-    o.max_examples      = max_examples;
-    o.cm_max_hops       = cm_max_hops;
-    o.cm_max_fanout     = cm_max_fanout;
-    o.cm_min_len        = cm_min_len;
-    o.cm_min_frac       = cm_min_frac;
-    o.cm_max_total_hits = cm_max_total_hits;
-
-    o.threads           = threads;
-
-    if (o.map_files.empty()) { error_stream() << "--map is required"; std::exit(1); }
-    if (o.do_check) {
-        if (o.ref_file.empty()) { error_stream() << "--check requires --ref"; std::exit(1); }
-    } else {
-        if (o.bed_file.empty()) { error_stream() << "need --bed (or use --check)"; std::exit(1); }
-    }
-
-    return o;
-}
-
 int bed_reader(
     const std::string& bed_file, 
     std::unordered_map<std::string, std::vector<BEDinfo>>& beds
@@ -269,7 +222,7 @@ int paf_reader(
     return 0;
 }
 
-std::vector<std::string> liftover(const RunOpts& opt)
+std::vector<std::string> liftover(const LiftoverOpts& opt)
 {
     std::vector<std::string> blocks;
 
@@ -280,9 +233,9 @@ std::vector<std::string> liftover(const RunOpts& opt)
     std::unordered_map<std::string, std::vector<uint32_t>> paf_idx_ends;
 
     // file_reader(opt, beds, M, pafs, paf_ends, paf_idx_ends);
-    bed_reader(opt.bed_file, beds);
-    map_reader(opt.map_files, M);
-    paf_reader(opt.paf_file, opt.min_mapq, opt.min_len, pafs, paf_ends, paf_idx_ends);
+    bed_reader(opt.bedFile, beds);
+    map_reader(opt.mapFiles, M);
+    paf_reader(opt.pafFile, opt.min_mapq, opt.min_len, pafs, paf_ends, paf_idx_ends);
 
     log_stream() << "Liftover BED intervals ..." << "\n";
 
@@ -633,7 +586,7 @@ std::vector<LIFTresult> paf_liftover(
 }
 
 std::vector<LIFTresult> map_liftover(
-    const RunOpts& opt, 
+    const LiftoverOpts& opt,
     const coordmap::CoordMap& M, 
     std::string qname, uint32_t qbeg, uint32_t qend
 ) {
@@ -948,7 +901,7 @@ const std::string* SeqDB::get(std::string_view name) const {
 }
 
 // Function check
-void check(const coordmap::CoordMap& M, const RunOpts& opt) {
+void check(const coordmap::CoordMap& M, const LiftoverOpts& opt) {
     struct CheckStats {
         uint64_t windows_total = 0, windows_hit = 0;
         uint64_t mapped_bases = 0, equal_bases = 0, diff_bases = 0;
@@ -957,8 +910,8 @@ void check(const coordmap::CoordMap& M, const RunOpts& opt) {
     };
 
     SeqDB db;
-    if (!db.load(opt.ref_file)) {
-        error_stream() << "Load ref failed: " + opt.ref_file << std::endl;
+    if (!db.load(opt.referenceFile)) {
+        error_stream() << "Load ref failed: " + opt.referenceFile << std::endl;
         std::exit(1);
     }
 

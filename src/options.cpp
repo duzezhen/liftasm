@@ -3,19 +3,25 @@
 
 namespace opt {
 
-void init_opts(uint16_t k, uint16_t w, double sec_pri_ratio, int sec_pri_num, bool outPAF, uint16_t t, ChainOpts& c, AnchorOpts& a, ExtendOpts& e, AlignOpts& al) {
-    al.k = k;
-    al.w = w;
-    al.threads = t;
+AlignmentOptions init_opts(const InitParams& params) {
+    AlignmentOptions options;
+    ChainOpts& c = options.chain;
+    AnchorOpts& a = options.anchor;
+    ExtendOpts& e = options.extend;
+    AlignOpts& al = options.align;
+
+    al.k = params.k;
+    al.w = params.w;
+    al.threads = params.threads;
     al.buffer_size = 10;
     al.queue_cap = 1e3;
-    al.sec_pri_ratio = sec_pri_ratio;
-    al.sec_pri_num = sec_pri_num;
-    al.outPAF = outPAF;
+    al.sec_pri_ratio = params.sec_pri_ratio;
+    al.sec_pri_num = params.sec_pri_num;
+    al.outPAF = params.out_paf;
 
-    c.k = k;
-    c.w = w;
-    c.threads = t;
+    c.k = params.k;
+    c.w = params.w;
+    c.threads = params.threads;
     c.mid_occ_frac = 2e-4f;
     c.q_occ_frac = 0.01f;
     c.bw = 500;
@@ -40,9 +46,9 @@ void init_opts(uint16_t k, uint16_t w, double sec_pri_ratio, int sec_pri_num, bo
     a.max_kept = 10;
     a.min_group_overlap_frac = 0.01f;
 
-    e.k = k;
-    e.w = w;
-    e.threads = t;
+    e.k = params.k;
+    e.w = params.w;
+    e.threads = params.threads;
     e.flank_pad = 30;
     e.match = 0;
     e.mismatch = 4;
@@ -60,6 +66,8 @@ void init_opts(uint16_t k, uint16_t w, double sec_pri_ratio, int sec_pri_num, bo
     e.dyn_max_ref_bp = 2e4;
     e.dyn_min_gain = 15;
     e.dyn_max_steps = 20;
+
+    return options;
 }
 
 void Preset::map_ont(ChainOpts& c, AnchorOpts& a, ExtendOpts& e, AlignOpts& al) {

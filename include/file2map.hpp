@@ -7,6 +7,7 @@
 #include <ostream>
 #include <cstring>
 
+#include "CommandOptions.hpp"
 #include "kpaf.hpp"
 #include "gfa_parser.hpp"
 
@@ -152,8 +153,8 @@ static inline void paf_to_map(const std::vector<std::string>& pafFiles, std::ost
     }
 }
 
-static inline void file_to_map_auto(const std::vector<std::string>& in_paths, const std::string& out_path, bool paf_primary_only, uint32_t min_len, int min_mapq) {
-    if (in_paths.empty()) {
+static inline void file_to_map_auto(const File2mapOpts& params) {
+    if (params.input_files.empty()) {
         error_stream() << "No input file provided.\n";
         std::exit(1);
     }
@@ -161,10 +162,10 @@ static inline void file_to_map_auto(const std::vector<std::string>& in_paths, co
     std::ostream* out = &std::cout;
     std::ofstream fout;
 
-    if (!out_path.empty() && out_path != "-") {
-        fout.open(out_path);
+    if (!params.output_file.empty() && params.output_file != "-") {
+        fout.open(params.output_file);
         if (!fout) {
-            error_stream() << out_path << ": No such file or directory\n";
+            error_stream() << params.output_file << ": No such file or directory\n";
             std::exit(1);
         }
         out = &fout;
@@ -173,7 +174,7 @@ static inline void file_to_map_auto(const std::vector<std::string>& in_paths, co
     std::vector<std::string> gfa_files;
     std::vector<std::string> paf_files;
 
-    for (const auto& path : in_paths) {
+    for (const auto& path : params.input_files) {
         if (has_suffix(path, ".gfa") || has_suffix(path, ".gfa.gz")) {
             gfa_files.emplace_back(path);
         } else {
@@ -186,7 +187,10 @@ static inline void file_to_map_auto(const std::vector<std::string>& in_paths, co
     }
 
     if (!paf_files.empty()) {
-        paf_to_map(paf_files, *out, paf_primary_only, min_len, min_mapq);
+        paf_to_map(
+            paf_files, *out, params.paf_primary_only,
+            params.min_len, params.min_mapq
+        );
     }
 }
 

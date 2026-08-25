@@ -159,8 +159,8 @@ bool GfaDeoverlapper::trim_small_overlap_(MmWfaHit& hit, const MmWfaHit& kept) c
     const uint32_t q_overlap = std::min(hqe, kqe) > std::max(hqb, kqb) ? std::min(hqe, kqe) - std::max(hqb, kqb) : 0;
     const uint32_t overlap = std::max(r_overlap, q_overlap);
 
-    if (overlap == 0 || hit_len < TRIM_MIN_ALIGN_LEN_ || kept_len < TRIM_MIN_ALIGN_LEN_) return false;
-    if (static_cast<double>(overlap) / hit_len > TRIM_MAX_OVERLAP_) return false;
+    if (overlap == 0 || hit_len < params_.trim_min_len || kept_len < params_.trim_min_len) return false;
+    if (static_cast<double>(overlap) / hit_len > params_.trim_max_overlap) return false;
 
     const bool trim_front = hrb >= krb && hqb >= kqb;
     const bool trim_back = hre <= kre && hqe <= kqe;
@@ -246,15 +246,15 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::filter_aligns_(
 
     for (auto& x : a) {
         if (x.cigar.empty() || x.cigar == "*") continue;
-        if (x.mapq < MIN_MAPQ_) continue;
-        if (CIGAR::match_ratio(x.cigar) < MIN_MATCH_RATIO_) continue;
+        if (x.mapq < params_.min_mapq) continue;
+        if (CIGAR::match_ratio(x.cigar) < params_.min_match_ratio) continue;
 
         const uint32_t aln_len = len(x);
         if (aln_len == 0) continue;
 
         if (denom > 0) {
             const double ali_ratio = static_cast<double>(aln_len) / static_cast<double>(denom);
-            if (ali_ratio < MIN_ALI_RATIO_) continue;
+            if (ali_ratio < params_.min_ali_ratio) continue;
         }
 
         passed.emplace_back(std::move(x));
@@ -297,10 +297,10 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::filter_aligns_(
         }
 
         if (!ok || cand.cigar.empty() || cand.cigar == "*") continue;
-        if (CIGAR::match_ratio(cand.cigar) < MIN_MATCH_RATIO_) continue;
+        if (CIGAR::match_ratio(cand.cigar) < params_.min_match_ratio) continue;
         const uint32_t aln_len = len(cand);
         if (aln_len == 0) continue;
-        if (denom > 0 && static_cast<double>(aln_len) / static_cast<double>(denom) < MIN_ALI_RATIO_) continue;
+        if (denom > 0 && static_cast<double>(aln_len) / static_cast<double>(denom) < params_.min_ali_ratio) continue;
         kept.emplace_back(std::move(cand));
     }
 
@@ -340,7 +340,7 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_short_wfa_(
         std::string_view(w_seq_slice),
         cigar,
         score,
-        extendOpts_
+        alignment_options_.extend
     );
 
     if (cigar.empty() || cigar == "*") {
@@ -364,14 +364,15 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_wfa_(
     std::vector<MmWfaHit> hits;
 
     // ---- Build a tiny minimizer index for v (reference) ----
-    std::vector<std::string> v_names{v_name};
-    std::vector<std::string_view> v_seqs{v_seq_slice};
-    std::vector<std::vector<std::string>> v_right_seqs{{""}};
+    ExpandedSeqs sequences;
+    sequences.names = {v_name};
+    sequences.seqs = {v_seq_slice};
+    sequences.right_seqs = {{""}};
 
-    mmidx::MinimizerIndex idx(v_names, v_seqs, v_right_seqs, chainOpts_, anchorOpts_);
+    mmidx::MinimizerIndex idx(sequences, alignment_options_);
     idx.build_mm();
 
-    aligner::Alignmenter aln(idx, v_names, v_seqs, extendOpts_, alignOpts_);
+    aligner::Alignmenter aln(idx, sequences, alignment_options_);
 
     auto aligns = aln.produce_read(w_name, w_seq_slice, /*keep same strand only=*/true);
     if (aligns.empty()) {
@@ -435,8 +436,8 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_short_mm2_(
 
     opt.flag |= MM_F_CIGAR;
     opt.flag |= MM_F_EQX;
-    opt.best_n = (short)anchorOpts_.max_kept;
-    opt.zdrop = extendOpts_.dyn_zdrop;
+    opt.best_n = (short)alignment_options_.anchor.max_kept;
+    opt.zdrop = alignment_options_.extend.dyn_zdrop;
 
     const char* ref_seqs[1] = { v_seq_slice.c_str() };
     const char* ref_names[1] = { v_name.c_str() };
@@ -519,19 +520,19 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_mm2_(
     mm_mapopt_t opt;
 
     mm_set_opt(nullptr, &ipt, &opt);
-    if (mm_set_opt(MM2_PRESET_.c_str(), &ipt, &opt) < 0) {
-        error_stream() << "Invalid mm2 preset: " << MM2_PRESET_ << "\n";
+    if (mm_set_opt(params_.mm2_preset.c_str(), &ipt, &opt) < 0) {
+        error_stream() << "Invalid mm2 preset: " << params_.mm2_preset << "\n";
         std::exit(1);
     }
 
-    ipt.k = (short)chainOpts_.k;
-    ipt.w = (short)chainOpts_.w;
+    ipt.k = (short)alignment_options_.chain.k;
+    ipt.w = (short)alignment_options_.chain.w;
 
     opt.flag |= MM_F_CIGAR;
     opt.flag |= MM_F_EQX;  // output =/X
 
-    opt.best_n = (short)anchorOpts_.max_kept;
-    opt.zdrop = extendOpts_.dyn_zdrop;
+    opt.best_n = (short)alignment_options_.anchor.max_kept;
+    opt.zdrop = alignment_options_.extend.dyn_zdrop;
 
     const char* ref_seqs[1]  = { v_seq_slice.c_str() };
     const char* ref_names[1] = { v_name.c_str() };
@@ -722,7 +723,7 @@ void GfaDeoverlapper::overlaps_align_() {
     using namespace wfa;  // WFAlignerGapAffine
 
     // ---------------- Thread pool ----------------
-    ThreadPool pool(alignOpts_.threads);
+    ThreadPool pool(alignment_options_.align.threads);
     std::vector<std::future<std::vector<BubbleAlignment>>> futs;
     futs.reserve(arcs_.size());
 
@@ -1067,7 +1068,7 @@ bool GfaDeoverlapper::add_cuts_from_one_alignment_(const BubbleAlignment& align)
                 step(pos_a, rev_a, op.len);
                 step(pos_b, rev_b, op.len);
 
-                if (op.len >= MIN_EQ_FOR_CUT_ || is_single_exact_match || align.force_cuts) {
+                if (op.len >= params_.min_eq || is_single_exact_match || align.force_cuts) {
                     add_cut(seg_a, prev_a, len_a);
                     add_cut(seg_b, prev_b, len_b);
                     add_cut(seg_a, pos_a,  len_a);
@@ -1175,7 +1176,7 @@ uint64_t GfaDeoverlapper::propagate_cuts_run_(const std::vector<size_t>& group) 
         p = rev ? (p - n) : (p + n);
     };
 
-    for (int iter = 0; iter < MAX_PROPAGATION_ITERS_ && !dirty.empty(); ++iter) {
+    for (int iter = 0; iter < params_.max_iters && !dirty.empty(); ++iter) {
         active.clear();
         active_seen.clear();
 
@@ -1316,7 +1317,7 @@ uint64_t GfaDeoverlapper::propagate_cuts_run_(const std::vector<size_t>& group) 
 }
 
 uint64_t GfaDeoverlapper::prune_cuts_run_(const std::vector<size_t>& group) {
-    if (MAX_ABNORMAL_CUT_LEN_ <= 0 || MIN_ABNORMAL_CUT_COUNT_ <= 0) {
+    if (params_.max_abnormal_cut_len <= 0 || params_.min_abnormal_cut_count <= 0) {
         return 0;
     }
     for (const size_t aln_id : group) {
@@ -1353,16 +1354,16 @@ uint64_t GfaDeoverlapper::prune_cuts_run_(const std::vector<size_t>& group) {
         while (i + 1 < cuts.size()) {
             const uint32_t seg_len = cuts[i + 1] - cuts[i];
 
-            if (seg_len <= MAX_ABNORMAL_CUT_LEN_) {
+            if (seg_len <= params_.max_abnormal_cut_len) {
                 const size_t abnormal_beg = i;
 
-                while (i + 1 < cuts.size() && cuts[i + 1] - cuts[i] <= MAX_ABNORMAL_CUT_LEN_) {
+                while (i + 1 < cuts.size() && cuts[i + 1] - cuts[i] <= params_.max_abnormal_cut_len) {
                     ++i;
                 }
 
                 const size_t abnormal_seg_count = i - abnormal_beg;
 
-                if (abnormal_seg_count >= MIN_ABNORMAL_CUT_COUNT_) {
+                if (abnormal_seg_count >= params_.min_abnormal_cut_count) {
                     n_removed += abnormal_seg_count - 1;
 
                     if (filtered.back() != cuts[i]) {
@@ -1423,7 +1424,7 @@ void GfaDeoverlapper::build_propagate_prune_cuts_(const std::vector<std::vector<
         return;
     }
 
-    ThreadPool pool(alignOpts_.threads);
+    ThreadPool pool(alignment_options_.align.threads);
     std::vector<std::future<std::pair<uint64_t, uint64_t>>> futs;
     futs.reserve(groups.size());
     ProgressTracker prog(groups.size());
@@ -2227,7 +2228,7 @@ SegReplace::RuleMap GfaDeoverlapper::build_rulemap_run_(
         if (align_id >= bubble_aligns_.size()) continue;
         const auto& align = bubble_aligns_[align_id];
 
-        // If the alignment result length is 1 and all are "=", directly add the cut point without filtering with MIN_EQ_FOR_CUT_
+        // If the alignment result length is 1 and all are "=", directly add the cut point without filtering with params_.min_eq
         const bool is_single_exact_match = (align.ops.size() == 1 && align.ops[0].op == '=');
 
         const uint32_t seg_a = NodeHandle::get_segment_id(align.v_a);
@@ -2279,7 +2280,7 @@ SegReplace::RuleMap GfaDeoverlapper::build_rulemap_run_(
                         ? std::make_pair(pos_b, prev_b)
                         : std::make_pair(prev_b, pos_b);
 
-                    if (op.len >= MIN_EQ_FOR_CUT_ || is_single_exact_match || align.force_cuts) {
+                    if (op.len >= params_.min_eq || is_single_exact_match || align.force_cuts) {
                         GfaDeoverlapper::record_rulemap(
                             seg_a, seg_b,
                             rev_a, rev_b,
@@ -2337,9 +2338,9 @@ void GfaDeoverlapper::build_rulemap_(const std::vector<std::vector<size_t>>& gro
 
     std::vector<std::unordered_set<uint32_t>> cut_sets = build_cut_sets_();
 
-    ThreadPool pool(alignOpts_.threads);
+    ThreadPool pool(alignment_options_.align.threads);
     std::deque<std::future<SegReplace::RuleMap>> futs;
-    const size_t max_pending = std::max<size_t>(1, alignOpts_.threads * 2);
+    const size_t max_pending = std::max<size_t>(1, alignment_options_.align.threads * 2);
     ProgressTracker prog(groups.size());
 
     for (const auto& group : groups) {
@@ -2378,7 +2379,7 @@ SegReplace::Expander GfaDeoverlapper::build_SegReplace_()
 {
     log_stream() << "Building segment replacement rules ...\n";
 
-    SegReplace::Expander ex(rulemap_, getAllSegmentNames(), MIN_TRANS_LEN_);
+    SegReplace::Expander ex(rulemap_, getAllSegmentNames(), params_.min_trans_len);
     ex.build_index();
 
     const size_t raw_rules = ex.index_view().size();

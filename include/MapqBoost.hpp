@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "CommandOptions.hpp"
+
 struct bam1_t;
 struct sam_hdr_t;
 namespace coordmap { class CoordMap; }
@@ -53,12 +55,9 @@ struct Subgroup {
 class MapqBooster {
 public:
     MapqBooster(
-        const coordmap::CoordMap& coormap_idx, const rsite::Index& rsite_idx,
-        std::size_t batch_size, std::uint8_t mapq_low, std::uint8_t mapq_cap, bool name_check, 
-        int cm_max_hops, uint32_t cm_max_fanout, uint32_t cm_min_len, double cm_min_frac, uint32_t cm_max_total_hits,
-        double sub_ovlp_frac, 
-        double K_mapq, double K_rs, double K_as, double K_ml, double K_nm, double W_mapq, double W_rs, double W_as, double W_ml, double W_nm, double close_as_eps,
-        int threads, int io_threads
+        const coordmap::CoordMap& coormap_idx,
+        const rsite::Index& rsite_idx,
+        MapqBoostOpts params
     );
 
     // in_path/out_path: "-" or empty => stdin/stdout
@@ -67,26 +66,7 @@ public:
 private:
     const coordmap::CoordMap& coormap_idx_;
     const rsite::Index& rsite_idx_;
-    const std::size_t   batch_size_;
-    const std::uint8_t  mapq_low_;
-    const std::uint8_t  mapq_cap_;
-    const bool          name_check_;
-
-    // CoordMapOpts
-    const int      cm_max_hops_;
-    const uint32_t cm_max_fanout_;
-    const uint32_t cm_min_len_;
-    const double   cm_min_frac_;
-    const uint32_t cm_max_total_hits_;
-
-    // Record cluster parameters
-    const double sub_ovlp_frac_;
-    const double K_mapq_, K_rs_, K_as_, K_ml_, K_nm_;
-    const double W_mapq_, W_rs_, W_as_, W_ml_, W_nm_;
-    const double close_as_eps_;
-
-    const int threads_;
-    const int io_threads_;
+    const MapqBoostOpts params_;
 
 private:
     // Build subgroups for one read group:

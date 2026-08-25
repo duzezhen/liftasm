@@ -4,12 +4,14 @@
 #include <vector>
 #include <memory>
 #include <thread>
+#include <utility>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
 #include <numeric>
 
+#include "CommandOptions.hpp"
 #include "gfa_parser.hpp"
 #include "../include/kgaf.hpp"
 #include "mmidx.hpp"
@@ -17,11 +19,8 @@
 
 class GfaDepth : public GfaGraph {
 public:
-    GfaDepth(int min_mapq, double min_align_frac, bool base_depth = false, bool forbid_overlap = true) {
-        set_forbid_overlap(forbid_overlap);
-        base_depth_ = base_depth;
-        min_mapq_ = min_mapq;
-        min_align_frac_ = min_align_frac;
+    explicit GfaDepth(DepthOpts params) : params_(std::move(params)) {
+        set_forbid_overlap(params_.forbid_overlap);
     }
 
 public:
@@ -32,10 +31,7 @@ public:
     bool count_from_A(const std::string& out_file);
     
 protected:
-    bool  base_depth_;               // whether to compute base-level depth instead of segment-level depth
-    // filters for GAF alignments
-    int    min_mapq_        = 0;     // minimum mapping quality (MAPQ) to consider an alignment
-    double min_align_frac_  = 0.0;   // minimum aligned fraction (aln_len / qlen) to consider an alignment
+    const DepthOpts params_;
 
 protected:
     struct ReadRec { std::string name; std::string seq; std::string qual; };

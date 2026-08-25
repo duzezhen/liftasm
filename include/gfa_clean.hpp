@@ -1,17 +1,12 @@
 #pragma once
 
+#include "CommandOptions.hpp"
 #include "gfa_parser.hpp"
 
 #include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-struct GfaCleanOptions {
-    uint32_t min_reads{5};
-    double min_purity{0.8};
-    double min_comp_overlap{0.05};
-};
 
 class GfaCleaner : public GfaGraph {
 public:
@@ -27,7 +22,7 @@ public:
         std::string optional_tags;
     };
 
-    explicit GfaCleaner(GfaCleanOptions options);
+    explicit GfaCleaner(CleanOpts params);
 
     size_t clean(const std::vector<std::string>& ctg_files);
     void save_read_placements(const std::string& output_file) const;
@@ -66,6 +61,6 @@ private:
     static double component_overlap_(const ComponentOverlapIndex& index, uint32_t a, uint32_t b);
     static uint64_t component_pair_key_(uint32_t a, uint32_t b);
 
-    GfaCleanOptions options_;
+    const CleanOpts params_;
     std::vector<ReadPlacement> read_placements_;
 };

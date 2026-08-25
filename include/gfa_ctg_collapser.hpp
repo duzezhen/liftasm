@@ -9,6 +9,7 @@
 #include <vector>
 
 class CtgCollapseDebugger;
+class CtgRepeatNormalizer;
 
 /* ================================================================================================================
  *                                        CTG COLLAPSER START
@@ -32,21 +33,12 @@ public:
         bool anchor_only
     );
 
-    std::vector<std::string> collapse_samples(
-        const std::vector<std::string>& hap1_files,
-        const std::vector<std::string>& hap2_files,
-        const std::vector<std::string>& sample_names,
-        const std::vector<std::string>& vcf_files,
-        const std::string& prefix,
-        double min_anchor_coverage,
-        uint32_t short_contig_len,
-        uint32_t min_contig_len,
-        bool anchor_only,
-        const std::string& command_line
-    ) const;
+    std::vector<std::string> collapse_samples(const CollapseOpts& options) const;
 
-    void set_component_filter(double min_coverage, double end_fraction) noexcept;
     void rebuild_component_paths();
+
+    // Normalize repeat-only bubbles from the final contig P-lines.
+    size_t normalize_repeat_paths(const CollapseOpts& options, BubbleOpts bubble_options);
 
     // Collapse uniquely placed standalone ms contigs into existing components.
     std::unordered_set<std::string> collapse_misassemblies(
@@ -56,9 +48,7 @@ public:
 
 private:
     friend class CtgCollapseDebugger;
-
-    double min_component_coverage_{0.5};
-    double component_end_fraction_{0.01};
+    friend class CtgRepeatNormalizer;
 
     struct SegmentOrigin {
         uint32_t sample{UINT32_MAX};
@@ -203,6 +193,67 @@ private:
 };
 /* ================================================================================================================
  *                                         CTG COLLAPSER END
+ * ================================================================================================================ */
+
+/* ================================================================================================================
+ *                                      CTG REPEAT NORMALIZER START
+ * ================================================================================================================ */
+class CtgRepeatNormalizer {
+public:
+    CtgRepeatNormalizer(
+        GfaCtgCollapser& graph,
+        const CollapseOpts& options,
+        BubbleOpts bubble_options
+    );
+
+    size_t run();
+
+private:
+    struct Occurrence {
+        uint32_t path{0};
+        uint32_t pos{0};
+    };
+
+    struct PathAnnotation {
+        std::vector<uint8_t> repeat;
+        bool valid{false};
+    };
+
+    struct Edit {
+        uint32_t path{0};
+        uint32_t begin{0}, end{0};
+        std::vector<PathSegment> replacement;
+    };
+
+    struct Candidate {
+        uint64_t length{0};
+        std::vector<Edit> edits;
+        std::vector<uint32_t> removed_nodes;
+        std::vector<uint32_t> template_nodes;
+        std::vector<uint32_t> sample_ids;
+    };
+
+    GfaCtgCollapser& graph_;
+    const uint32_t min_repeat_len_;
+    const uint32_t max_repeat_period_;
+    const uint32_t max_repeat_mismatch_;
+    BubbleOpts bubble_options_;
+
+    std::vector<PathAnnotation> annotations_;
+    std::unordered_map<uint32_t, std::vector<Occurrence>> starts_;
+    std::vector<uint32_t> path_occurrences_;
+
+    static bool is_component_path_(const std::string& name);
+    static uint32_t path_vertex_(const PathSegment& segment);
+
+    PathAnnotation annotate_path_(size_t path_id) const;
+    void annotate_paths_();
+    void index_bubble_starts_(const std::vector<GfaBubble::Bubble>& bubbles);
+    bool build_candidate_(const GfaBubble::Bubble& bubble, Candidate& candidate) const;
+    size_t apply_candidates_(std::vector<Candidate> candidates);
+};
+/* ================================================================================================================
+ *                                       CTG REPEAT NORMALIZER END
  * ================================================================================================================ */
 
 /* ================================================================================================================

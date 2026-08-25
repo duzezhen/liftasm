@@ -14,12 +14,14 @@ namespace aligner {
 
 /*====================== 2. Alignmenter ============================*/
 Alignmenter::Alignmenter(
-    const mmidx::MinimizerIndex& GIndex,
-    const std::vector<std::string>& names,
-    const std::vector<std::string_view>& seqs,
-    const opt::ExtendOpts& extendOpts,
-    const opt::AlignOpts& alignParams
-) : GIndex_(GIndex), names_(names), seqs_(seqs), extendOpts_(extendOpts), alignParams_(alignParams) {}
+    const mmidx::MinimizerIndex& index,
+    const ExpandedSeqs& sequences,
+    const opt::AlignmentOptions& options
+) : GIndex_(index),
+    names_(sequences.names),
+    seqs_(sequences.seqs),
+    extendOpts_(options.extend),
+    alignParams_(options.align) {}
 
 /*------------------------------------------------------------------*
  * flush SAM buffer (under out_mtx_)

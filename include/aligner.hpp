@@ -27,11 +27,9 @@ struct ReadRec { std::string name; std::string seq; std::string qual; };
 class Alignmenter {
 public:
     Alignmenter(
-        const mmidx::MinimizerIndex& GIndex,
-        const std::vector<std::string>& names,
-        const std::vector<std::string_view>& seqs,
-        const opt::ExtendOpts& extendOpts,
-        const opt::AlignOpts& alignParams
+        const mmidx::MinimizerIndex& index,
+        const ExpandedSeqs& sequences,
+        const opt::AlignmentOptions& options
     );
 
     void align(

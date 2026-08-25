@@ -704,7 +704,7 @@ void GfaCtgCollapser::align_unanchored_contigs_(
     std::vector<BubbleAlignment> alignments = align_component_backbones_(
         contigs, {"hap1", "hap2"}, prefix, short_contig_len
     );
-    if (alignments.empty() || min_component_coverage_ <= 0.0) return;
+    if (alignments.empty() || collapser_params_.ctg_min_coverage <= 0.0) return;
 
     struct Bounds {
         uint32_t a_beg{UINT32_MAX}, a_end{0};
@@ -730,7 +730,7 @@ void GfaCtgCollapser::align_unanchored_contigs_(
         const Bounds& span = bounds.at({a_sid, b_sid, reverse});
         const double a_cov = nodes_[a_sid].length == 0 ? 0.0 : static_cast<double>(span.a_end - span.a_beg) / nodes_[a_sid].length;
         const double b_cov = nodes_[b_sid].length == 0 ? 0.0 : static_cast<double>(span.b_end - span.b_beg) / nodes_[b_sid].length;
-        return std::max(a_cov, b_cov) < min_component_coverage_;
+        return std::max(a_cov, b_cov) < collapser_params_.ctg_min_coverage;
     }), alignments.end());
 
     bubble_aligns_.insert(
@@ -863,7 +863,7 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_block_(cons
 
 void GfaCtgCollapser::align_regions_(const std::vector<AnchorBlock>& regions) {
     log_stream() << "Aligning haplotype regions ...\n";
-    ThreadPool pool(alignOpts_.threads);
+    ThreadPool pool(alignment_options_.align.threads);
     std::vector<std::future<std::vector<BubbleAlignment>>> futures;
     futures.reserve(regions.size());
     ProgressTracker progress(regions.size());
@@ -956,11 +956,6 @@ void GfaCtgCollapser::append_component_paths_() {
     log_stream() << "  - Longest paths added: " << component_paths.size() << "\n\n";
 
     paths_.insert(paths_.end(), std::make_move_iterator(component_paths.begin()), std::make_move_iterator(component_paths.end()));
-}
-
-void GfaCtgCollapser::set_component_filter(double min_coverage, double end_fraction) noexcept {
-    min_component_coverage_ = min_coverage;
-    component_end_fraction_ = end_fraction;
 }
 
 void GfaCtgCollapser::rebuild_component_paths() {
@@ -1236,18 +1231,12 @@ void GfaCtgCollapser::collapse_ctgs(
     log_stream() << message << ".\n\n";
 }
 
-std::vector<std::string> GfaCtgCollapser::collapse_samples(
-    const std::vector<std::string>& hap1_files,
-    const std::vector<std::string>& hap2_files,
-    const std::vector<std::string>& sample_names,
-    const std::vector<std::string>& vcf_files,
-    const std::string& prefix,
-    double min_anchor_coverage,
-    uint32_t short_contig_len,
-    uint32_t min_contig_len,
-    bool anchor_only,
-    const std::string& command_line
-) const {
+std::vector<std::string> GfaCtgCollapser::collapse_samples(const CollapseOpts& options) const {
+    const auto& hap1_files = options.input.hap1Files;
+    const auto& hap2_files = options.input.hap2Files;
+    const auto& sample_names = options.input.sampleNames;
+    const auto& vcf_files = options.input.vcfFiles;
+
     std::vector<std::string> names = sample_names;
     if (names.empty()) {
         names.reserve(hap1_files.size());
@@ -1285,29 +1274,32 @@ std::vector<std::string> GfaCtgCollapser::collapse_samples(
             warning_stream() << "  ! Duplicate sample name '" << base_name << "'; using '" << unique_name << "'\n";
         }
 
-        const std::string sample_prefix = prefix + "." + unique_name;
+        const std::string sample_prefix = options.prefix + "." + unique_name;
         const std::vector<std::string> sample_vcf = vcf_files.empty() || vcf_files[i].empty()
             ? std::vector<std::string>{}
             : std::vector<std::string>{vcf_files[i]};
 
         log_stream() << "Processing contig sample " << (i + 1) << '/' << hap1_files.size() << " (" << unique_name << ") ...\n\n";
         GfaCtgCollapser sample(*this);
-        sample.load_ctgs({hap1_files[i]}, {hap2_files[i]}, {unique_name}, min_contig_len);
+        sample.load_ctgs({hap1_files[i]}, {hap2_files[i]}, {unique_name}, options.ctg_min_len);
         if (namespace_samples) sample.namespace_segment_names_("_" + std::to_string(i + 1));
         sample.collapse_ctgs(
-            sample_vcf, sample_prefix, min_anchor_coverage,
-            short_contig_len, anchor_only
+            sample_vcf, sample_prefix, options.ctg_anchor_coverage,
+            options.ctg_short_len, options.ctg_anchor_only
         );
-        sample.save_to_disk(sample_prefix + ".collapse.gfa", true, false, true, command_line);
-        sample.save_to_disk(sample_prefix + ".collapse.noseq.gfa", true, false, false, command_line);
+        sample.save_to_disk(sample_prefix + ".collapse.gfa", true, false, true, options.command_line);
+        sample.save_to_disk(sample_prefix + ".collapse.noseq.gfa", true, false, false, options.command_line);
         outputs.push_back(sample_prefix + ".collapse.gfa");
         output_names.push_back(unique_name);
     }
 
     if (outputs.size() > 1) {
         GfaCtgCollapser combined(*this);
-        combined.collapse_backbone_samples_(outputs, output_names, prefix, short_contig_len, command_line);
-        return {prefix + ".iter0.collapse.gfa"};
+        combined.collapse_backbone_samples_(
+            outputs, output_names, options.prefix,
+            options.ctg_short_len, options.command_line
+        );
+        return {options.prefix + ".iter0.collapse.gfa"};
     }
     return outputs;
 }
@@ -1356,8 +1348,8 @@ std::vector<std::vector<GfaCtgCollapser::ComponentHit>> GfaCtgCollapser::select_
                         candidate.ref_end - candidate.ref_beg,
                         candidate.query_end - candidate.query_beg
                     );
-                    if (short_query && static_cast<double>(aligned_len) / query_len < MIN_JACCARD_FOR_ALIGN_) continue;
-                    if (short_reference && static_cast<double>(aligned_len) / ref_len < MIN_JACCARD_FOR_ALIGN_) continue;
+                    if (short_query && static_cast<double>(aligned_len) / query_len < collapser_params_.min_jaccard) continue;
+                    if (short_reference && static_cast<double>(aligned_len) / ref_len < collapser_params_.min_jaccard) continue;
                     eligible.push_back(std::move(candidate));
                 }
                 candidates = std::move(eligible);
@@ -1465,20 +1457,21 @@ std::vector<std::vector<GfaCtgCollapser::ComponentHit>> GfaCtgCollapser::select_
                 }
                 group.span = interval_union_length(std::move(intervals));
                 group.strong = query_len > 0 &&
-                    static_cast<double>(group.span) / query_len >= MIN_JACCARD_FOR_ALIGN_;
+                    static_cast<double>(group.span) / query_len >= collapser_params_.min_jaccard;
                 if (group.strong) pairs.push_back(std::move(group));
                 continue;
             }
 
             const uint64_t shorter = std::min<uint64_t>(query_len, backbones[group.rid].sequence.size());
-            const uint64_t query_tolerance = component_end_fraction_ > 0.0 ? std::max<uint64_t>(10'000, query_len * component_end_fraction_) : 0;
-            const uint64_t ref_tolerance = component_end_fraction_ > 0.0 ? std::max<uint64_t>(10'000, ref_len * component_end_fraction_) : 0;
-            const bool opposite_ends = component_end_fraction_ > 0.0 && (
+            const double end_fraction = collapser_params_.ctg_end_fraction;
+            const uint64_t query_tolerance = end_fraction > 0.0 ? std::max<uint64_t>(10'000, query_len * end_fraction) : 0;
+            const uint64_t ref_tolerance = end_fraction > 0.0 ? std::max<uint64_t>(10'000, ref_len * end_fraction) : 0;
+            const bool opposite_ends = end_fraction > 0.0 && (
                 (group.query_beg <= query_tolerance && ref_len - group.ref_end <= ref_tolerance) ||
                 (query_len - group.query_end <= query_tolerance && group.ref_beg <= ref_tolerance)
             );
             const double coverage = shorter > 0 ? static_cast<double>(group.span) / shorter : 0.0;
-            group.strong = short_query || short_reference || coverage >= min_component_coverage_ || opposite_ends;
+            group.strong = short_query || short_reference || coverage >= collapser_params_.ctg_min_coverage || opposite_ends;
             if (!group.hits.empty()) pairs.push_back(std::move(group));
         }
     }
@@ -1691,15 +1684,15 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     mm_idxopt_t index_options;
     mm_mapopt_t map_options;
     mm_set_opt(nullptr, &index_options, &map_options);
-    if (mm_set_opt(MM2_PRESET_.c_str(), &index_options, &map_options) < 0) {
-        error_stream() << "Invalid mm2 preset: " << MM2_PRESET_ << "\n";
+    if (mm_set_opt(params_.mm2_preset.c_str(), &index_options, &map_options) < 0) {
+        error_stream() << "Invalid mm2 preset: " << params_.mm2_preset << "\n";
         std::exit(1);
     }
-    index_options.k = static_cast<short>(chainOpts_.k);
-    index_options.w = static_cast<short>(chainOpts_.w);
+    index_options.k = static_cast<short>(alignment_options_.chain.k);
+    index_options.w = static_cast<short>(alignment_options_.chain.w);
     map_options.flag |= MM_F_CIGAR | MM_F_EQX;
-    map_options.best_n = static_cast<short>(anchorOpts_.max_kept);
-    map_options.zdrop = extendOpts_.dyn_zdrop;
+    map_options.best_n = static_cast<short>(alignment_options_.anchor.max_kept);
+    map_options.zdrop = alignment_options_.extend.dyn_zdrop;
 
     SAVE paf(prefix + ".paf");
     SAVE paf_all(prefix + ".all.paf");
@@ -1768,13 +1761,15 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     mm_mapopt_t round_options = map_options;
     mm_mapopt_update(&round_options, index);
 
-    ThreadPool pool(alignOpts_.threads);
+    ThreadPool pool(alignment_options_.align.threads);
     struct PendingMap {
         const ComponentBackbone* query = nullptr;
         std::future<MapResult> future;
     };
     std::deque<PendingMap> futures;
-    const size_t max_pending = std::max<size_t>(1, static_cast<size_t>(alignOpts_.threads) * 2);
+    const size_t max_pending = std::max<size_t>(
+        1, static_cast<size_t>(alignment_options_.align.threads) * 2
+    );
     ProgressTracker progress(queries.size());
 
     for (const ComponentBackbone* query : queries) {
@@ -1790,7 +1785,7 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
                 for (int i = 0; i < count; ++i) {
                     const mm_reg1_t& hit = regs[i];
                     if (!hit.p || hit.rid < 0 || static_cast<size_t>(hit.rid) >= references.size()) continue;
-                    if (hit.mapq < MIN_MAPQ_ || hit.parent != hit.id) continue;  // filter based on mapping quality
+                    if (hit.mapq < params_.min_mapq || hit.parent != hit.id) continue;  // filter based on mapping quality
                     const mm_extra_t* extra = static_cast<const mm_extra_t*>(hit.p);
                     if (!extra || extra->n_cigar == 0) continue;
 
@@ -1808,7 +1803,7 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
                     candidate.mapq = hit.mapq;
                     candidate.cigar = CIGAR::to_string(extra->cigar, extra->n_cigar);
                     candidate.ops = CIGAR::parse(candidate.cigar);
-                    if (candidate.ops.empty() || CIGAR::match_ratio(candidate.cigar) < MIN_MATCH_RATIO_) continue;  // filter based on match ratio
+                    if (candidate.ops.empty() || CIGAR::match_ratio(candidate.cigar) < params_.min_match_ratio) continue;  // filter based on match ratio
 
                     const ComponentBackbone& ref = *references[candidate.rid];
                     if (query_components && ref.component == query->component) continue;
@@ -1817,7 +1812,7 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
                         candidate.query_end - candidate.query_beg
                     );
                     const uint64_t shorter = std::min(ref.sequence.size(), query->sequence.size());
-                    if (shorter > 0 && static_cast<double>(span) / shorter < MIN_ALI_RATIO_) continue;  // filter based on alignment ratio
+                    if (shorter > 0 && static_cast<double>(span) / shorter < params_.min_ali_ratio) continue;  // filter based on alignment ratio
                     candidate.rid = ref.id;
                     result.hits.push_back(std::move(candidate));
                 }

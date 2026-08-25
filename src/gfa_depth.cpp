@@ -125,7 +125,7 @@ void GfaDepth::write_kmer_depth_bed_(
         saver.save(line);
     }
 
-    if (!base_depth_) return;
+    if (!params_.base_depth) return;
 
     // Base-level section: chrom  pos  depth  freq
     saver.save("## chrom\tpos\tdepth\tfreq\n");
@@ -193,18 +193,18 @@ bool GfaDepth::count_from_kmer(
 // ----------------------- count depth from GAF alignments -----------------------
 
 bool GfaDepth::pass_gaf_filters_(const kgaf::Record& rec) {
-    if (min_mapq_ > 0) {
-        if (rec.mapq < min_mapq_) return false;
+    if (params_.min_mapq > 0) {
+        if (rec.mapq < params_.min_mapq) return false;
     }
 
-    if (min_align_frac_ > 0.0) {
+    if (params_.min_frac > 0.0) {
         const uint64_t qlen  = rec.qlen;
         const uint64_t qs    = rec.qstart;
         const uint64_t qe    = rec.qend;
         if (qlen == 0) return false;
         const uint64_t aln   = (qe > qs ? (qe - qs) : 0);
         const double   frac  = static_cast<double>(aln) / static_cast<double>(qlen);
-        if (frac < min_align_frac_) return false;
+        if (frac < params_.min_frac) return false;
     }
 
     return true;
@@ -346,7 +346,7 @@ void GfaDepth::write_gaf_depth_bed_(
         saver.save(line);
     }
 
-    if (!base_depth_) return;
+    if (!params_.base_depth) return;
 
     // run-length coverage per segment: chrom  start  depth
     saver.save("## chrom\tpos\tdepth\n");
@@ -464,7 +464,7 @@ void GfaDepth::write_A_depth_bed_(
         saver.save(line);
     }
 
-    if (!base_depth_) return;
+    if (!params_.base_depth) return;
 
     // base-level depth per segment
     saver.save("## chrom\tpos\tdepth\n");

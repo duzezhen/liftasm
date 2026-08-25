@@ -131,40 +131,26 @@ uint64_t layout_deviation(const std::vector<int64_t>& values, int64_t center) {
 
 
 // Configure and run the complete gap-fill pipeline.
-GfaGapfill::GfaGapfill(Params params) : params_(std::move(params)) {
+GfaGapfill::GfaGapfill(GapfillOpts options) : params_(std::move(options)) {
     // Gapfill uses node boundaries from a deoverlapped graph.
     set_forbid_overlap(true);
     full_phase_samples_.insert(
         params_.full_phase_samples.begin(), params_.full_phase_samples.end()
     );
-}
-
-void GfaGapfill::set_alignment_options(
-    const opt::ChainOpts& chain,
-    const opt::AnchorOpts& anchor,
-    const opt::ExtendOpts& extend,
-    const opt::AlignOpts& align,
-    const std::string& preset,
-    double min_match,
-    double min_ali_ratio,
-    uint8_t min_mapq
-) {
-    mm2_.k = chain.k;
-    mm2_.w = chain.w;
-    mm2_.best_n = anchor.max_kept;
-    mm2_.zdrop = extend.dyn_zdrop;
-    mm2_.preset = preset;
-    mm2_.min_match = min_match;
-    mm2_.min_ali_ratio = min_ali_ratio;
-    mm2_.min_mapq = min_mapq;
-    params_.threads = std::max<uint32_t>(1, align.threads);
+    mm2_.k = params_.alignment_options.chain.k;
+    mm2_.w = params_.alignment_options.chain.w;
+    mm2_.best_n = params_.alignment_options.anchor.max_kept;
+    mm2_.zdrop = params_.alignment_options.extend.dyn_zdrop;
+    mm2_.preset = params_.mm2_preset;
+    mm2_.min_match = params_.min_match;
+    mm2_.min_ali_ratio = params_.min_ali_ratio;
+    mm2_.min_mapq = params_.min_mapq;
+    params_.threads = std::max<uint32_t>(1, params_.threads);
 }
 
 
 // ================================================= Clear state =================================================
 void GfaGapfill::clear_state_() {
-    prepared_candidates_.clear();
-    candidates_prepared_ = false;
     fragments_.clear();
     backbone_bp_.clear();
     source_ids_.clear();
@@ -189,18 +175,12 @@ void GfaGapfill::clear_state_() {
 
 size_t GfaGapfill::gapfill(const std::vector<GfaBubble::Bubble>& bubbles) {
     log_stream() << "Gap-filling sample contigs with source-aware graph walks ...\n\n";
-    std::vector<Candidate> candidates;
-    if (candidates_prepared_) {
-        candidates = std::move(prepared_candidates_);
-        candidates_prepared_ = false;
-    } else {
-        clear_state_();
-        index_bubble_nodes_(bubbles);
-        build_fragments_();
-        build_graph_order_();
-        index_source_transitions_();
-        candidates = build_candidates_();
-    }
+    clear_state_();
+    index_bubble_nodes_(bubbles);
+    build_fragments_();
+    build_graph_order_();
+    index_source_transitions_();
+    std::vector<Candidate> candidates = build_candidates_();
 
     std::vector<Candidate> selected = select_and_walk_(candidates);
 
@@ -214,42 +194,12 @@ size_t GfaGapfill::gapfill(const std::vector<GfaBubble::Bubble>& bubbles) {
     return selected.size();
 }
 
-std::vector<GfaGapfill::MisassemblyContig> GfaGapfill::prepare_misassemblies(
-    const std::vector<GfaBubble::Bubble>& bubbles
-) {
+std::vector<GfaGapfill::MisassemblyContig> GfaGapfill::prepare_misassemblies() {
     log_stream() << "Detecting terminal misassemblies before gap filling ...\n\n";
     clear_state_();
-    index_bubble_nodes_(bubbles);
+    bubble_nodes_.assign(getNumNodes(), 0);
     build_fragments_();
-    build_graph_order_();
-    index_source_transitions_();
-
-    std::vector<Candidate> candidates = build_candidates_(true);
-    check_unplaced_sequence_(candidates);
-    std::vector<MisassemblyContig> result = split_misassemblies_(candidates);
-    if (result.empty()) {
-        std::vector<Candidate> phase_edges;
-        size_t kept = 0;
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            const Candidate& candidate = candidates[i];
-            const uint64_t fill_bp = candidate.right_boundary.bridge_cut_bp - candidate.left_boundary.bridge_cut_bp;  // Gap fill size
-            if ((!candidate.target_overlaps && candidate.target_distance > params_.max_gap_bp) || fill_bp > params_.max_gap_bp) continue;  // Skip long gaps
-            const Fragment& left = fragments_[candidate.left];
-            const Fragment& right = fragments_[candidate.right];
-            if (!full_phase_samples_.count(left.sample) && left.hap != right.hap) continue;  // Skip cross-haplotype connections if not full-phase
-            if (left.hap != right.hap) {
-                phase_edges.push_back(std::move(candidates[i]));
-                continue;
-            }
-            if (kept != i) candidates[kept] = std::move(candidates[i]);
-            ++kept;
-        }
-        candidates.resize(kept);
-        group_full_phase_candidates_(candidates, phase_edges);
-        prepared_candidates_ = std::move(candidates);
-        candidates_prepared_ = true;
-    }
-    return result;
+    return GfaGapfillMisassembly(*this).run();
 }
 
 void GfaGapfill::set_misassemblies(
@@ -417,7 +367,7 @@ void GfaGapfill::build_fragments_() {
 
         // ------------------------------------------------ Build fragment indexes ------------------------------------------------
         rebuild_fragment_index_(fragment);
-        fragment.eligible = fragment.length >= params_.min_contig_bp;
+        fragment.eligible = fragment.length >= params_.min_contig;
 
         // ------------------------------------------------ Attach relocation records ------------------------------------------------
         const auto relocation = misassembly_index_.find(path.name);
@@ -1034,7 +984,7 @@ GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
     // ------------------------------------------------ Try each left contig ------------------------------------------------
     for (uint32_t left_id : sample_fragments) {
         const Fragment& left = fragments_[left_id];
-        if (left.length < params_.min_contig_bp) continue;
+        if (left.length < params_.min_contig) continue;
         const bool target_full_phase = full_phase_samples_.count(left.sample);
 
         // ------------------------------------------------ Find bridge and right contigs ------------------------------------------------
@@ -1059,7 +1009,7 @@ GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
             const OverlapSupport left_support = overlap_support_(
                 left, bridge, bridge_item.second
             );
-            if (left_support.shared_bp < params_.min_overlap_bp) {
+            if (left_support.shared_bp < params_.min_overlap) {
                 ++batch.low_support;
                 continue;
             }
@@ -1097,7 +1047,7 @@ GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
                 const OverlapSupport right_support = overlap_support_(
                     bridge, right, right_item.second
                 );
-                if (right_support.shared_bp < params_.min_overlap_bp) {
+                if (right_support.shared_bp < params_.min_overlap) {
                     ++batch.low_support;
                     continue;
                 }
@@ -1120,7 +1070,7 @@ GfaGapfill::CandidateBatch GfaGapfill::build_sample_candidates_(
                 }
                 const uint64_t fill_bp = candidate.right_boundary.bridge_cut_bp -
                     candidate.left_boundary.bridge_cut_bp;
-                if (!include_long_gaps && fill_bp > params_.max_gap_bp) {
+                if (!include_long_gaps && fill_bp > params_.max_gap) {
                     ++batch.wrong_group;
                     continue;
                 }
@@ -1229,16 +1179,16 @@ bool GfaGapfill::ordered_pair_(
     const Fragment& right,
     bool include_long_gaps
 ) const {
-    if (left.sample != right.sample || left.component != right.component || left.length < params_.min_contig_bp || right.length < params_.min_contig_bp) return false;
+    if (left.sample != right.sample || left.component != right.component || left.length < params_.min_contig || right.length < params_.min_contig) return false;
     if (left.layout_start > right.layout_start) return false;
     const int64_t left_end = left.layout_start + static_cast<int64_t>(left.length);
     const int64_t right_end = right.layout_start + static_cast<int64_t>(right.length);
     if (right.layout_start >= left_end) {
-        return include_long_gaps || static_cast<uint64_t>(right.layout_start - left_end) <= params_.max_gap_bp;
+        return include_long_gaps || static_cast<uint64_t>(right.layout_start - left_end) <= params_.max_gap;
     }
     const uint64_t overlap = static_cast<uint64_t>(std::min(left_end, right_end) - right.layout_start);
     const double fraction = static_cast<double>(overlap) / std::min(left.length, right.length);
-    return fraction <= params_.max_target_overlap;
+    return fraction <= params_.max_overlap;
 }
 
 bool GfaGapfill::skips_backbone_(uint32_t left_id, uint32_t right_id) const {
@@ -1258,7 +1208,7 @@ bool GfaGapfill::skips_backbone_(uint32_t left_id, uint32_t right_id) const {
     for (uint32_t id = begin; id < end; ++id) {
         const Fragment& middle = fragments_[id];
         if (middle.sample != left.sample || middle.component != left.component ||
-            middle.hap != left.hap || middle.length < params_.min_contig_bp ||
+            middle.hap != left.hap || middle.length < params_.min_contig ||
             !middle.eligible || middle.redundant) continue;
         const int64_t middle_begin = middle.layout_start;
         const int64_t middle_end = middle_begin + static_cast<int64_t>(middle.length);
@@ -1311,7 +1261,7 @@ bool GfaGapfill::homolog_spans_(
         if (right_it == overlaps[bridge_id].end()) continue;
         const OverlapSupport left_support = overlap_support_(left, bridge, item.second);
         const OverlapSupport right_support = overlap_support_(bridge, right, right_it->second);
-        if (left_support.shared_bp < params_.min_overlap_bp || right_support.shared_bp < params_.min_overlap_bp || left_support.similarity < params_.min_similarity || right_support.similarity < params_.min_similarity) continue;
+        if (left_support.shared_bp < params_.min_overlap || right_support.shared_bp < params_.min_overlap || left_support.similarity < params_.min_similarity || right_support.similarity < params_.min_similarity) continue;
 
         const int64_t left_end = left.layout_start + static_cast<int64_t>(left.length);
         const int64_t bridge_end = bridge.layout_start + static_cast<int64_t>(bridge.length);
@@ -1355,8 +1305,8 @@ void GfaGapfill::group_full_phase_candidates_(
             left.hap < 1 || left.hap > 2) continue;
         const uint64_t bridge_bp = candidate.right_boundary.bridge_cut_bp -
             candidate.left_boundary.bridge_cut_bp;
-        if ((!candidate.target_overlaps && candidate.target_distance > params_.max_gap_bp) ||
-            bridge_bp > params_.max_gap_bp) continue;
+        if ((!candidate.target_overlaps && candidate.target_distance > params_.max_gap) ||
+            bridge_bp > params_.max_gap) continue;
 
         const auto key = std::make_pair(candidate.left, candidate.right);
         direct_by_ends[key].push_back(id);
@@ -1749,7 +1699,7 @@ std::vector<size_t> GfaGapfill::select_candidates_(
             const Fragment& left = fragments_[edge.left];
             const Fragment& right = fragments_[edge.right];
             if (edge.target_overlaps && static_cast<double>(edge.target_distance) /
-                    std::min(left.length, right.length) > params_.max_target_overlap) {
+                    std::min(left.length, right.length) > params_.max_overlap) {
                 rejected = Candidate::COORDINATE_CONFLICT;
                 decision = "drop:long-overlap";
             } else if (outgoing[edge.left] != SIZE_MAX || incoming[edge.right] != SIZE_MAX) {
@@ -2114,8 +2064,8 @@ bool GfaGapfill::resolve_fill_path_(
     options.soft_blocked = soft_blocked.empty() ? nullptr : &soft_blocked;
     options.soft_block_mask = soft_block_mask;
     options.max_depth = params_.max_depth;
-    options.max_bp = params_.max_gap_bp;
-    options.max_states = params_.dfs_guard;
+    options.max_bp = params_.max_gap;
+    options.max_states = params_.DFS_guard;
 
     const GfaSourceWalker::Result result = GfaSourceWalker(*this).walk(source, sink, options);
     if (!result || result.truncated) return false;
@@ -2137,7 +2087,7 @@ bool GfaGapfill::resolve_fill_path_(
         fill->left_cut = nodes_[Vertex::get_segment_id(source)].length;
         fill->right_cut = fill->length - nodes_[Vertex::get_segment_id(sink)].length;
     }
-    if (fill->left_cut > fill->right_cut || fill->right_cut - fill->left_cut > params_.max_gap_bp || fill->right_cut > fill->length || candidate.right_boundary.target_cut_bp > right.length) return false;
+    if (fill->left_cut > fill->right_cut || fill->right_cut - fill->left_cut > params_.max_gap || fill->right_cut > fill->length || candidate.right_boundary.target_cut_bp > right.length) return false;
 
     candidate.fill = std::move(fill);
     return true;
@@ -2145,457 +2095,6 @@ bool GfaGapfill::resolve_fill_path_(
 
 
 // ================================================= Misassembly detection and relocation =================================================
-void GfaGapfill::check_unplaced_sequence_(std::vector<Candidate>& candidates) const {
-    log_stream() << "Checking long unplaced contig ends ...\n";
-
-    // ------------------------------------------------ Bit encoding ------------------------------------------------
-    // Left/right end
-    constexpr uint32_t RIGHT_END_CODE = 0;
-    constexpr uint32_t LEFT_END_CODE = 1;
-    constexpr uint32_t END_KEY_SHIFT = 1;
-    // left/right sequence checks
-    constexpr uint8_t CHECK_LEFT = 1u << 0;
-    constexpr uint8_t CHECK_RIGHT = 1u << 1;
-    // left, then right
-    constexpr uint32_t TERMINAL_SLOTS = 2;
-    constexpr uint32_t LEFT_TERMINAL_OFFSET = 0;
-    constexpr uint32_t RIGHT_TERMINAL_OFFSET = 1;
-
-    // ------------------------------------------------ Helper Functions ------------------------------------------------
-    const auto check_candidate = [this](  // Compare the unplaced left/right ends with the bridge sequence.
-        Candidate& candidate, bool check_left, bool check_right
-    ) {
-        const Fragment& left = fragments_[candidate.left];
-        const Fragment& right = fragments_[candidate.right];
-        const Fragment& bridge = fragments_[candidate.bridge];
-
-        if (check_left) {
-            const uint64_t target_begin = left.path_bp[candidate.left_boundary.target_pos + 1];
-            const uint64_t bridge_begin = bridge.path_bp[candidate.left_boundary.bridge_pos + 1];
-            const uint64_t compare_bp = std::min(left.length - target_begin, bridge.length - bridge_begin);
-            const std::string unplaced = fragment_subsequence_(left, target_begin, target_begin + compare_bp);
-            const std::string filled = fragment_subsequence_(bridge, bridge_begin, bridge_begin + compare_bp);
-            candidate.left_unplaced_similarity = mm2_similarity_(filled, unplaced);
-            candidate.left_misassembly = candidate.left_unplaced_similarity >= 0.0 && candidate.left_unplaced_similarity < params_.misassembly_similarity;
-        }
-        if (check_right) {
-            const uint64_t target_end = right.path_bp[candidate.right_boundary.target_pos];
-            const uint64_t bridge_end = bridge.path_bp[candidate.right_boundary.bridge_pos];
-            const uint64_t compare_bp = std::min(target_end, bridge_end);
-            const std::string unplaced = fragment_subsequence_(right, target_end - compare_bp, target_end);
-            const std::string filled = fragment_subsequence_(bridge, bridge_end - compare_bp, bridge_end);
-            candidate.right_unplaced_similarity = mm2_similarity_(filled, unplaced);
-            candidate.right_misassembly = candidate.right_unplaced_similarity >= 0.0 && candidate.right_unplaced_similarity < params_.misassembly_similarity;
-        }
-    };
-
-
-    // ------------------------------------------------ Keep one candidate per end ------------------------------------------------
-    std::unordered_map<uint64_t, uint32_t> best;  // Key = (fragment_id << 1) | side, Value = candidate index; left side = 1, right side = 0
-    for (uint32_t i = 0; i < candidates.size(); ++i) {
-        Candidate& candidate = candidates[i];
-        const Fragment& left = fragments_[candidate.left];
-        const Fragment& right = fragments_[candidate.right];
-        candidate.left_unplaced = left.length - left.path_bp[candidate.left_boundary.target_pos + 1];
-        candidate.right_unplaced = right.path_bp[candidate.right_boundary.target_pos];
-        const uint64_t keys[2] = {
-            (static_cast<uint64_t>(candidate.left) << END_KEY_SHIFT) | LEFT_END_CODE,
-            (static_cast<uint64_t>(candidate.right) << END_KEY_SHIFT) | RIGHT_END_CODE
-        };
-        const uint64_t lengths[2] = {candidate.left_unplaced, candidate.right_unplaced};
-        for (uint32_t side = 0; side < 2; ++side) {
-            if (lengths[side] <= params_.misassembly_check_bp) continue;
-            const auto found = best.find(keys[side]);
-            if (found == best.end() || candidate_better_(candidate, candidates[found->second])) {
-                best[keys[side]] = i;
-            }
-        }
-    }
-
-    // ------------------------------------------------ Group fragments by haplotype ------------------------------------------------
-    std::map<std::pair<std::string, uint8_t>, std::vector<uint32_t>> haplotypes;  // Sample name + haplotype -> fragment IDs
-    for (uint32_t i = 0; i < fragments_.size(); ++i) {
-        haplotypes[{fragments_[i].sample, fragments_[i].hap}].push_back(i);
-    }
-    if (haplotypes.size() <= 2) {
-        log_stream() << "  - Misassembly check skipped: only " << haplotypes.size() << " haplotypes\n\n";
-        return;
-    }
-
-    // ------------------------------------------------ Find shared terminal nodes ------------------------------------------------
-    // rule: <=4 haplotypes -> support 1 is checked;
-    //        >4 haplotypes -> support 1/2 is checked.
-    const uint32_t max_rare_support = haplotypes.size() <= 4 ? 1 : 2;
-    std::unordered_map<uint32_t, std::vector<uint32_t>> terminal_nodes;  // Segment ID -> candidate IDs
-    std::vector<uint64_t> terminal_bp(candidates.size() * 2, 0);
-    for (const auto& item : best) {
-        const uint32_t candidate_id = item.second;
-        const bool left_side = (item.first & LEFT_END_CODE) == LEFT_END_CODE;
-        const Candidate& candidate = candidates[candidate_id];
-        const Fragment& fragment = fragments_[left_side ? candidate.left : candidate.right];
-        const uint32_t begin = left_side ? candidate.left_boundary.target_pos + 1 : 0;
-        const uint32_t end = left_side ? fragment.vertices.size() : candidate.right_boundary.target_pos;
-        const uint32_t terminal_id = candidate_id * TERMINAL_SLOTS + (left_side ? LEFT_TERMINAL_OFFSET : RIGHT_TERMINAL_OFFSET);
-        terminal_bp[terminal_id] = left_side ? candidate.left_unplaced : candidate.right_unplaced;
-        for (uint32_t pos = begin; pos < end; ++pos) {
-            terminal_nodes[Vertex::get_segment_id(fragment.vertices[pos])].push_back(terminal_id);
-        }
-    }
-
-    // ------------------------------------------------ Count haplotype support ------------------------------------------------
-    std::vector<uint32_t> haplotype_support(terminal_bp.size(), 0);
-    for (const auto& haplotype : haplotypes) {
-        std::unordered_set<uint32_t> seen_nodes;
-        std::unordered_map<uint32_t, uint64_t> shared_bp;
-        for (uint32_t fragment_id : haplotype.second) {
-            for (uint32_t vertex : fragments_[fragment_id].vertices) {
-                const uint32_t segment = Vertex::get_segment_id(vertex);
-                const auto found = terminal_nodes.find(segment);
-                if (found == terminal_nodes.end() || !seen_nodes.insert(segment).second) continue;
-                for (uint32_t terminal_id : found->second) {
-                    shared_bp[terminal_id] += nodes_[segment].length;
-                }
-            }
-        }
-        for (const auto& support : shared_bp) {
-            if (support.second >= terminal_bp[support.first] * params_.misassembly_similarity) {
-                ++haplotype_support[support.first];
-            }
-        }
-    }
-
-    // ------------------------------------------------ Keep supported ends and check the rest ------------------------------------------------
-    std::vector<uint8_t> sides(candidates.size(), 0);  // Bit 0 = unplaced, Bit 1 = left side, Bit 2 = right side, Bit 3 = both sides
-    size_t supported = 0, checked = 0;
-    for (const auto& item : best) {
-        const uint32_t candidate_id = item.second;
-        const bool left_side = item.first & 1;
-        const uint32_t terminal_id = candidate_id * 2 + !left_side;
-        if (haplotype_support[terminal_id] > max_rare_support) {
-            const Candidate& candidate = candidates[candidate_id];
-            const Fragment& fragment = fragments_[left_side ? candidate.left : candidate.right];
-            log_stream() << "  - Preserved " << (left_side ? "right end of " : "left end of ") << paths_[fragment.path_id].name << ": supported by " << haplotype_support[terminal_id] << " haplotypes\n";
-            ++supported;
-            continue;
-        }
-        sides[candidate_id] |= left_side ? CHECK_LEFT : CHECK_RIGHT;
-        ++checked;
-    }
-    std::vector<uint32_t> work;
-    work.reserve(best.size());
-    for (uint32_t i = 0; i < sides.size(); ++i) {
-        if (sides[i]) work.push_back(i);
-    }
-
-    // ------------------------------------------------ Compare selected ends with bridge sequence ------------------------------------------------
-    if (!work.empty()) {
-        ThreadPool pool(std::min<size_t>(params_.threads, work.size()));
-        std::vector<std::future<void>> futures;
-        futures.reserve(work.size());
-        for (uint32_t i : work) {
-            futures.emplace_back(pool.submit([&, i] {
-                check_candidate(
-                    candidates[i], sides[i] & CHECK_LEFT, sides[i] & CHECK_RIGHT
-                );
-            }));
-        }
-        ProgressTracker progress(work.size());
-        for (auto& future : futures) {
-            future.get();
-            progress.hit();
-        }
-        progress.finish();
-        pool.stop();
-    }
-
-    // ------------------------------------------------ Report possible misassemblies ------------------------------------------------
-    size_t possible = 0;
-    for (uint32_t i : work) {
-        const Candidate& candidate = candidates[i];
-        const Fragment& left = fragments_[candidate.left];
-        const Fragment& right = fragments_[candidate.right];
-        const Fragment& bridge = fragments_[candidate.bridge];
-        if ((sides[i] & CHECK_LEFT) && candidate.left_unplaced_similarity < 0.0) {
-            warning_stream() << "  ! Preserving unchecked left end of " << paths_[left.path_id].name << ": sequence unavailable\n";
-        }
-        if ((sides[i] & CHECK_RIGHT) && candidate.right_unplaced_similarity < 0.0) {
-            warning_stream() << "  ! Preserving unchecked right end of " << paths_[right.path_id].name << ": sequence unavailable\n";
-        }
-        possible += candidate.left_misassembly;
-        possible += candidate.right_misassembly;
-        if (candidate.left_misassembly) {
-            uint64_t begin = left.path_bp[candidate.left_boundary.target_pos + 1];
-            uint64_t end = left.length;
-            if (left.reverse) {
-                end = left.length - begin;
-                begin = 0;
-            }
-            log_stream() << "  - Possible misassembly: " << paths_[left.path_id].name
-                         << ':' << begin << '-' << end
-                         << " | compared with " << paths_[bridge.path_id].name
-                         << " | similarity=" << std::fixed << std::setprecision(4)
-                         << candidate.left_unplaced_similarity
-            << " | haplotypes=" << haplotype_support[i * TERMINAL_SLOTS + LEFT_TERMINAL_OFFSET]
-                         << '/' << haplotypes.size() << '\n';
-        }
-        if (candidate.right_misassembly) {
-            uint64_t begin = 0;
-            uint64_t end = right.path_bp[candidate.right_boundary.target_pos];
-            if (right.reverse) {
-                begin = right.length - end;
-                end = right.length;
-            }
-            log_stream() << "  - Possible misassembly: " << paths_[right.path_id].name
-                         << ':' << begin << '-' << end
-                         << " | compared with " << paths_[bridge.path_id].name
-                         << " | similarity=" << std::fixed << std::setprecision(4)
-                         << candidate.right_unplaced_similarity
-                         << " | haplotypes=" << haplotype_support[i * TERMINAL_SLOTS + RIGHT_TERMINAL_OFFSET]
-                         << '/' << haplotypes.size() << '\n';
-        }
-    }
-    log_stream() << "  - Long ends checked: " << checked << '\n';
-    log_stream() << "  - Supported ends preserved: " << supported << '\n';
-    log_stream() << "  - Possible misassemblies: " << possible << "\n\n";
-}
-
-std::vector<GfaGapfill::MisassemblyContig> GfaGapfill::split_misassemblies_(
-    const std::vector<Candidate>& candidates
-) {
-    // ------------------------------------------------ Helper Functions ------------------------------------------------
-    const auto misassembly_contig_name = [](
-        const std::string& sample, uint8_t hap, size_t number
-    ) {
-        std::ostringstream name;
-        name << sample << ".h" << static_cast<uint32_t>(hap) << "ms" << std::setw(6) << std::setfill('0') << number << 'l';
-        return name.str();
-    };
-
-    // ------------------------------------------------ Bit encoding ------------------------------------------------
-    enum SplitEnd : uint64_t {
-        SPLIT_RIGHT_END = 0,
-        SPLIT_LEFT_END = 1
-    };
-    constexpr uint32_t SPLIT_END_BITS = 1;
-    constexpr uint32_t VERTEX_REVERSE_BIT = 1u;
-    constexpr SplitEnd CANDIDATE_SPLIT_ENDS[2] = {SPLIT_RIGHT_END, SPLIT_LEFT_END};
-
-    // ------------------------------------------------ Collect misassembly ends ------------------------------------------------
-    struct Split {
-        uint32_t source{UINT32_MAX}, begin{0}, end{0};  // Fragment ID and vertex range to split
-        const char* side{nullptr};  // left/right/whole
-        std::string sequence;
-    };
-
-    std::vector<Split> splits;
-    std::unordered_set<uint64_t> seen;
-    for (const Candidate& candidate : candidates) {
-        const uint32_t sources[2] = {candidate.left, candidate.right};
-        const uint32_t begins[2] = {candidate.left_boundary.target_pos + 1, 0};
-        const uint32_t ends[2] = {
-            static_cast<uint32_t>(fragments_[candidate.left].vertices.size()),
-            candidate.right_boundary.target_pos
-        };
-        const bool flagged[2] = {candidate.left_misassembly, candidate.right_misassembly};
-        for (uint32_t side = 0; side < 2; ++side) {
-            if (!flagged[side] || begins[side] >= ends[side]) continue;
-            const uint64_t key = (static_cast<uint64_t>(sources[side]) << SPLIT_END_BITS) | CANDIDATE_SPLIT_ENDS[side];
-            if (!seen.insert(key).second) continue;
-            splits.push_back({
-                sources[side], begins[side], ends[side],
-                CANDIDATE_SPLIT_ENDS[side] == SPLIT_RIGHT_END ? "right" : "left", {}
-            });
-        }
-    }
-
-    // ------------------------------------------------ Find matching terminal blocks ------------------------------------------------
-    // Terminal block can occur on more than one misassembled haplotype. Split every contig where that block is also terminal.
-    const size_t seed_count = splits.size();
-    for (size_t seed_id = 0; seed_id < seed_count; ++seed_id) {
-        const Split& seed = splits[seed_id];
-        const Fragment& source = fragments_[seed.source];
-        std::unordered_set<uint32_t> terminal_nodes;  // segment IDs
-        uint64_t terminal_bp = 0;
-        for (uint32_t pos = seed.begin; pos < seed.end; ++pos) {
-            const uint32_t sid = Vertex::get_segment_id(source.vertices[pos]);
-            if (terminal_nodes.insert(sid).second) terminal_bp += nodes_[sid].length;
-        }
-        if (terminal_bp == 0) continue;
-
-        for (uint32_t fragment_id = 0; fragment_id < fragments_.size(); ++fragment_id) {
-            if (fragment_id == seed.source) continue;
-            const Fragment& fragment = fragments_[fragment_id];
-            uint32_t first = UINT32_MAX, last = 0;
-            uint64_t shared_bp = 0;
-            std::unordered_set<uint32_t> shared_nodes;  // segment IDs
-            for (uint32_t pos = 0; pos < fragment.vertices.size(); ++pos) {
-                const uint32_t sid = Vertex::get_segment_id(fragment.vertices[pos]);
-                if (!terminal_nodes.contains(sid) || !shared_nodes.insert(sid).second) continue;
-                first = std::min(first, pos);
-                last = std::max(last, pos);
-                shared_bp += nodes_[sid].length;
-            }
-            if (first == UINT32_MAX || shared_bp < terminal_bp * params_.misassembly_similarity) continue;
-
-            // Propagate only blocks that actually touch a contig end. This is
-            // a structural terminal check, not a fixed-distance heuristic.
-            const bool prefix = first == 0;
-            const bool suffix = last + 1 == fragment.vertices.size();
-            if (!prefix && !suffix) continue;
-            const uint64_t fragment_key = static_cast<uint64_t>(fragment_id) << SPLIT_END_BITS;
-            const uint64_t right_end_key = fragment_key | SPLIT_RIGHT_END;
-            const uint64_t left_end_key = fragment_key | SPLIT_LEFT_END;
-            if (prefix && suffix) {
-                if (seen.contains(left_end_key) || seen.contains(right_end_key)) continue;
-                seen.insert(left_end_key);
-                seen.insert(right_end_key);
-                splits.push_back({fragment_id, 0, static_cast<uint32_t>(fragment.vertices.size()), "whole", {}});
-            } else if (prefix) {
-                if (!seen.insert(left_end_key).second) continue;
-                splits.push_back({fragment_id, 0, last + 1, "left", {}});
-            } else {
-                if (!seen.insert(right_end_key).second) continue;
-                splits.push_back({fragment_id, first, static_cast<uint32_t>(fragment.vertices.size()), "right", {}});
-            }
-        }
-    }
-
-    // ------------------------------------------------ Build split sequences ------------------------------------------------
-    std::vector<uint8_t> split_nodes(nodes_.size(), false);  // Nodes needed to be deleted after all paths have been rewritten
-    size_t valid_splits = 0;
-    for (size_t i = 0; i < splits.size(); ++i) {
-        Split& split = splits[i];
-        split.sequence = fragment_sequence_(fragments_[split.source], split.begin, split.end);
-        if (split.sequence.empty()) {
-            warning_stream() << "  ! Cannot split misassembly without sequence: " << paths_[fragments_[split.source].path_id].name << '\n';
-            continue;
-        }
-        for (uint32_t pos = split.begin; pos < split.end; ++pos) {
-            split_nodes[Vertex::get_segment_id(fragments_[split.source].vertices[pos])] = true;
-        }
-        if (valid_splits != i) splits[valid_splits] = std::move(split);
-        ++valid_splits;
-    }
-    splits.resize(valid_splits);
-
-    // ------------------------------------------------ Find retained source ranges ------------------------------------------------
-    std::vector<uint32_t> retained_begin(fragments_.size(), 0);
-    std::vector<uint32_t> retained_end;
-    retained_end.reserve(fragments_.size());
-    for (const Fragment& fragment : fragments_) retained_end.push_back(fragment.vertices.size());
-    for (const Split& split : splits) {
-        if (split.begin == 0) retained_begin[split.source] = std::max(retained_begin[split.source], split.end);
-        if (split.end == fragments_[split.source].vertices.size()) {
-            retained_end[split.source] = std::min(retained_end[split.source], split.begin);
-        }
-    }
-
-    // ------------------------------------------------ Cut fully contig from backbone ------------------------------------------------
-    std::vector<uint8_t> valid_source(fragments_.size(), true);
-    for (const Split& split : splits) {
-        if (retained_begin[split.source] >= retained_end[split.source]) valid_source[split.source] = false;
-    }
-
-    // ------------------------------------------------ Create single misassembly paths ------------------------------------------------
-    std::unordered_set<std::string> names;
-    names.reserve(nodes_.size() + paths_.size());
-    for (const GfaNode& node : nodes_) names.insert(node.name);
-    for (const GfaPath& path : paths_) names.insert(path.name);
-
-    std::vector<MisassemblyContig> records;
-    records.reserve(splits.size());
-    size_t number = 0;
-    for (const Split& split : splits) {
-        const Fragment& source = fragments_[split.source];
-        std::string name;
-        do {
-            name = misassembly_contig_name(source.sample, source.hap, ++number);
-        } while (!names.insert(name).second);
-
-        std::vector<uint32_t> sample_ids;
-        const auto sample = sample_name_to_id_.find(source.sample);
-        if (sample != sample_name_to_id_.end()) sample_ids.push_back(sample->second);
-        // Create a new segment
-        const uint32_t segment = add_segment(name, split.sequence, true, sample_ids);
-        // Create a new path
-        GfaPath path;
-        path.name = name;
-        path.segments.push_back({segment, false});
-        paths_.push_back(std::move(path));
-        records.push_back({
-            name, source.sample, paths_[source.path_id].name,
-            split.side, source.hap, source.component
-        });
-    }
-
-    // ------------------------------------------------ Trim original paths ------------------------------------------------
-    size_t trimmed = 0;
-    for (uint32_t i = 0; i < fragments_.size(); ++i) {
-        if (retained_begin[i] == 0 && retained_end[i] == fragments_[i].vertices.size()) continue;
-        const Fragment& source = fragments_[i];
-        if (!valid_source[i]) {
-            paths_[source.path_id].segments.clear();
-            ++trimmed;
-            continue;
-        }
-        std::vector<uint32_t> retained(
-            source.vertices.begin() + retained_begin[i],
-            source.vertices.begin() + retained_end[i]
-        );
-        if (source.reverse) {
-            std::reverse(retained.begin(), retained.end());
-            for (uint32_t& vertex : retained) vertex ^= VERTEX_REVERSE_BIT;
-        }
-        GfaPath& path = paths_[source.path_id];
-        path.segments.clear();
-        path.segments.reserve(retained.size());
-        for (uint32_t vertex : retained) {
-            path.segments.push_back({
-                Vertex::get_segment_id(vertex), Vertex::get_is_reverse(vertex)
-            });
-        }
-        ++trimmed;
-    }
-    paths_.erase(
-        std::remove_if(paths_.begin(), paths_.end(), [](const GfaPath& path) {
-            return path.segments.empty();
-        }),
-        paths_.end()
-    );
-
-    // ------------------------------------------------ Remove unused split nodes ------------------------------------------------
-    // Delete old split nodes
-    std::vector<uint8_t> path_nodes(nodes_.size(), false);
-    for (const GfaPath& path : paths_) {
-        std::string sample;
-        uint8_t hap = 0;
-        if (!parse_path_name_(path.name, sample, hap)) continue;
-        for (const PathSegment& segment : path.segments) {
-            if (segment.node_id < path_nodes.size()) path_nodes[segment.node_id] = true;
-        }
-    }
-    size_t removed = 0;
-    for (uint32_t sid = 0; sid < split_nodes.size(); ++sid) {
-        if (split_nodes[sid] && !path_nodes[sid] && delete_segment(sid)) ++removed;
-    }
-    if (removed > 0) {
-        paths_.erase(
-            std::remove_if(paths_.begin(), paths_.end(), [&](const GfaPath& path) {
-                return std::any_of(path.segments.begin(), path.segments.end(), [&](const PathSegment& segment) {
-                    return segment.node_id < nodes_.size() && nodes_[segment.node_id].deleted;
-                });
-            }),
-            paths_.end()
-        );
-        rebuild_after_edits();
-    }
-
-    log_stream() << "Splitting terminal misassemblies into single contigs ...\n";
-    log_stream() << "  - Misassembly contigs created: " << records.size() << '\n';
-    log_stream() << "  - Misassembly nodes removed: " << removed << "\n\n";
-    return records;
-}
-
 void GfaGapfill::mark_used_relocations_(const std::vector<Candidate>& selected) {
     for (const Candidate& candidate : selected) {
         const uint32_t ids[2] = {candidate.left, candidate.right};
@@ -2982,7 +2481,7 @@ GfaGapfill::PrimarySelection GfaGapfill::select_primary_chains_() const {
         for (uint8_t hap = 0; hap < 2; ++hap) {
             for (const Chain* chain : component->second[hap]) hap_bp[hap] += chain_lengths.at(chain);
         }
-        if (std::max(hap_bp[0], hap_bp[1]) <= params_.dedup_component_bp) {
+        if (std::max(hap_bp[0], hap_bp[1]) <= params_.dedup_component) {
             component = primary_components.erase(component);
         } else {
             ++component;
@@ -3080,7 +2579,7 @@ GfaGapfill::ChainRefs GfaGapfill::unmatched_small_primary_chains_(
         for (uint8_t hap = 0; hap < 2; ++hap) {
             for (const Chain* chain : component.second[hap]) hap_bp[hap] += chain_lengths.at(chain);
         }
-        const bool is_small = std::max(hap_bp[0], hap_bp[1]) <= params_.dedup_component_bp;
+        const bool is_small = std::max(hap_bp[0], hap_bp[1]) <= params_.dedup_component;
         for (uint8_t hap = 0; hap < 2; ++hap) {
             auto& destination = is_small ? small_chains[hap] : large[hap];
             destination.insert(destination.end(), component.second[hap].begin(), component.second[hap].end());
@@ -3646,7 +3145,7 @@ bool GfaGapfillBoundary::find_anchors_(
     }
     if (direct_matches > 0) {
         const uint64_t shorter_bp = std::min(left.length, right.length);
-        if (shorter_bp == 0 || static_cast<double>(direct_bp) / shorter_bp > gapfill_.params_.max_target_overlap) {
+        if (shorter_bp == 0 || static_cast<double>(direct_bp) / shorter_bp > gapfill_.params_.max_overlap) {
             return false;
         }
         if (2 * left_sum + direct_matches <= direct_matches * left.vertices.size() || 2 * right_sum + direct_matches >= direct_matches * right.vertices.size()) {
@@ -3782,7 +3281,7 @@ std::pair<uint32_t, uint32_t> GfaGapfillBoundary::phase_region_(
     bool before
 ) const {
     const GfaGapfill::Fragment& fragment = gapfill_.fragments_[fragment_id];
-    const uint64_t window = gapfill_.params_.phase_window_bp;
+    const uint64_t window = gapfill_.params_.phase_win;
     uint64_t begin_bp = 0;
     uint64_t end_bp = 0;
     if (before) {

@@ -100,7 +100,7 @@ This command first writes collapsed GFAs for each tissue, then writes the combin
 | `--ctg_min_len INT` `[2Mb]` | Minimum input contig length in CTG mode. | Lower when short contigs are important; `0` disables filtering. |
 | `--anchor_only` | Align only shared-read anchors in CTG mode. | Use when full-contig alignment is unnecessary or too expensive. |
 
-For difficult repetitive graphs, `--repeat_mask MIN_LEN,MAX_PERIOD,MAX_MISMATCH` masks short tandem repeats during alignment, and `--no_cx` disables complex-region filtering. Both are advanced choices: the former costs time; the latter can permit unreliable complex-graph merges.
+For difficult repetitive graphs, `--repeat_mask MIN_LEN,MAX_PERIOD,MAX_MISMATCH` controls tandem-repeat detection. UTG mode masks repeat matches during alignment; CTG mode uses the final contig P-lines to normalize repeat-only bubbles. `--no_cx` disables complex-region filtering and can permit unreliable complex-graph merges.
 
 ## `gapfill`: use source-aware node walks to close contig gaps
 
@@ -123,6 +123,9 @@ With the default prefix, the report is `out.gapfill.tsv`. The command also write
 | `--DFS_guard INT` `[1M]` | Maximum visited states for one bubble or gap walk. | Increase when a complex but valid region reaches the search limit. |
 | `--min_match FLOAT` `[0.9]` | Minimum matching-base fraction in relocation and deduplication alignments. | Raise it for more conservative sequence checks. |
 | `--min_ali_ratio FLOAT` `[0.05]` | Minimum aligned fraction in relocation and deduplication alignments. | Raise it to ignore short local hits. |
+| `--ms_len INT` `[10M]` | Minimum low-support sequence at a contig end. | Lower it to inspect shorter terminal errors. |
+| `--ms_sim FLOAT` `[0.7]` | Fraction that one other component must cover. | Raise it for more conservative splitting. |
+| `--ms_haps INT\|auto` `[auto]` | Minimum supporting haplotypes, computed per component. | Use an integer to replace the automatic 1/2-haplotype rule. |
 | `--min_mapq INT` `[30]` | Minimum mapping quality in relocation and deduplication alignments. | Raise it when repeats create ambiguous hits. |
 | `--min_contig INT` `[1Mb]` | Shortest contig considered as evidence. | Raise it to avoid noisy short contigs. |
 | `--max_gap INT` `[10Mb]` | Largest graph gap eligible for filling. | Lower it when only short joins are trusted. |

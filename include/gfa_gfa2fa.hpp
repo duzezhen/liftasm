@@ -2,7 +2,9 @@
 #include <cstdint>
 #include <iosfwd>
 #include <string>
+#include <utility>
 #include <vector>
+#include "CommandOptions.hpp"
 #include "gfa_parser.hpp"
 #include "gfa_name.hpp"
 #include "seq_utils.hpp"
@@ -10,11 +12,7 @@
 // Directly inherit GfaGraph to use its protected API
 class Gfa2fa : public GfaGraph {
 public:
-    Gfa2fa(int min_len_xbp, int extend_ybp, int wrap_width, bool skip_unknown = true)
-        : min_len_xbp_(min_len_xbp)
-        , extend_ybp_(extend_ybp)
-        , wrap_width_(wrap_width)
-        , skip_unknown_(skip_unknown) {}
+    explicit Gfa2fa(Gfa2FaOpts params) : params_(std::move(params)) {}
 
     // Export current graph (this) to FASTA; for segments with length < x,
     // extend y bp on both sides. The extension does NOT include the segment itself.
@@ -24,10 +22,7 @@ public:
     bool dump_to_file(const std::string& fasta_path) const;
 
 private:
-    int  min_len_xbp_;
-    int  extend_ybp_;
-    int  wrap_width_;
-    bool skip_unknown_;
+    const Gfa2FaOpts params_;
 
 private:
     // Helpers

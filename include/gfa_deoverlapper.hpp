@@ -4,6 +4,7 @@
 #include <utility>
 #include <optional>
 
+#include "CommandOptions.hpp"
 #include "gfa_parser.hpp"
 #include "seg_replace.hpp"
 #include "logger.hpp"
@@ -46,44 +47,20 @@ public:
 
 public:
 
-    GfaDeoverlapper(
-        int min_eq, 
-        double min_match_ratio,
-        double min_ali_ratio,
-        uint8_t min_mapq,
-        uint32_t trim_min_len,
-        double trim_max_overlap,
-        uint16_t max_prop_iters, 
-        uint32_t max_abnormal_cut_len, 
-        uint32_t min_abnormal_cut_count, 
-        uint32_t min_trans_len,
-        std::string mm2_preset
-    ) {
+    explicit GfaDeoverlapper(CollapseOpts params)
+        : params_(std::move(params)) {
         set_forbid_overlap(false);
-        MIN_EQ_FOR_CUT_ = min_eq;
-        MIN_MATCH_RATIO_ = min_match_ratio;
-        MIN_ALI_RATIO_ = min_ali_ratio;
-        MIN_MAPQ_ = min_mapq;
-        TRIM_MIN_ALIGN_LEN_ = trim_min_len;
-        TRIM_MAX_OVERLAP_ = trim_max_overlap;
-        MAX_PROPAGATION_ITERS_ = max_prop_iters;
-        MAX_ABNORMAL_CUT_LEN_ = max_abnormal_cut_len;
-        MIN_ABNORMAL_CUT_COUNT_ = min_abnormal_cut_count;
-        MIN_TRANS_LEN_ = min_trans_len;
-        if (!mm2_preset.empty()) MM2_PRESET_ = mm2_preset;
     }
 
-    void set_opts(
-        const opt::ChainOpts&  chain, const opt::AnchorOpts& anchor,
-        const opt::ExtendOpts& extend, const opt::AlignOpts&  align, 
-        bool use_wfa
-    ) {
-        chainOpts_ = chain; anchorOpts_ = anchor; extendOpts_ = extend; alignOpts_ = align; use_wfa_ = use_wfa;
+    void set_opts(const opt::AlignmentOptions& options) {
+        alignment_options_ = options;
     }
 
     void deoverlap(const std::string& prefix);
 
 protected:  // data will be used in rulemap building
+    const CollapseOpts params_;
+
     /* -------------------------------------------- collapse bubbles -------------------------------------------- */
     struct MmWfaHit {
         uint32_t r_beg = 0, r_end = 0;     // alignment start/end on reference (0-based, end-exclusive)
@@ -118,26 +95,7 @@ protected:  // data will be used in rulemap building
     SegReplace::RuleMap rulemap_;  // Replacement rules for segments
     std::vector<uint8_t> keep_unused_nodes_;  // Whether to keep segments that are not involved in any alignment-based replacement rule.
 
-    int MIN_EQ_FOR_CUT_;              // Only when the length of '=' in CIGAR >= threshold, a cut point is made / rulemap is established
-    double MIN_MATCH_RATIO_;          // Only when the ratio of '=/M' in CIGAR >= threshold, the alignment will be saved for rulemap building
-    double MIN_ALI_RATIO_;            // minimum aligned length ratio against shorter sequence
-    uint8_t MIN_MAPQ_;                // Minimum mapping quality to be considered
-    uint32_t TRIM_MIN_ALIGN_LEN_ = 5'000'000;
-    double TRIM_MAX_OVERLAP_ = 0.05;
-    uint16_t MAX_PROPAGATION_ITERS_;  // Maximum number of propagation iterations
-
-    uint32_t MAX_ABNORMAL_CUT_LEN_ = 4;     // Maximum short segment length (bp) considered abnormal
-    uint32_t MIN_ABNORMAL_CUT_COUNT_ = 5;   // Minimum consecutive abnormal short segments required for pruning
-
-    uint32_t MIN_TRANS_LEN_ = 3;  // Minimum interval length to allow transitive replacement expansion (i.e. if A->B and B->C, then A->C is allowed only if the replacement interval is >= this length)
-
-    std::string MM2_PRESET_ = "asm5";
-
-    opt::ChainOpts  chainOpts_;
-    opt::AnchorOpts anchorOpts_;
-    opt::ExtendOpts extendOpts_;
-    opt::AlignOpts  alignOpts_;
-    bool            use_wfa_ = false;  // whether to use WFA for alignment (default: use minimap2)
+    opt::AlignmentOptions alignment_options_;
 
 
 // Used to prevent generating cycle in graph.
