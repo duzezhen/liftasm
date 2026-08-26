@@ -469,7 +469,7 @@ private:
     static bool can_trim_suffix_(const std::string& ref, const std::vector<std::string>& alleles);
     std::string path_root_(const std::string& path_name) const;
     std::vector<uint32_t> path_sample_ids_(const std::vector<uint32_t>& path, uint32_t src_seg, uint32_t sink_seg) const;
-    std::vector<std::string> sample_gt_tokens_(const std::vector<std::string>& path_gt_tokens, const std::vector<std::vector<uint32_t>>& path_sample_ids) const;
+    std::vector<std::string> sample_gt_tokens_(const std::vector<std::string>& path_gt_tokens, const std::vector<std::vector<uint32_t>>& path_sample_ids, size_t sample_count, bool haploid) const;
     static bool same_vcf_allele_(const VcfRecord& a, const VcfRecord& b);
     static std::string merge_genotypes_(std::string_view a, std::string_view b);
     static void merge_sample_genotypes_(VcfRecord& target, const VcfRecord& duplicate);

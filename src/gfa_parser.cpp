@@ -82,6 +82,27 @@ static std::string gfa_sample_name_from_path_(const std::string& path) {
     return s.empty() ? "gfa" : s;
 }
 
+// Keep the P-line owner before callers normalize the contig name.
+static std::string gfa_sample_name_from_p_path_(const std::string& name) {
+    const std::pair<const char*, const char*> markers[] = {
+        {".hap1.", ".hap1"}, {".hap2.", ".hap2"},
+        {".h1tg",  ".hap1"}, {".h2tg",  ".hap2"},
+        {".h1ms",  ".hap1"}, {".h2ms",  ".hap2"}
+    };
+    for (const auto& [marker, suffix] : markers) {
+        const size_t pos = name.find(marker);
+        if (pos != std::string::npos && pos > 0) return name.substr(0, pos) + suffix;
+    }
+
+    // PanSN: sample#haplotype#contig.
+    const size_t first = name.find('#');
+    if (first != std::string::npos && first > 0) {
+        const size_t second = name.find('#', first + 1);
+        if (second != std::string::npos && second > first + 1) return name.substr(0, second);
+    }
+    return name;
+}
+
 bool GfaGraph::input_segment_names_need_namespace_(
     const std::vector<std::string>& filenames,
     const std::vector<uint32_t>& duplicate_groups
@@ -703,7 +724,9 @@ bool GfaGraph::parsePLine(std::stringstream& ss, const std::string& filename, ui
     ss >> c >> pname >> segs >> cigar;
     if (pname.empty() || segs.empty()) return false;
 
-    GfaPath p; p.name = pname;
+    GfaPath p;
+    p.name = pname;
+    p.sample = gfa_sample_name_from_p_path_(pname);
     std::stringstream segs_ss(segs);
     std::string tok;
     while (std::getline(segs_ss, tok, ',')) {

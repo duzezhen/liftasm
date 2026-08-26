@@ -542,4 +542,25 @@ double match_ratio(const uint32_t* cigar, uint32_t n) {
     return denom == 0 ? 0.0 : (double)match / (double)denom;
 }
 
+bool has_match(const std::vector<COp>& ops) {
+    for (const COp& op : ops) {
+        if ((op.op == 'M' || op.op == '=') && op.len > 0) return true;
+    }
+    return false;
+}
+
+bool mask_short_matches(std::vector<COp>& ops, uint32_t min_len) {
+    bool has_match = false;
+    for (COp& op : ops) {
+        if (op.op != 'M' && op.op != '=') continue;
+        if (op.len < min_len) {
+            // X consumes both coordinates but cannot introduce cuts or rules.
+            op.op = 'X';
+        } else {
+            has_match = true;
+        }
+    }
+    return has_match;
+}
+
 } // namespace CIGAR

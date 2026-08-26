@@ -1118,7 +1118,11 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::split_component_a
     std::vector<CIGAR::COp> piece_ops;
 
     auto flush = [&]() {
-        if (piece_ops.empty() || start_ri >= ref.pieces.size() || start_qi >= query_pieces.size()) return;
+        if (piece_ops.empty() || !CIGAR::has_match(piece_ops) ||
+            start_ri >= ref.pieces.size() || start_qi >= query_pieces.size()) {
+            piece_ops.clear();
+            return;
+        }
         const PathPiece& a = ref.pieces[start_ri];
         const PathPiece& b = query_pieces[start_qi];
         uint32_t a0 = start_rp - a.beg, a1 = rp - a.beg;
@@ -1135,6 +1139,7 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::split_component_a
             const uint32_t x = len - b1; b1 = len - b0; b0 = x;
         }
         result.emplace_back(nodes_[a_sid].name, nodes_[b_sid].name, a0, a1, b0, b1, a.vertex, b.vertex, mapq, std::move(piece_ops));
+        result.back().min_eq_checked = true;
         piece_ops.clear();
     };
 
@@ -1416,6 +1421,7 @@ std::vector<std::vector<GfaCtgCollapser::ComponentHit>> GfaCtgCollapser::select_
                         candidate.query_end = hit.q_end;
                         candidate.cigar = std::move(hit.cigar);
                         candidate.ops = CIGAR::parse(candidate.cigar);
+                        CIGAR::mask_short_matches(candidate.ops, static_cast<uint32_t>(params_.min_eq));
                         candidate.matches = CIGAR::match_len(candidate.cigar);
                         candidate.block_len = std::max(
                             candidate.ref_end - candidate.ref_beg,
@@ -1434,7 +1440,7 @@ std::vector<std::vector<GfaCtgCollapser::ComponentHit>> GfaCtgCollapser::select_
                         break;
                     }
                 }
-                if (!accepted || candidate.ops.empty()) continue;
+                if (!accepted || !CIGAR::has_match(candidate.ops)) continue;
                 group.query_beg = std::min(group.query_beg, candidate.query_beg);
                 group.query_end = std::max(group.query_end, candidate.query_end);
                 group.raw_query_beg = std::min(group.raw_query_beg, candidate.raw_query_beg);
@@ -1804,6 +1810,7 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
                     candidate.cigar = CIGAR::to_string(extra->cigar, extra->n_cigar);
                     candidate.ops = CIGAR::parse(candidate.cigar);
                     if (candidate.ops.empty() || CIGAR::match_ratio(candidate.cigar) < params_.min_match_ratio) continue;  // filter based on match ratio
+                    if (!CIGAR::mask_short_matches(candidate.ops, static_cast<uint32_t>(params_.min_eq))) continue;
 
                     const ComponentBackbone& ref = *references[candidate.rid];
                     if (query_components && ref.component == query->component) continue;

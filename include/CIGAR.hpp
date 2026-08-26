@@ -96,4 +96,14 @@ bool query_interval_fwd(const uint32_t* cigar, uint32_t n, bool is_rev, uint32_t
 double match_ratio(std::string_view cigar);
 double match_ratio(const uint32_t* cigar, uint32_t n);
 
+/**
+ * @brief Whether a CIGAR contains a match operation usable for collapse.
+ */
+bool has_match(const std::vector<COp>& ops);
+
+/**
+ * @brief Replace match runs shorter than min_len with coordinate-safe X.
+ */
+bool mask_short_matches(std::vector<COp>& ops, uint32_t min_len);
+
 } // namespace CIGAR

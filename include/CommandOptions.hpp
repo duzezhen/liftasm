@@ -85,7 +85,7 @@ struct BubbleOpts {
     uint32_t same_min_len = 1'000'000;
     uint32_t diff_min_src = 500'000;
     double diff_sim = 0.9;
-    uint32_t diff_min_len = 3'000'000;
+    uint32_t diff_min_len = 6'000'000;
     uint32_t homo_num = 1;
     uint32_t homo_k = 17;
     uint32_t homo_w = 100;
@@ -149,7 +149,7 @@ struct CollapseOpts {
     std::vector<uint32_t> same_min_lens    = {1000000};
     std::vector<uint32_t> diff_min_srcs    = {500000};
     std::vector<double>   diff_sims        = {0.9};
-    std::vector<uint32_t> diff_min_lens    = {3000000};
+    std::vector<uint32_t> diff_min_lens    = {6'000'000};
     std::vector<int>      min_eqs          = {1000, 3, 3};  // collapse defaults
 
     uint32_t repeat_mask_min_len      = 24;  // minimum tandem-repeat span to mask

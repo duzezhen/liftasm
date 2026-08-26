@@ -4022,9 +4022,151 @@ void BubbleWriter::save_gfa(
     log_stream() << "  - Total records written: " << nb + nh << "\n\n";
 }
 
-// ------------------------------------------------ Primary path coordinate index ------------------------------------------------
+// ------------------------------------------------ Contig P-line genotype index ------------------------------------------------
 namespace {
 
+static bool is_component_path_name_(std::string_view name)
+{
+    constexpr std::string_view component = "component";
+    if (name.starts_with(component)) {
+        const size_t first = component.size();
+        if (first < name.size() && std::all_of(name.begin() + first, name.end(), [](unsigned char c) {
+                return std::isdigit(c);
+            })) return true;
+    }
+
+    const size_t marker = name.rfind(".component");
+    if (marker == std::string_view::npos) return false;
+    const size_t first = marker + component.size() + 1;
+    return first < name.size() &&
+        std::all_of(name.begin() + first, name.end(), [](unsigned char c) {
+            return std::isdigit(c);
+        });
+}
+
+// Match complete bubble alleles against real contig P-lines. Component paths
+// describe graph backbones and must not contribute sample genotypes.
+class ContigPathIndex {
+public:
+    ContigPathIndex(const GfaGraph& graph, const std::vector<Bubble>& bubbles)
+    {
+        anchor_vertices_.reserve(bubbles.size() * 2);
+        for (const Bubble& bubble : bubbles) {
+            if (bubble.get_source() == UINT32_MAX || bubble.get_sink() == UINT32_MAX) continue;
+            anchor_vertices_.insert(bubble.get_source());
+            anchor_vertices_.insert(bubble.get_sink() ^ 1u);
+        }
+        occurrences_.reserve(anchor_vertices_.size());
+
+        std::unordered_map<std::string, uint32_t> sample_ids;
+        sample_ids.reserve(graph.getPaths().size());
+        paths_.reserve(graph.getPaths().size());
+
+        for (const GfaPath& path : graph.getPaths()) {
+            if (path.segments.empty() || path.segments.size() > UINT32_MAX ||
+                is_component_path_name_(path.name)) continue;
+
+            bool valid = true;
+            for (const PathSegment& segment : path.segments) {
+                if (segment.node_id >= graph.getNumNodes() || segment.node_id > UINT32_MAX / 2 ||
+                    graph.getNodeDeleted(segment.node_id)) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid || paths_.size() >= UINT32_MAX) continue;
+
+            const std::string& sample_name = path.sample.empty() ? path.name : path.sample;
+            auto [sample, inserted] = sample_ids.emplace(
+                sample_name, static_cast<uint32_t>(sample_names_.size())
+            );
+            if (inserted) sample_names_.push_back(sample_name);
+
+            const uint32_t path_id = static_cast<uint32_t>(paths_.size());
+            paths_.push_back({&path, sample->second});
+            for (uint32_t position = 0; position < path.segments.size(); ++position) {
+                const uint32_t vertex = vertex_at_(path, position);
+                if (anchor_vertices_.contains(vertex)) {
+                    occurrences_[vertex].push_back({path_id, position});
+                }
+            }
+        }
+    }
+
+    bool empty() const { return paths_.empty(); }
+    size_t path_count() const { return paths_.size(); }
+    const std::vector<std::string>& sample_names() const { return sample_names_; }
+
+    std::vector<std::vector<uint32_t>> match_samples(const Bubble& bubble) const
+    {
+        const auto& alleles = bubble.get_paths();
+        std::vector<std::vector<uint32_t>> out(alleles.size());
+
+        for (uint32_t allele_id = 0; allele_id < alleles.size(); ++allele_id) {
+            const std::vector<uint32_t>& allele = alleles[allele_id];
+            if (allele.empty() || allele.front() != bubble.get_source() ||
+                allele.back() != bubble.get_sink()) continue;
+
+            auto add_sample = [&](const IndexedPath& path) {
+                std::vector<uint32_t>& samples = out[allele_id];
+                if (std::find(samples.begin(), samples.end(), path.sample_id) == samples.end()) {
+                    samples.push_back(path.sample_id);
+                }
+            };
+            find_matches_(allele, false, add_sample);
+            find_matches_(allele, true, add_sample);
+        }
+        return out;
+    }
+
+private:
+    struct Occurrence {
+        uint32_t path_id{0};
+        uint32_t position{0};
+    };
+
+    struct IndexedPath {
+        const GfaPath* path{nullptr};
+        uint32_t sample_id{UINT32_MAX};
+    };
+
+    static uint32_t vertex_at_(const GfaPath& path, uint32_t position)
+    {
+        const PathSegment& segment = path.segments[position];
+        return Vertex::make_vertex(static_cast<uint32_t>(segment.node_id), segment.is_reverse);
+    }
+
+    template<class Callback>
+    void find_matches_(const std::vector<uint32_t>& allele, bool reverse, Callback&& callback) const
+    {
+        const uint32_t first = reverse ? allele.back() ^ 1u : allele.front();
+        const auto found = occurrences_.find(first);
+        if (found == occurrences_.end()) return;
+
+        for (const Occurrence& occurrence : found->second) {
+            const IndexedPath& indexed = paths_[occurrence.path_id];
+            const GfaPath& path = *indexed.path;
+            if (allele.size() > path.segments.size() - occurrence.position) continue;
+
+            bool equal = true;
+            for (size_t i = 0; i < allele.size(); ++i) {
+                const uint32_t expected = reverse ? allele[allele.size() - i - 1] ^ 1u : allele[i];
+                if (vertex_at_(path, occurrence.position + static_cast<uint32_t>(i)) != expected) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal) callback(indexed);
+        }
+    }
+
+    std::vector<std::string> sample_names_;
+    std::vector<IndexedPath> paths_;
+    std::unordered_set<uint32_t> anchor_vertices_;
+    std::unordered_map<uint32_t, std::vector<Occurrence>> occurrences_;
+};
+
+// ------------------------------------------------ Primary path coordinate index ------------------------------------------------
 class PrimaryPathIndex {
 public:
     struct Match {
@@ -4237,6 +4379,9 @@ void BubbleWriter::save_vcf(
     std::optional<PrimaryPathIndex> primary_index;
     if (use_primary_paths) primary_index.emplace(graph_, *reference_paths, bubbles_);
 
+    const ContigPathIndex contig_paths(graph_, bubbles_);
+    const bool use_p_genotypes = !contig_paths.empty();
+
     log_stream() << "Writing bubble VCF to " << output_prefix << ".bubbles.vcf ...\n";
     if (use_primary_paths) {
         log_stream() << "  - Using " << primary_index->size() << " primary contig paths as reference\n";
@@ -4252,6 +4397,10 @@ void BubbleWriter::save_vcf(
     }
     if (!use_primary_paths && !use_liftover && use_ref) {
         log_stream() << "  - No PAF provided; REF will not be extracted\n";
+    }
+    if (use_p_genotypes) {
+        log_stream() << "  - Using " << contig_paths.path_count() << " contig P-lines from "
+                     << contig_paths.sample_names().size() << " samples for genotypes\n";
     }
 
     std::unordered_map<std::string, std::vector<liftover::Pafinfo>> pafs;
@@ -4270,7 +4419,8 @@ void BubbleWriter::save_vcf(
     SAVE saver(output_prefix + ".bubbles.vcf");
     std::ostringstream oss;
 
-    const std::vector<std::string>& sample_names = graph_.getSampleNames();
+    const std::vector<std::string>& sample_names = use_p_genotypes ?
+        contig_paths.sample_names() : graph_.getSampleNames();
 
 
     // ------------------------------------------------ VCF Output ------------------------------------------------
@@ -4438,6 +4588,9 @@ void BubbleWriter::save_vcf(
         std::vector<std::vector<uint32_t>> path_sample_ids;
         std::vector<uint32_t> bubble_path_ids;
 
+        std::vector<std::vector<uint32_t>> p_path_sample_ids;
+        if (use_p_genotypes) p_path_sample_ids = contig_paths.match_samples(bb);
+
         path_names.reserve(bb.get_paths().size());
         allele_seqs.reserve(bb.get_paths().size());
         has_allele_seq.reserve(bb.get_paths().size());
@@ -4449,7 +4602,8 @@ void BubbleWriter::save_vcf(
             if (p.empty()) continue;
 
             path_names.push_back(path_name_u32_(p, src_seg, sink_seg));
-            path_sample_ids.push_back(path_sample_ids_(p, src_seg, sink_seg));
+            path_sample_ids.push_back(use_p_genotypes ?
+                p_path_sample_ids[path_id] : path_sample_ids_(p, src_seg, sink_seg));
             bubble_path_ids.push_back(path_id);
 
             if (!use_ref_sequence) {
@@ -4528,7 +4682,7 @@ void BubbleWriter::save_vcf(
                 rec.ref = ".";
                 rec.alt = ".";
                 rec.gt_tokens.assign(rec.path_names.size(), ".");
-                rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids);
+                rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size(), use_p_genotypes);
                 vcf_records.push_back(std::move(rec));
                 continue;
             }
@@ -4564,7 +4718,7 @@ void BubbleWriter::save_vcf(
                 rec.alt = join_strings_(alt_alleles, ",");
             }
 
-            rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids);
+            rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size(), use_p_genotypes);
             vcf_records.push_back(std::move(rec));
             continue;
         }
@@ -4585,7 +4739,7 @@ void BubbleWriter::save_vcf(
             rec.ref = ".";
             rec.alt = ".";
             rec.gt_tokens.assign(rec.path_names.size(), ".");
-            rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids);
+            rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size(), use_p_genotypes);
             vcf_records.push_back(std::move(rec));
             continue;
         }
@@ -4673,7 +4827,7 @@ void BubbleWriter::save_vcf(
         rec.end = out_pos1 + static_cast<uint32_t>(ref_seq.size()) - 1;
         rec.ref = std::move(ref_seq);
         rec.alt = join_strings_(alt_alleles, ",");
-        rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids);
+        rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size(), use_p_genotypes);
         vcf_records.push_back(std::move(rec));
     }
 
@@ -4695,7 +4849,11 @@ void BubbleWriter::save_vcf(
     size_t kept = 0;
     for (size_t i = 0; i < vcf_records.size(); ++i) {
         if (kept > 0 && same_vcf_allele_(vcf_records[kept - 1], vcf_records[i])) {
-            merge_sample_genotypes_(vcf_records[kept - 1], vcf_records[i]);
+            // A complete P-line match is already a haploid call. Keep the
+            // larger representative instead of combining nested-bubble calls.
+            if (!use_p_genotypes) {
+                merge_sample_genotypes_(vcf_records[kept - 1], vcf_records[i]);
+            }
             continue;
         }
         if (kept != i) vcf_records[kept] = std::move(vcf_records[i]);
@@ -4959,9 +5117,11 @@ std::vector<uint32_t> BubbleWriter::path_sample_ids_(
 
 std::vector<std::string> BubbleWriter::sample_gt_tokens_(
     const std::vector<std::string>& path_gt_tokens,
-    const std::vector<std::vector<uint32_t>>& path_sample_ids
+    const std::vector<std::vector<uint32_t>>& path_sample_ids,
+    size_t sample_count,
+    bool haploid
 ) const {
-    std::vector<std::vector<std::string>> by_sample(graph_.getSampleNames().size());
+    std::vector<std::vector<std::string>> by_sample(sample_count);
     const size_t n = std::min(path_gt_tokens.size(), path_sample_ids.size());
 
     for (size_t i = 0; i < n; ++i) {
@@ -4986,7 +5146,7 @@ std::vector<std::string> BubbleWriter::sample_gt_tokens_(
             if (b == ".") return true;
             return std::stoi(a) < std::stoi(b);
         });
-        out.push_back(join_strings_(values, "/"));
+        out.push_back(haploid && values.size() != 1 ? "." : join_strings_(values, "/"));
     }
     return out;
 }

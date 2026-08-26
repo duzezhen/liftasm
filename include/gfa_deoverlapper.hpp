@@ -82,6 +82,8 @@ protected:  // data will be used in rulemap building
         uint8_t                 mapq;     // mapping quality
         int32_t                 idx = INT32_MAX;    // Index of this alignment in bubbles, homologous and forks. Used for deduplication.
         bool                    force_cuts = false; // preserve exact boundaries for externally supplied alignments (augment)
+        bool                    min_eq_checked = false; // retained match runs passed min_eq before graph-boundary splitting
+        bool                    direct_equal = false;   // complete compared sequences are identical; short exact replacement is safe
 
         BubbleAlignment() = default;
 
@@ -231,6 +233,7 @@ protected:
 
     // Build, propagate and prune cuts based on alignment results. (2026-05-25, v0.1.3-r7)
     void normalize_all_cuts_();
+    bool match_can_collapse_(const BubbleAlignment& align, const CIGAR::COp& op) const;
     bool add_cuts_from_one_alignment_(const BubbleAlignment& align);
     void normalize_group_cuts_(const std::vector<size_t>& group);
     uint64_t propagate_cuts_run_(const std::vector<size_t>& group);

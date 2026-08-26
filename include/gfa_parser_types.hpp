@@ -97,7 +97,11 @@ struct GfaComponentPath {
 
 // path segment structure (P-line)
 struct PathSegment { uint64_t node_id{0}; bool is_reverse{false}; };
-struct GfaPath     { std::string name; std::vector<PathSegment> segments; };
+struct GfaPath {
+    std::string name;
+    std::vector<PathSegment> segments;
+    std::string sample;  // Logical sample/haplotype derived from the original P-line name.
+};
 
 // alignment structure (A-line)
 struct GfaAlignment {

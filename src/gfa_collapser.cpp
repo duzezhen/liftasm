@@ -1156,7 +1156,7 @@ std::vector<GfaCollapser::BubbleAlignment> GfaCollapser::align_subpaths_(
         };
 
         auto flush = [&]() {
-            if (!started || ops.empty()) {
+            if (!started || ops.empty() || !CIGAR::has_match(ops)) {
                 ops.clear();
                 started = false;
                 return;
@@ -1247,6 +1247,8 @@ std::vector<GfaCollapser::BubbleAlignment> GfaCollapser::align_subpaths_(
                 big.mapq,
                 std::move(ops)
             );
+            out.back().min_eq_checked = big.min_eq_checked;
+            out.back().direct_equal = big.direct_equal;
 
             ops.clear();
             started = false;
@@ -1432,10 +1434,6 @@ std::vector<GfaCollapser::BubbleAlignment> GfaCollapser::align_paths_(
         return (uint64_t(a) << 32) | uint64_t(b);
     };
 
-    auto has_match = [](const std::vector<CIGAR::COp>& ops) -> bool {
-        return !ops.empty() && CIGAR::match_ratio(CIGAR::pack(ops)) > 0.0;
-    };
-
     auto pick_longest = [&](const std::vector<size_t>& xs, const std::vector<uint64_t>& lens) -> size_t {
         size_t best = xs.front();
         for (size_t x : xs) {
@@ -1530,7 +1528,7 @@ std::vector<GfaCollapser::BubbleAlignment> GfaCollapser::align_paths_(
             if (alns.empty()) continue;
 
             for (auto& aln : alns) {
-                if (!has_match(aln.ops)) continue;
+                if (!CIGAR::has_match(aln.ops)) continue;
 
                 const uint64_t key = pair_key(aln.v_a, aln.v_b);
                 auto& s = compared_spans[key];

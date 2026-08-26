@@ -643,7 +643,9 @@ std::vector<GfaDeoverlapper::BubbleAlignment> GfaDeoverlapper::align_and_pack_(
         uint32_t q_beg, uint32_t q_end,
         std::string cigar,
         uint8_t mapq,
-        std::vector<CIGAR::COp>&& ops
+        std::vector<CIGAR::COp>&& ops,
+        bool min_eq_checked,
+        bool direct_equal
     ) {
         // Convert to original segment coordinates
         //   forward:  [vb + r_beg, vb + r_end)
@@ -661,6 +663,8 @@ std::vector<GfaDeoverlapper::BubbleAlignment> GfaDeoverlapper::align_and_pack_(
             mapq,
             std::move(ops)
         );
+        outs.back().min_eq_checked = min_eq_checked;
+        outs.back().direct_equal = direct_equal;
     };
 
     if (DEBUG_ENABLED) {
@@ -674,7 +678,7 @@ std::vector<GfaDeoverlapper::BubbleAlignment> GfaDeoverlapper::align_and_pack_(
         std::string cigar = std::to_string(L) + "=";
         auto ops = CIGAR::parse(cigar);
         if (DEBUG_ENABLED) print_alignment(0, L, 0, L, cigar, 60, ops);
-        add_alignment(0, L, 0, L, std::move(cigar), 60, std::move(ops));
+        add_alignment(0, L, 0, L, std::move(cigar), 60, std::move(ops), false, true);
         return outs;
     }
 
@@ -696,8 +700,9 @@ std::vector<GfaDeoverlapper::BubbleAlignment> GfaDeoverlapper::align_and_pack_(
     for (auto& h : hits) {
         if (h.cigar.empty()) continue;
         auto ops = CIGAR::parse(h.cigar);
+        if (!CIGAR::mask_short_matches(ops, static_cast<uint32_t>(params_.min_eq))) continue;
         if (DEBUG_ENABLED) print_alignment(h.r_beg, h.r_end, h.q_beg, h.q_end, h.cigar, h.mapq, ops);
-        add_alignment(h.r_beg, h.r_end, h.q_beg, h.q_end, std::move(h.cigar), h.mapq, std::move(ops));
+        add_alignment(h.r_beg, h.r_end, h.q_beg, h.q_end, std::move(h.cigar), h.mapq, std::move(ops), true, false);
     }
 
     return outs;
@@ -1026,6 +1031,13 @@ void GfaDeoverlapper::normalize_all_cuts_() {
 }
 
 
+bool GfaDeoverlapper::match_can_collapse_(const BubbleAlignment& align, const CIGAR::COp& op) const {
+    return op.len >= params_.min_eq ||
+           align.min_eq_checked ||
+           align.direct_equal ||
+           align.force_cuts;
+}
+
 bool GfaDeoverlapper::add_cuts_from_one_alignment_(const BubbleAlignment& align) {
     uint32_t seg_a = NodeHandle::get_segment_id(align.v_a);
     uint32_t seg_b = NodeHandle::get_segment_id(align.v_b);
@@ -1043,7 +1055,6 @@ bool GfaDeoverlapper::add_cuts_from_one_alignment_(const BubbleAlignment& align)
     uint32_t pos_a = rev_a ? align.end_a : align.beg_a;
     uint32_t pos_b = rev_b ? align.end_b : align.beg_b;
 
-    const bool is_single_exact_match = (align.ops.size() == 1 && align.ops[0].op == '=');
     bool changed = false;
 
     auto add_cut = [&](uint32_t seg, uint32_t p, uint32_t len) {
@@ -1068,7 +1079,7 @@ bool GfaDeoverlapper::add_cuts_from_one_alignment_(const BubbleAlignment& align)
                 step(pos_a, rev_a, op.len);
                 step(pos_b, rev_b, op.len);
 
-                if (op.len >= params_.min_eq || is_single_exact_match || align.force_cuts) {
+                if (match_can_collapse_(align, op)) {
                     add_cut(seg_a, prev_a, len_a);
                     add_cut(seg_b, prev_b, len_b);
                     add_cut(seg_a, pos_a,  len_a);
@@ -1228,6 +1239,9 @@ uint64_t GfaDeoverlapper::propagate_cuts_run_(const std::vector<size_t>& group) 
 
                         step(pos_a, rev_a, op.len);
                         step(pos_b, rev_b, op.len);
+
+                        // Only trusted matches may carry cuts between segments.
+                        if (!match_can_collapse_(align, op)) break;
 
                         const auto [beg_a, end_a] = rev_a
                             ? std::make_pair(pos_a, prev_a)
@@ -2228,9 +2242,6 @@ SegReplace::RuleMap GfaDeoverlapper::build_rulemap_run_(
         if (align_id >= bubble_aligns_.size()) continue;
         const auto& align = bubble_aligns_[align_id];
 
-        // If the alignment result length is 1 and all are "=", directly add the cut point without filtering with params_.min_eq
-        const bool is_single_exact_match = (align.ops.size() == 1 && align.ops[0].op == '=');
-
         const uint32_t seg_a = NodeHandle::get_segment_id(align.v_a);
         const uint32_t seg_b = NodeHandle::get_segment_id(align.v_b);
         const bool     rev_a = NodeHandle::get_is_reverse(align.v_a);
@@ -2280,7 +2291,7 @@ SegReplace::RuleMap GfaDeoverlapper::build_rulemap_run_(
                         ? std::make_pair(pos_b, prev_b)
                         : std::make_pair(prev_b, pos_b);
 
-                    if (op.len >= params_.min_eq || is_single_exact_match || align.force_cuts) {
+                    if (match_can_collapse_(align, op)) {
                         GfaDeoverlapper::record_rulemap(
                             seg_a, seg_b,
                             rev_a, rev_b,

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.3-r27 (2026-08-25)
+
+### Fixed
+
+- Fixed `--min_eq` filtering after alignments were split at graph node boundaries.
+- Fixed VCF haplotype assignment to follow GFA P-lines when available.
+
 ## v0.1.3-r26 (2026-08-24)
 
 ### Improved
