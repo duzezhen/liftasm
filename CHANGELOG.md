@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.3-r28 (2026-08-26)
+
+### Changed
+
+- Increased the default `collapse --path_sim` from `0.5` to `0.9`.
+
 ## v0.1.3-r27 (2026-08-25)
 
 ### Fixed

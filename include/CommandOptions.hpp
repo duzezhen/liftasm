@@ -75,7 +75,7 @@ struct BubbleOpts {
     uint32_t max_depth = 100'000;
     uint16_t max_paths = 20;
     uint64_t DFS_guard = 1'000'000;
-    double path_sim = 0.5;           // minimum minimizer Jaccard for path clustering
+    double path_sim = 0.9;           // minimum minimizer Jaccard for path clustering
     uint32_t stall_round_limit = 2;
     bool skip_comp = false;
     bool keep_nested = false;
@@ -317,7 +317,7 @@ struct GapfillOpts {
     uint32_t max_depth = 100'000;
     uint16_t max_paths = 20;
     uint64_t DFS_guard = 1'000'000;
-    double path_sim = 0.5;           // minimum minimizer Jaccard for path clustering
+    double path_sim = 0.9;           // minimum minimizer Jaccard for path clustering
     uint32_t stall_round_limit = 2;
 
     // phasing
