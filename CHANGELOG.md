@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.3-r29 (2026-08-27)
+
+### Improved
+
+- Updated automatic node-support thresholds to 2 for 3-4 haplotypes and 3 otherwise.
+- Split fully low-support contigs that share nodes with a confirmed misassembly.
+
 ## v0.1.3-r28 (2026-08-26)
 
 ### Changed

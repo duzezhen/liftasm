@@ -13,6 +13,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 extern "C" {
 #include "minimap.h"
@@ -25,13 +26,14 @@ uint32_t GfaGapfillMisassembly::source_id_(const GfaGapfill::Fragment& fragment)
     return found == graph_.source_ids_.end() ? UINT32_MAX : found->second;
 }
 
-// Auto adjusts the support threshold to the haplotypes in each component.
-uint32_t GfaGapfillMisassembly::min_haplotypes_(uint32_t component) const {
+// Return the minimum node support that ends a terminal low-support run.
+// Zero disables terminal misassembly detection for the component.
+uint32_t GfaGapfillMisassembly::required_haplotype_support_(uint32_t component) const {
     if (graph_.params_.ms_haps > 0) return graph_.params_.ms_haps;
     const auto found = component_haplotypes_.find(component);
     const size_t total = found == component_haplotypes_.end() ? 0 : found->second.size();
     if (total <= 2) return 0;
-    return total <= 4 ? 1 : 2;
+    return total <= 4 ? 2 : 3;
 }
 
 uint32_t GfaGapfillMisassembly::node_support_(
@@ -58,6 +60,7 @@ uint32_t GfaGapfillMisassembly::node_support_(
 }
 
 void GfaGapfillMisassembly::index_haplotypes_() {
+    log_stream() << "Indexing haplotype support by component ...\n";
     component_haplotypes_.clear();
 
     // P paths are direct haplotype evidence. Add missing P support to the SN index.
@@ -79,65 +82,105 @@ void GfaGapfillMisassembly::index_haplotypes_() {
         std::sort(ids.begin(), ids.end());
         ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
         memberships += ids.size();
-        disabled += min_haplotypes_(item.first) == 0;
+        disabled += required_haplotype_support_(item.first) == 0;
     }
     log_stream() << "  - Components with contig paths: " << component_haplotypes_.size() << '\n';
     log_stream() << "  - Component haplotype memberships: " << memberships << '\n';
     if (disabled > 0) {
         log_stream() << "  - Components skipped with at most two haplotypes: " << disabled << '\n';
     }
+    std::cerr << '\n';
 }
 
 void GfaGapfillMisassembly::find_terminals_() {
+    log_stream() << "Scanning contig ends for long low-support runs ...\n";
     terminals_.clear();
-    size_t no_anchor = 0;
+    fully_low_support_.clear();
+
+    const auto original_range = [](const GfaGapfill::Fragment& fragment, uint32_t begin, uint32_t end) {
+        uint64_t begin_bp = fragment.path_bp[begin];
+        uint64_t end_bp = fragment.path_bp[end];
+        if (fragment.reverse) {
+            const uint64_t old_begin = begin_bp;
+            begin_bp = fragment.length - end_bp;
+            end_bp = fragment.length - old_begin;
+        }
+        return std::make_pair(begin_bp, end_bp);
+    };
+
+    const auto terminal_log = [&](const GfaGapfill::Fragment& fragment, uint32_t begin, uint32_t end, uint64_t length, bool normalized_left, uint32_t required_support) {
+        const auto range = original_range(fragment, begin, end);
+        const bool original_left = normalized_left != fragment.reverse;
+        std::ostringstream line;
+        line << "  - Low-support end: " << graph_.paths_[fragment.path_id].name
+             << ':' << range.first << '-' << range.second
+             << " | side=" << (original_left ? "left" : "right")
+             << " | component=" << fragment.component
+             << " | length=" << length
+             << " | support<" << required_support << '\n';
+        return line.str();
+    };
 
     for (uint32_t fragment_id = 0; fragment_id < graph_.fragments_.size(); ++fragment_id) {
         const GfaGapfill::Fragment& fragment = graph_.fragments_[fragment_id];
-        const uint32_t min_haps = min_haplotypes_(fragment.component);
+        const uint32_t required_support = required_haplotype_support_(fragment.component);
         const uint32_t count = static_cast<uint32_t>(fragment.vertices.size());
-        if (min_haps == 0 || count == 0) continue;
+        if (required_support == 0 || count == 0) continue;
 
+        const auto has_low_support = [&](uint32_t pos) {
+            return node_support_(fragment, Vertex::get_segment_id(fragment.vertices[pos])) < required_support;
+        };
+
+        // A left candidate is the maximal contiguous low-support prefix. It is
+        // retained only when its sequence length reaches --ms_len.
         uint32_t left_anchor = 0;
-        while (left_anchor < count && node_support_(
-            fragment, Vertex::get_segment_id(fragment.vertices[left_anchor])
-        ) < min_haps) ++left_anchor;
+        while (left_anchor < count && has_low_support(left_anchor)) ++left_anchor;
         if (left_anchor == count) {
-            ++no_anchor;
+            fully_low_support_.push_back(fragment_id);
+            log_stream() << "  - Fully low-support contig: "
+                         << graph_.paths_[fragment.path_id].name
+                         << " | component=" << fragment.component
+                         << " | length=" << fragment.length
+                         << " | support<" << required_support << " throughout\n";
             continue;
         }
         const uint64_t left_bp = fragment.path_bp[left_anchor];
         if (left_anchor > 0 && left_bp >= graph_.params_.ms_len) {
             terminals_.push_back({
                 fragment_id, 0, left_anchor, UINT32_MAX,
-                left_bp, 0.0, true, false, {}
+                left_bp, 0.0, true, false, false, {}
             });
+            log_stream() << terminal_log(
+                fragment, 0, left_anchor, left_bp, true, required_support
+            );
         }
 
+        // Apply the same definition to the maximal low-support suffix.
         uint32_t right_anchor = count - 1;
-        while (right_anchor > 0 && node_support_(
-            fragment, Vertex::get_segment_id(fragment.vertices[right_anchor])
-        ) < min_haps) --right_anchor;
-        if (right_anchor == 0 && node_support_(
-            fragment, Vertex::get_segment_id(fragment.vertices[0])
-        ) < min_haps) continue;
+        while (right_anchor > 0 && has_low_support(right_anchor)) --right_anchor;
+        if (right_anchor == 0 && has_low_support(0)) continue;
         const uint32_t right_begin = right_anchor + 1;
         const uint64_t right_bp = fragment.length - fragment.path_bp[right_begin];
         if (right_begin < count && right_bp >= graph_.params_.ms_len) {
             terminals_.push_back({
                 fragment_id, right_begin, count, UINT32_MAX,
-                right_bp, 0.0, false, false, {}
+                right_bp, 0.0, false, false, false, {}
             });
+            log_stream() << terminal_log(
+                fragment, right_begin, count, right_bp, false, required_support
+            );
         }
     }
 
     log_stream() << "  - Long low-support ends: " << terminals_.size() << '\n';
-    if (no_anchor > 0) {
-        log_stream() << "  - Contigs preserved without a supported anchor: " << no_anchor << '\n';
+    if (!fully_low_support_.empty()) {
+        log_stream() << "  - Fully low-support contigs: " << fully_low_support_.size() << '\n';
     }
+    std::cerr << '\n';
 }
 
 std::vector<uint32_t> GfaGapfillMisassembly::select_references_() const {
+    log_stream() << "Selecting trusted cross-component reference contigs ...\n";
     struct Group {
         uint32_t component{UINT32_MAX}, source{UINT32_MAX};
         uint64_t total_bp{0}, longest_bp{0};
@@ -149,9 +192,13 @@ std::vector<uint32_t> GfaGapfillMisassembly::select_references_() const {
     };
 
     std::unordered_set<uint64_t> possible;
-    possible.reserve(terminals_.size());
+    possible.reserve(terminals_.size() + fully_low_support_.size());
     for (const Terminal& terminal : terminals_) {
         const GfaGapfill::Fragment& fragment = graph_.fragments_[terminal.fragment];
+        possible.insert(key(fragment.component, source_id_(fragment)));
+    }
+    for (uint32_t fragment_id : fully_low_support_) {
+        const GfaGapfill::Fragment& fragment = graph_.fragments_[fragment_id];
         possible.insert(key(fragment.component, source_id_(fragment)));
     }
 
@@ -416,29 +463,85 @@ void GfaGapfillMisassembly::confirm_terminals_(const std::vector<uint32_t>& refe
 }
 
 std::vector<GfaGapfill::MisassemblyContig> GfaGapfillMisassembly::split_confirmed_() {
+    log_stream() << "Splitting confirmed terminal misassemblies ...\n";
     const auto contig_name = [](const std::string& sample, uint8_t hap, size_t number) {
         std::ostringstream name;
-        name << sample << ".h" << static_cast<uint32_t>(hap) << "ms"
-             << std::setw(6) << std::setfill('0') << number << 'l';
+        name << sample << ".h" << static_cast<uint32_t>(hap) << "ms" << std::setw(6) << std::setfill('0') << number << 'l';
         return name.str();
     };
+    const auto original_range = [](const GfaGapfill::Fragment& fragment, uint32_t begin, uint32_t end) {
+        uint64_t begin_bp = fragment.path_bp[begin];
+        uint64_t end_bp = fragment.path_bp[end];
+        if (fragment.reverse) {
+            const uint64_t old_begin = begin_bp;
+            begin_bp = fragment.length - end_bp;
+            end_bp = fragment.length - old_begin;
+        }
+        return std::make_pair(begin_bp, end_bp);
+    };
 
+    // ------------------------------------------------ Collect confirmed ends ------------------------------------------------
     std::vector<uint32_t> splits;
+    splits.reserve(terminals_.size() + fully_low_support_.size());
     for (uint32_t i = 0; i < terminals_.size(); ++i) {
-        if (terminals_[i].confirmed && !terminals_[i].sequence.empty()) splits.push_back(i);
+        const Terminal& terminal = terminals_[i];
+        if (!terminal.confirmed || terminal.sequence.empty()) continue;
+        splits.push_back(i);
     }
     if (splits.empty()) {
         log_stream() << "  - Confirmed terminal misassemblies: 0\n\n";
         return {};
     }
 
+    // ------------------------------------------------ Find contained whole contigs ------------------------------------------------
+    // A fully low-support contig sharing a confirmed cut node belongs to the
+    // same untrusted region, so the complete contig is split out.
+    const uint32_t confirmed_ends = static_cast<uint32_t>(splits.size());
+    std::vector<uint8_t> split_nodes(graph_.nodes_.size(), false);
+    for (uint32_t split_id : splits) {
+        const Terminal& split = terminals_[split_id];
+        const GfaGapfill::Fragment& fragment = graph_.fragments_[split.fragment];
+        for (uint32_t pos = split.begin; pos < split.end; ++pos) {
+            split_nodes[Vertex::get_segment_id(fragment.vertices[pos])] = true;
+        }
+    }
+
+    size_t contained = 0;
+    for (uint32_t fragment_id : fully_low_support_) {
+        const GfaGapfill::Fragment& fragment = graph_.fragments_[fragment_id];
+        const bool shares_cut_node = std::any_of(
+            fragment.vertices.begin(), fragment.vertices.end(), [&](uint32_t vertex) {
+                return split_nodes[Vertex::get_segment_id(vertex)];
+            }
+        );
+        if (!shares_cut_node) continue;
+
+        std::string sequence = graph_.fragment_sequence_(
+            fragment, 0, static_cast<uint32_t>(fragment.vertices.size())
+        );
+        if (sequence.empty() || sequence == "*") continue;
+        terminals_.push_back({
+            fragment_id, 0, static_cast<uint32_t>(fragment.vertices.size()),
+            UINT32_MAX, fragment.length, 0.0,
+            false, true, true, std::move(sequence)
+        });
+        splits.push_back(static_cast<uint32_t>(terminals_.size() - 1));
+        ++contained;
+    }
+
+    log_stream() << "  - Confirmed terminal misassemblies: " << confirmed_ends << '\n';
+    log_stream() << "  - Contained whole low-support contigs: " << contained << '\n';
+    if (contained < fully_low_support_.size()) {
+        log_stream() << "  - Whole low-support contigs preserved: " << fully_low_support_.size() - contained << '\n';
+    }
+
+    // ------------------------------------------------ Mark source paths ------------------------------------------------
     std::vector<uint32_t> retained_begin(graph_.fragments_.size(), 0);
     std::vector<uint32_t> retained_end;
     retained_end.reserve(graph_.fragments_.size());
     for (const GfaGapfill::Fragment& fragment : graph_.fragments_) {
         retained_end.push_back(static_cast<uint32_t>(fragment.vertices.size()));
     }
-    std::vector<uint8_t> split_nodes(graph_.nodes_.size(), false);
     for (uint32_t split_id : splits) {
         const Terminal& split = terminals_[split_id];
         if (split.begin == 0) retained_begin[split.fragment] = std::max(retained_begin[split.fragment], split.end);
@@ -451,6 +554,7 @@ std::vector<GfaGapfill::MisassemblyContig> GfaGapfillMisassembly::split_confirme
         }
     }
 
+    // ------------------------------------------------ Create independent misassembly contigs ------------------------------------------------
     std::unordered_set<std::string> path_names;
     path_names.reserve(graph_.paths_.size() + splits.size());
     for (const GfaPath& path : graph_.paths_) path_names.insert(path.name);
@@ -479,23 +583,25 @@ std::vector<GfaGapfill::MisassemblyContig> GfaGapfillMisassembly::split_confirme
         const bool original_left = split.left != source.reverse;
         records.push_back({
             name, source.sample, graph_.paths_[source.path_id].name,
-            original_left ? "left" : "right", source.hap, source.component
+            split.whole ? "whole" : (original_left ? "left" : "right"),
+            source.hap, source.component
         });
 
-        uint64_t begin = source.path_bp[split.begin];
-        uint64_t end = source.path_bp[split.end];
-        if (source.reverse) {
-            const uint64_t old_begin = begin;
-            begin = source.length - end;
-            end = source.length - old_begin;
+        const auto range = original_range(source, split.begin, split.end);
+        if (split.whole) {
+            log_stream() << "  - Whole low-support misassembly: "
+                         << graph_.paths_[source.path_id].name
+                         << ':' << range.first << '-' << range.second << '\n';
+        } else {
+            log_stream() << "  - Confirmed misassembly: " << graph_.paths_[source.path_id].name
+                         << ':' << range.first << '-' << range.second
+                         << " | target=component" << split.target_component
+                         << " | coverage=" << std::fixed << std::setprecision(4)
+                         << split.coverage << '\n';
         }
-        log_stream() << "  - Confirmed misassembly: " << graph_.paths_[source.path_id].name
-                     << ':' << begin << '-' << end
-                     << " | target=component" << split.target_component
-                     << " | coverage=" << std::fixed << std::setprecision(4)
-                     << split.coverage << '\n';
     }
 
+    // ------------------------------------------------ Trim old P paths ------------------------------------------------
     // Trim every confirmed P path after all new contigs have been created.
     for (uint32_t i = 0; i < graph_.fragments_.size(); ++i) {
         if (retained_begin[i] == 0 && retained_end[i] == graph_.fragments_[i].vertices.size()) continue;
@@ -529,6 +635,7 @@ std::vector<GfaGapfill::MisassemblyContig> GfaGapfillMisassembly::split_confirme
         graph_.paths_.end()
     );
 
+    // ------------------------------------------------ Remove unused source nodes ------------------------------------------------
     // Old nodes are removed only after no sample contig path uses them.
     std::vector<uint8_t> path_nodes(graph_.nodes_.size(), false);
     for (const GfaPath& path : graph_.paths_) {
@@ -564,7 +671,6 @@ std::vector<GfaGapfill::MisassemblyContig> GfaGapfillMisassembly::run() {
     index_haplotypes_();
     find_terminals_();
     if (terminals_.empty()) {
-        log_stream() << '\n';
         return {};
     }
 

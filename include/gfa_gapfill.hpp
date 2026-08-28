@@ -326,7 +326,7 @@ private:
         uint32_t target_component{UINT32_MAX};
         uint64_t length{0};
         double coverage{0.0};
-        bool left{false}, confirmed{false};
+        bool left{false}, confirmed{false}, whole{false};
         std::string sequence;
     };
 
@@ -337,9 +337,10 @@ private:
     GfaGapfill& graph_;
     std::unordered_map<uint32_t, std::vector<uint32_t>> component_haplotypes_;
     std::vector<Terminal> terminals_;
+    std::vector<uint32_t> fully_low_support_;
 
     uint32_t source_id_(const GfaGapfill::Fragment& fragment) const;
-    uint32_t min_haplotypes_(uint32_t component) const;
+    uint32_t required_haplotype_support_(uint32_t component) const;
     uint32_t node_support_(const GfaGapfill::Fragment& fragment, uint32_t segment) const;
     void index_haplotypes_();
     void find_terminals_();

@@ -125,7 +125,7 @@ With the default prefix, the report is `out.gapfill.tsv`. The command also write
 | `--min_ali_ratio FLOAT` `[0.05]` | Minimum aligned fraction in relocation and deduplication alignments. | Raise it to ignore short local hits. |
 | `--ms_len INT` `[10M]` | Minimum low-support sequence at a contig end. | Lower it to inspect shorter terminal errors. |
 | `--ms_sim FLOAT` `[0.7]` | Fraction that one other component must cover. | Raise it for more conservative splitting. |
-| `--ms_haps INT\|auto` `[auto]` | Minimum supporting haplotypes, computed per component. | Use an integer to replace the automatic 1/2-haplotype rule. |
+| `--ms_haps INT\|auto` `[auto]` | Minimum supporting haplotypes, computed per component. | Use an integer to replace the automatic 2/3-haplotype rule. |
 | `--min_mapq INT` `[30]` | Minimum mapping quality in relocation and deduplication alignments. | Raise it when repeats create ambiguous hits. |
 | `--min_contig INT` `[1Mb]` | Shortest contig considered as evidence. | Raise it to avoid noisy short contigs. |
 | `--max_gap INT` `[10Mb]` | Largest graph gap eligible for filling. | Lower it when only short joins are trusted. |

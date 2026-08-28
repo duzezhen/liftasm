@@ -333,9 +333,9 @@ struct GapfillOpts {
     double min_similarity = 0.7;
 
     // misassembly detection
-    uint64_t ms_len = 10'000'000;  // minimum low-support sequence at a contig end
+    uint64_t ms_len = 10'000'000;  // minimum contiguous low-support run at a contig end
     double ms_sim = 0.7;           // fraction covered by one other component
-    uint32_t ms_haps = 0;          // minimum supporting haplotypes; 0 selects automatically
+    uint32_t ms_haps = 0;          // minimum node haplotype support; 0 selects automatically
 
     // output deduplication
     double dedup_similarity = 0.95;

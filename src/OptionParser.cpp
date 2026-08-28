@@ -3578,8 +3578,8 @@ void help_gapfill(char** argv) {
     hp.section("Misassembly options");
     hp.line("--ms_len", "INT", "minimum low-support sequence at a contig end [" + format_size_arg_(GapfillOpts().ms_len) + "]");
     hp.line("--ms_sim", "FLOAT", "minimum fraction covered by one other component [" + format_double_(GapfillOpts().ms_sim) + "]");
-    hp.line("--ms_haps", "INT|auto", "minimum supporting haplotypes in each component [auto]");
-    hp.note(" * auto: disabled for <=2 haplotypes; 1 for 3-4; 2 otherwise");
+    hp.line("--ms_haps", "INT|auto", "minimum node support in a terminal --ms_len run [auto]");
+    hp.note(" * auto: disabled for <=2 haplotypes; 2 for 3-4; 3 otherwise");
 
     hp.blank();
 

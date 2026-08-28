@@ -1994,6 +1994,7 @@ std::unordered_set<std::string> GfaCtgCollapser::collapse_misassemblies(
             }
         }
     }
+    log_stream() << "Summarizing misassembly integration ...\n";
     log_stream() << "  - Misassembly contigs integrated: " << integrated.size() << "\n\n";
     return integrated;
 }
