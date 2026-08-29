@@ -202,8 +202,18 @@ void GfaGraph::load_from_GFA(
 
             const std::string fixed_name = plan.register_segment_name(raw_name, name_to_id_map_, filename);
 
-            if (name_to_id_map_.insert({fixed_name, total_segments_}).second) {
+            const auto [name_it, inserted] = name_to_id_map_.insert({fixed_name, total_segments_});
+            if (inserted) {
                 ++total_segments_;
+            }
+            if (track_original_names_) {
+                const auto [original_it, original_inserted] = original_name_to_id_.emplace(
+                    raw_name, static_cast<uint32_t>(name_it->second)
+                );
+                if (!original_inserted && original_it->second != name_it->second) {
+                    error_stream() << "Duplicate original segment name '" << raw_name << "' across CTG haplotypes\n";
+                    std::exit(1);
+                }
             }
         }
         zr.close();

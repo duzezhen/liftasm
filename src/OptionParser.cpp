@@ -174,6 +174,10 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--stall_rounds must be >= 0"
             );
             ensure(
+                cfg.bubble.max_mosaic_freq >= 0.0 && cfg.bubble.max_mosaic_freq < 0.5,
+                "--max_mf must be in [0,0.5)"
+            );
+            ensure(
                 cfg.bubble.min_len >= 0,
                 "--min_len must be >= 0"
             );
@@ -845,6 +849,10 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
                 "--path_sim must be in [0,1]"
             );
             ensure(
+                cfg.gapfill.max_mosaic_freq >= 0.0 && cfg.gapfill.max_mosaic_freq < 0.5,
+                "--max_mf must be in [0,0.5)"
+            );
+            ensure(
                 cfg.gapfill.phase_path_len > 0,
                 "--phase_len must be > 0"
             );
@@ -1318,7 +1326,7 @@ AppConfig main_depth(int argc, char** argv) {
 }
 
 void help_bubble(char** argv, bool advanced) {
-    HelpPrinter hp;
+    HelpPrinter hp(std::cerr, 20, 13);
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ... [options]\n\n"
         << "Detect bubbles in GFA graph and write them to GFA/VCF file\n";
@@ -1336,6 +1344,11 @@ void help_bubble(char** argv, bool advanced) {
     hp.note(" * must contain cg tag; e.g. minimap2 -cx asm5 ref.fa ctg.fa > aln.paf");
     hp.line("--ali_min_mapq", "INT", "minimum mapping quality for PAF liftover [" + format_size_arg_(BubbleOpts().ali_min_mapq) + "]");
     hp.line("--ali_min_len", "INT", "minimum alignment length for PAF liftover [" + format_size_arg_(BubbleOpts().ali_min_len) + "]");
+
+    hp.blank();
+
+    hp.section("Mosaic mutation options");
+    hp.line("--max_mf", "FLOAT", "ALT alleles at or below this tissue frequency are mosaic [" + format_double_(BubbleOpts().max_mosaic_freq) + "]");
     
     hp.blank();
     
@@ -1399,6 +1412,7 @@ AppConfig main_bubble(int argc, char** argv) {
         {"paf",             required_argument, nullptr, 0003},
         {"ali_min_mapq",    required_argument, nullptr, 0004},
         {"ali_min_len",     required_argument, nullptr, 0005},
+        {"max_mf",          required_argument, nullptr, 0006},
 
         {"depth",           required_argument, nullptr, 1001},
         {"paths",           required_argument, nullptr, 1002},
@@ -1475,6 +1489,10 @@ AppConfig main_bubble(int argc, char** argv) {
             }
             case 0005: {
                 cfg.bubble.ali_min_len = parse_size_arg_u32_(optarg, argc, argv, optind, "--ali_min_len");
+                break;
+            }
+            case 0006: {
+                cfg.bubble.max_mosaic_freq = std::stod(optarg);
                 break;
             }
 
@@ -3516,7 +3534,7 @@ AppConfig main_clean(int argc, char** argv) {
 }
 
 void help_gapfill(char** argv) {
-    HelpPrinter hp(std::cerr, 20, 13);
+    HelpPrinter hp;
     std::cerr
         << "Usage: " << argv[0] << " " << argv[1] << " -g FILE [options]\n\n"
         << "Fill supported contig gaps with source-aware node walks between trusted graph anchors.\n";
@@ -3529,6 +3547,7 @@ void help_gapfill(char** argv) {
     hp.note(" * <prefix>.<sample>.hap{1,2}.gapfill.{gfa,noseq.gfa}");
     hp.note(" * <prefix>.primary.hap{1,2}.gapfill.{gfa,noseq.gfa}");
     hp.note(" * <prefix>.primary.hap{1,2}.gapfill.bubbles.vcf");
+    hp.note(" * <prefix>.primary.hap{1,2}.gapfill.mosaic.{gfa,noseq.gfa}");
     hp.note(" * <prefix>.primary.hap{1,2}.lowQ.gapfill.{gfa,noseq.gfa}");
     hp.note(" * <prefix>.gapfill.{tsv,relocations.tsv,html}");
 
@@ -3555,6 +3574,12 @@ void help_gapfill(char** argv) {
     hp.line("--DFS_guard", "INT", "stop one bubble or gap walk after this many visited states [" + format_size_arg_(GapfillOpts().DFS_guard) + "]");
     hp.line("--path_sim", "FLOAT", "minimum minimizer Jaccard for path clustering [" + format_double_(GapfillOpts().path_sim) + "]");
     hp.line("--stall_rounds", "INT", "stop after this many rounds find no new path [" + format_size_arg_(GapfillOpts().stall_round_limit) + "]");
+
+    hp.blank();
+
+    hp.section("Mosaic mutation options");
+    hp.line("--max_mf", "FLOAT", "ALT alleles at or below this tissue frequency are mosaic [" + format_double_(GapfillOpts().max_mosaic_freq) + "]");
+    hp.line("--flank", "INT", "keep variants within this distance of mosaic sites; remove other alternative nodes [" + format_size_arg_(GapfillOpts().mosaic_flank) + "]");
 
     hp.blank();
 
@@ -3638,6 +3663,9 @@ AppConfig main_gapfill(int argc, char** argv) {
 
         {"dedup_sim",              required_argument, nullptr, 7001},
         {"dedup_component",        required_argument, nullptr, 7002},
+
+        {"max_mf",                 required_argument, nullptr, 8001},
+        {"flank",                  required_argument, nullptr, 8002},
 
         {"threads",                required_argument, nullptr, 't'},
         {"debug",                  no_argument,       nullptr, 'd'},
@@ -3768,6 +3796,14 @@ AppConfig main_gapfill(int argc, char** argv) {
             }
             case 7002: {
                 cfg.gapfill.dedup_component = parse_size_arg_u64_(optarg, argc, argv, optind, "--dedup_component");
+                break;
+            }
+            case 8001: {
+                cfg.gapfill.max_mosaic_freq = std::stod(optarg);
+                break;
+            }
+            case 8002: {
+                cfg.gapfill.mosaic_flank = parse_size_arg_u64_(optarg, argc, argv, optind, "--flank");
                 break;
             }
 

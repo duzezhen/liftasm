@@ -22,7 +22,8 @@ public:
         const std::vector<std::string>& hap1_files,
         const std::vector<std::string>& hap2_files,
         const std::vector<std::string>& sample_names,
-        uint32_t min_contig_len
+        uint32_t min_contig_len,
+        bool map_original_names = false
     );
 
     void collapse_ctgs(
@@ -228,6 +229,7 @@ private:
     struct Candidate {
         uint64_t length{0};
         std::vector<Edit> edits;
+        std::vector<uint64_t> alternative_edges;
         std::vector<uint32_t> removed_nodes;
         std::vector<uint32_t> template_nodes;
         std::vector<uint32_t> sample_ids;

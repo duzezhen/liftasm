@@ -20,14 +20,11 @@ public:
 
 protected:
     struct VariantInput {
-        uint32_t sid{0};
         uint32_t beg{0};
         uint32_t end{0};
         std::string id;
         std::string ref;
         std::vector<std::string> alts;
-        std::string source;
-        uint64_t line_no{0};
     };
 
     struct AltNode {
@@ -35,11 +32,10 @@ protected:
         uint32_t alt_sid{0};
         uint32_t ref_beg{0};
         uint32_t ref_end{0};
-        std::string vcf_id;
     };
 
     Stats read_vcfs_(const std::vector<std::string>& files);
-    void validate_variant_order_();
+    void sort_variants_();
     void create_alt_nodes_(const std::string& tag);
     void inject_variant_alignments_();
     void connect_alt_nodes_(const SegReplace::Expander& expander);

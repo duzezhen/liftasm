@@ -146,6 +146,14 @@ bool interval_free(const std::map<uint32_t, uint32_t>& intervals, uint32_t begin
     return next == intervals.begin() || std::prev(next)->second <= begin;
 }
 
+uint64_t edge_key(uint32_t source, uint32_t sink) {
+    return (uint64_t(source) << 32) | sink;
+}
+
+uint64_t canonical_edge(uint32_t source, uint32_t sink) {
+    return std::min(edge_key(source, sink), edge_key(sink ^ 1u, source ^ 1u));
+}
+
 } // namespace
 
 CtgRepeatNormalizer::CtgRepeatNormalizer(
@@ -493,9 +501,26 @@ bool CtgRepeatNormalizer::build_candidate_(
         if (sid >= path_occurrences_.size() || covered_occurrences[sid] != path_occurrences_[sid]) return false;
     }
 
+    for (size_t branch_id = 0; branch_id < branches.size(); ++branch_id) {
+        if (branch_id == template_id) continue;
+        const std::vector<uint32_t>& path = branches[branch_id].vertices;
+        for (size_t i = 1; i < path.size(); ++i) {
+            const uint32_t source = Vertex::get_segment_id(path[i - 1]);
+            const uint32_t sink = Vertex::get_segment_id(path[i]);
+            if (!removed_nodes.contains(source) && !removed_nodes.contains(sink)) {
+                candidate.alternative_edges.push_back(canonical_edge(path[i - 1], path[i]));
+            }
+        }
+    }
+
     candidate.removed_nodes.assign(removed_nodes.begin(), removed_nodes.end());
     std::sort(candidate.sample_ids.begin(), candidate.sample_ids.end());
     candidate.sample_ids.erase(std::unique(candidate.sample_ids.begin(), candidate.sample_ids.end()), candidate.sample_ids.end());
+    std::sort(candidate.alternative_edges.begin(), candidate.alternative_edges.end());
+    candidate.alternative_edges.erase(
+        std::unique(candidate.alternative_edges.begin(), candidate.alternative_edges.end()),
+        candidate.alternative_edges.end()
+    );
     std::sort(candidate.removed_nodes.begin(), candidate.removed_nodes.end());
     std::sort(candidate.template_nodes.begin(), candidate.template_nodes.end());
     return true;
@@ -551,9 +576,18 @@ size_t CtgRepeatNormalizer::apply_candidates_(std::vector<Candidate> candidates)
     }
 
     std::vector<std::vector<Edit>> path_edits(graph_.paths_.size());
+    std::unordered_set<uint64_t> alternative_edges;
+    size_t alternative_edge_count = 0;
+    for (const Candidate& candidate : accepted) {
+        alternative_edge_count += candidate.alternative_edges.size();
+    }
+    alternative_edges.reserve(alternative_edge_count);
     for (Candidate& candidate : accepted) {
         for (uint32_t sid : candidate.template_nodes) {
             graph_.merge_sample_ids_into(graph_.nodes_[sid].sample_ids, candidate.sample_ids);
+        }
+        for (uint64_t edge : candidate.alternative_edges) {
+            alternative_edges.insert(edge);
         }
         for (Edit& edit : candidate.edits) path_edits[edit.path].push_back(std::move(edit));
     }
@@ -582,9 +616,28 @@ size_t CtgRepeatNormalizer::apply_candidates_(std::vector<Candidate> candidates)
         path.segments.swap(rewritten);
     }
 
+    for (const GfaPath& path : graph_.paths_) {
+        for (size_t i = 1; i < path.segments.size(); ++i) {
+            alternative_edges.erase(canonical_edge(
+                path_vertex_(path.segments[i - 1]),
+                path_vertex_(path.segments[i])
+            ));
+        }
+    }
+
+    size_t removed_arcs = 0;
+    for (GfaArc& arc : graph_.arcs_) {
+        const uint64_t edge = canonical_edge(arc.get_source_vertex_id(), arc.get_target_vertex_id());
+        if (!arc.get_del() && alternative_edges.contains(edge)) {
+            arc.set_del(true);
+            ++removed_arcs;
+        }
+    }
+
     for (uint32_t sid : removed_nodes) graph_.delete_segment(sid);
     log_stream() << "  - Bubbles collapsed: " << accepted.size() << '\n';
-    log_stream() << "  - Alternative nodes removed: " << removed_nodes.size() << "\n\n";
+    log_stream() << "  - Alternative nodes removed: " << removed_nodes.size() << '\n';
+    log_stream() << "  - Alternative arcs removed: " << removed_arcs << "\n\n";
 
     graph_.rebuild_after_edits();
     graph_.merge_linear_chains();

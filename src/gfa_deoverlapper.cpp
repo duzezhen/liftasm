@@ -2,7 +2,6 @@
 #include "../include/progress_tracker.hpp"
 
 #include <set>
-#include <deque>
 #include <tuple>
 #include <unordered_map>
 #include <iostream>
@@ -2350,29 +2349,14 @@ void GfaDeoverlapper::build_rulemap_(const std::vector<std::vector<size_t>>& gro
     std::vector<std::unordered_set<uint32_t>> cut_sets = build_cut_sets_();
 
     ThreadPool pool(alignment_options_.align.threads);
-    std::deque<std::future<SegReplace::RuleMap>> futs;
-    const size_t max_pending = std::max<size_t>(1, alignment_options_.align.threads * 2);
     ProgressTracker prog(groups.size());
+    std::vector<SegReplace::RuleMap> results(groups.size());
+    pool.parallel_for(groups.size(), [this, &groups, &cut_sets, &prog, &results](size_t group_id) {
+        results[group_id] = build_rulemap_run_(groups[group_id], cut_sets);
+        prog.hit();
+    });
 
-    for (const auto& group : groups) {
-        const auto* group_ptr = &group;
-        futs.emplace_back(pool.submit([this, group_ptr, &cut_sets, &prog]() {
-            SegReplace::RuleMap result = build_rulemap_run_(*group_ptr, cut_sets);
-            prog.hit();
-            return result;
-        }));
-
-        if (futs.size() >= max_pending) {
-            SegReplace::RuleMap local = futs.front().get();
-            futs.pop_front();
-            for (auto& kv : local) {
-                rulemap_.emplace(kv.first, std::move(kv.second));
-            }
-        }
-    }
-    while (!futs.empty()) {
-        SegReplace::RuleMap local = futs.front().get();
-        futs.pop_front();
+    for (SegReplace::RuleMap& local : results) {
         for (auto& kv : local) {
             rulemap_.emplace(kv.first, std::move(kv.second));
         }

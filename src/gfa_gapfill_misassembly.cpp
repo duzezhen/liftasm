@@ -6,8 +6,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <deque>
-#include <future>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -327,78 +325,70 @@ void GfaGapfillMisassembly::confirm_terminals_(const std::vector<uint32_t>& refe
     log_stream() << "  - Trusted sequence chunks: " << chunks.size() << '\n';
     ProgressTracker progress(chunks.size());
     ThreadPool pool(std::min<size_t>(graph_.params_.threads, chunks.size()));
-    std::deque<std::future<std::vector<Alignment>>> futures;
-    const size_t max_pending = std::max<size_t>(1, pool.thread_count() * 2);
-    for (const ReferenceChunk& chunk : chunks) {
-        futures.emplace_back(pool.submit([&, chunk] {
-            std::vector<Alignment> result;
-            const GfaGapfill::Fragment& reference = graph_.fragments_[chunk.fragment];
-            const bool has_other_component = std::any_of(
-                target_terminals.begin(), target_terminals.end(), [&](uint32_t terminal_id) {
-                    return graph_.fragments_[terminals_[terminal_id].fragment].component != reference.component;
-                }
-            );
-            if (!has_other_component) {
-                progress.hit();
-                return result;
+    std::vector<std::vector<Alignment>> results(chunks.size());
+    pool.parallel_for(chunks.size(), [&](size_t chunk_id) {
+        const ReferenceChunk& chunk = chunks[chunk_id];
+        std::vector<Alignment>& result = results[chunk_id];
+        const GfaGapfill::Fragment& reference = graph_.fragments_[chunk.fragment];
+        const bool has_other_component = std::any_of(
+            target_terminals.begin(), target_terminals.end(), [&](uint32_t terminal_id) {
+                return graph_.fragments_[terminals_[terminal_id].fragment].component != reference.component;
             }
-            const std::string query = graph_.fragment_subsequence_(
-                reference, chunk.begin, chunk.end
-            );
-            if (query.empty() || query == "*" || query.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
-                progress.hit();
-                return result;
-            }
-
-            mm_tbuf_t* buffer = mm_tbuf_init();
-            if (!buffer) {
-                progress.hit();
-                return result;
-            }
-            int count = 0;
-            const std::string query_name = graph_.paths_[reference.path_id].name + ':' +
-                std::to_string(chunk.begin) + '-' + std::to_string(chunk.end);
-            mm_reg1_t* hits = mm_map(
-                index, static_cast<int>(query.size()), query.c_str(),
-                &count, buffer, &map_options, query_name.c_str()
-            );
-            result.reserve(count);
-            for (int i = 0; i < count; ++i) {
-                const mm_reg1_t& hit = hits[i];
-                if (!hit.p || hit.rid < 0 || static_cast<size_t>(hit.rid) >= target_terminals.size() ||
-                    hit.blen <= 0 || hit.re <= hit.rs || hit.mapq < graph_.mm2_.min_mapq) continue;
-                const uint32_t terminal_id = target_terminals[hit.rid];
-                const Terminal& terminal = terminals_[terminal_id];
-                if (graph_.fragments_[terminal.fragment].component == reference.component) continue;
-                const double identity = static_cast<double>(hit.mlen) / hit.blen;
-                if (identity < graph_.mm2_.min_match) continue;
-                const uint64_t aligned_span = std::max<int64_t>(
-                    hit.re - hit.rs, hit.qe - hit.qs
-                );
-                const uint64_t shorter = std::min<uint64_t>(terminal.sequence.size(), query.size());
-                if (shorter == 0 || static_cast<double>(aligned_span) / shorter < graph_.mm2_.min_ali_ratio) continue;
-                result.push_back({
-                    terminal_id, reference.component,
-                    static_cast<uint32_t>(hit.rs), static_cast<uint32_t>(hit.re)
-                });
-            }
-            if (hits) {
-                for (int i = 0; i < count; ++i) std::free(hits[i].p);
-                std::free(hits);
-            }
-            mm_tbuf_destroy(buffer);
+        );
+        if (!has_other_component) {
             progress.hit();
-            return result;
-        }));
-
-        if (futures.size() >= max_pending) {
-            collect(futures.front().get());
-            futures.pop_front();
+            return;
         }
-    }
-    while (!futures.empty()) {
-        collect(futures.front().get());
-        futures.pop_front();
+        const std::string query = graph_.fragment_subsequence_(
+            reference, chunk.begin, chunk.end
+        );
+        if (query.empty() || query == "*" || query.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            progress.hit();
+            return;
+        }
+
+        mm_tbuf_t* buffer = mm_tbuf_init();
+        if (!buffer) {
+            progress.hit();
+            return;
+        }
+        int count = 0;
+        const std::string query_name = graph_.paths_[reference.path_id].name + ':' +
+            std::to_string(chunk.begin) + '-' + std::to_string(chunk.end);
+        mm_reg1_t* hits = mm_map(
+            index, static_cast<int>(query.size()), query.c_str(),
+            &count, buffer, &map_options, query_name.c_str()
+        );
+        result.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            const mm_reg1_t& hit = hits[i];
+            if (!hit.p || hit.rid < 0 || static_cast<size_t>(hit.rid) >= target_terminals.size() ||
+                hit.blen <= 0 || hit.re <= hit.rs || hit.mapq < graph_.mm2_.min_mapq) continue;
+            const uint32_t terminal_id = target_terminals[hit.rid];
+            const Terminal& terminal = terminals_[terminal_id];
+            if (graph_.fragments_[terminal.fragment].component == reference.component) continue;
+            const double identity = static_cast<double>(hit.mlen) / hit.blen;
+            if (identity < graph_.mm2_.min_match) continue;
+            const uint64_t aligned_span = std::max<int64_t>(
+                hit.re - hit.rs, hit.qe - hit.qs
+            );
+            const uint64_t shorter = std::min<uint64_t>(terminal.sequence.size(), query.size());
+            if (shorter == 0 || static_cast<double>(aligned_span) / shorter < graph_.mm2_.min_ali_ratio) continue;
+            result.push_back({
+                terminal_id, reference.component,
+                static_cast<uint32_t>(hit.rs), static_cast<uint32_t>(hit.re)
+            });
+        }
+        if (hits) {
+            for (int i = 0; i < count; ++i) std::free(hits[i].p);
+            std::free(hits);
+        }
+        mm_tbuf_destroy(buffer);
+        progress.hit();
+    });
+
+    for (std::vector<Alignment>& result : results) {
+        collect(std::move(result));
     }
     pool.stop();
     mm_idx_destroy(index);

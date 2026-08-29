@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iterator>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -50,13 +51,18 @@ GfaAugmenter::Stats GfaAugmenter::read_vcfs_(const std::vector<std::string>& fil
         kvcf::Reader reader(file);
         kvcf::Record rec;
         while (reader.next(rec)) {
-            const auto name_it = name_to_id_map_.find(rec.chrom);
-            if (name_it == name_to_id_map_.end()) {
+            uint32_t sid = UINT32_MAX;
+            const auto original_it = original_name_to_id_.find(rec.chrom);
+            if (original_it != original_name_to_id_.end()) sid = original_it->second;
+            if (sid == UINT32_MAX) {
+                const auto name_it = name_to_id_map_.find(rec.chrom);
+                if (name_it != name_to_id_map_.end()) sid = static_cast<uint32_t>(name_it->second);
+            }
+            if (sid == UINT32_MAX) {
                 error_stream() << file + ":" + std::to_string(rec.line_no) + ": CHROM '" + rec.chrom + "' is not a GFA segment" << std::endl;
                 std::exit(1);
             }
 
-            const uint32_t sid = static_cast<uint32_t>(name_it->second);
             const GfaNode& node = nodes_[sid];
             if (node.deleted) continue;
             if (node.sequence.empty() || node.sequence == "*") {
@@ -89,25 +95,18 @@ GfaAugmenter::Stats GfaAugmenter::read_vcfs_(const std::vector<std::string>& fil
                 std::exit(1);
             }
 
-            variants_[sid].push_back({sid, beg, end, rec.id, ref, rec.alts, file, rec.line_no});
+            variants_[sid].push_back({beg, end, rec.id, ref, rec.alts});
             ++stats.records;
         }
     }
     return stats;
 }
 
-void GfaAugmenter::validate_variant_order_() {
-    for (uint32_t sid = 0; sid < variants_.size(); ++sid) {
-        auto& variants = variants_[sid];
+void GfaAugmenter::sort_variants_() {
+    for (auto& variants : variants_) {
         std::sort(variants.begin(), variants.end(), [](const VariantInput& a, const VariantInput& b) {
             return a.beg < b.beg || (a.beg == b.beg && a.end < b.end);
         });
-        for (size_t i = 1; i < variants.size(); ++i) {
-            if (variants[i].beg < variants[i - 1].end) {
-                error_stream() << "overlapping VCF records on segment '" + nodes_[sid].name + "': " + variants[i - 1].source + ":" + std::to_string(variants[i - 1].line_no) + " and " + variants[i].source + ":" + std::to_string(variants[i].line_no) << std::endl;
-                std::exit(1);
-            }
-        }
     }
 }
 
@@ -131,7 +130,7 @@ void GfaAugmenter::create_alt_nodes_(const std::string& tag) {
                 if (!variant.id.empty() && variant.id != ".") {
                     GfaAuxParser::append_str_tag(nodes_[alt_sid].aux.aux_data, "VI", variant.id);
                 }
-                alt_nodes_.push_back({sid, alt_sid, variant.beg, variant.end, variant.id});
+                alt_nodes_.push_back({sid, alt_sid, variant.beg, variant.end});
             }
         }
     }
@@ -180,15 +179,30 @@ void GfaAugmenter::connect_alt_nodes_(const SegReplace::Expander& expander) {
     };
 
     for (const AltNode& alt : alt_nodes_) {
-        const SegReplace::Seg ref = SegReplace::Interval::pack(alt.ref_sid, alt.ref_beg, alt.ref_end, false);
-        const SegReplace::Expansion canonical = expander.query(ref);
-        if (canonical.empty()) {
-            error_stream() << "empty canonical expansion for VCF interval" << std::endl;
+        const auto& cuts = cuts_[alt.ref_sid].v;
+        const auto first_cut = std::lower_bound(cuts.begin(), cuts.end(), alt.ref_beg);
+        const auto last_cut = std::lower_bound(cuts.begin(), cuts.end(), alt.ref_end);
+        if (first_cut == cuts.end() || last_cut == cuts.end() ||
+            *first_cut != alt.ref_beg || *last_cut != alt.ref_end || first_cut == last_cut) {
+            error_stream() << "missing VCF interval cut points" << std::endl;
             std::exit(1);
         }
 
-        const uint32_t first = materialized_vertex(canonical.front());
-        const uint32_t last = materialized_vertex(canonical.back());
+        const SegReplace::Seg first_piece = SegReplace::Interval::pack(
+            alt.ref_sid, *first_cut, *std::next(first_cut), false
+        );
+        const SegReplace::Seg last_piece = SegReplace::Interval::pack(
+            alt.ref_sid, *std::prev(last_cut), *last_cut, false
+        );
+        const SegReplace::Expansion first_expansion = expander.query(first_piece);
+        const SegReplace::Expansion last_expansion = expander.query(last_piece);
+        if (first_expansion.empty() || last_expansion.empty()) {
+            error_stream() << "empty canonical expansion for VCF interval boundary" << std::endl;
+            std::exit(1);
+        }
+
+        const uint32_t first = materialized_vertex(first_expansion.front());
+        const uint32_t last = materialized_vertex(last_expansion.back());
         const uint32_t alt_vertex = Vertex::make_vertex(alt.alt_sid, false);
 
         std::vector<uint32_t> incoming;
@@ -259,7 +273,7 @@ GfaAugmenter::Stats GfaAugmenter::augment(
 
     Stats stats = read_vcfs_(files);
     if (stats.records == 0) return stats;
-    validate_variant_order_();
+    sort_variants_();
     create_alt_nodes_(tag);
     stats.alleles = alt_nodes_.size();
     stats.split_segments = std::count_if(variants_.begin(), variants_.end(), [](const auto& v) { return !v.empty(); });

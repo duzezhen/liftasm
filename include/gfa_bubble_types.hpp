@@ -106,10 +106,19 @@ struct VcfRecord {
     uint64_t ln{0};
     uint32_t nc{0};
     std::string vt;
+    std::string mt;
+    std::string tf;
     std::vector<std::string> path_names;
     std::vector<std::string> gt_tokens;         // path-level allel ids
     std::vector<std::string> sample_gt_tokens;  // sample-level GT columns
     char gt_sep{'/'};
+    bool mosaic{false};
+};
+
+struct MosaicSite {
+    std::string chrom;
+    uint32_t begin{0};  // 0-based, half-open
+    uint32_t end{0};
 };
 
 

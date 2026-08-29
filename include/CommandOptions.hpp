@@ -67,6 +67,7 @@ struct BubbleOpts {
     std::string paf_file;               // PAF used to liftover contig coordinates to reference
     uint32_t ali_min_len  = 50000;      // minimum alignment length to keep in PAF (liftover)
     uint32_t ali_min_mapq = 5;          // minimum mapping quality to keep in PAF (liftover)
+    double max_mosaic_freq = 0.3;       // maximum tissue frequency for a mosaic allele
 
     uint32_t min_len   = 0;   // minimum sequence length for bubble detection
     uint32_t min_num   = 0;   // minimum number of nodes in a bubble
@@ -340,6 +341,10 @@ struct GapfillOpts {
     // output deduplication
     double dedup_similarity = 0.95;
     uint64_t dedup_component = 10'000'000;
+
+    // mosaic output
+    double max_mosaic_freq = 0.3;
+    uint64_t mosaic_flank = 100'000;
 
     // Runtime alignment and output, completed by runner
     opt::AlignmentOptions alignment_options;

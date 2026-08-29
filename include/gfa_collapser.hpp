@@ -135,6 +135,7 @@ private:
         uint32_t idx{UINT32_MAX};
         uint32_t input_paths{0};
         uint64_t priority{0};
+        std::vector<uint32_t> conflict_nodes;
         std::vector<CandidateTopoSpan_> spans;
         std::vector<uint32_t> region_vertices;
     };

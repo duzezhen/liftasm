@@ -28,6 +28,7 @@
 #include "../include/gfa_augment.hpp"
 #include "../include/gfa_clean.hpp"
 #include "../include/gfa_gapfill.hpp"
+#include "../include/gfa_gapfill_mosaic.hpp"
 #include "../include/aligner.hpp"
 #include "../include/CommandRunner.hpp"
 
@@ -327,6 +328,7 @@ void run_gapfill(int argc, char** argv, const std::string& command_line)
         params.DFS_guard = cfg.gapfill.DFS_guard;
         params.path_sim = cfg.gapfill.path_sim;
         params.stall_round_limit = cfg.gapfill.stall_round_limit;
+        params.max_mosaic_freq = cfg.gapfill.max_mosaic_freq;
         params.keep_nested = true;
 
         const bool debug = DEBUG_ENABLED;
@@ -336,16 +338,22 @@ void run_gapfill(int argc, char** argv, const std::string& command_line)
         DEBUG_ENABLED = debug;
         return finder;
     };
-    auto save_primary_vcfs = [&cfg](
+    auto save_primary_outputs = [&cfg, &command_line](
+        const GfaGraph& graph,
         const GfaBubble::GfaBubbleFinder& finder,
         const GfaGapfill::PrimaryPaths& paths
     ) {
         for (uint8_t hap = 0; hap < 2; ++hap) {
-            finder.save_bubble_as_vcf(
-                cfg.gapfill.prefix + ".primary.hap" + std::to_string(hap + 1) + ".gapfill",
+            const std::string prefix = cfg.gapfill.prefix + ".primary.hap"
+                + std::to_string(hap + 1) + ".gapfill";
+            const std::vector<GfaBubble::MosaicSite> sites = finder.save_bubble_as_vcf(
+                prefix,
                 "", "", cfg.bubble.ali_min_mapq, cfg.bubble.ali_min_len,
                 &paths[hap]
             );
+            GfaGapfillMosaic(
+                graph, finder.get_bubbles(), paths[hap], sites, cfg.gapfill.mosaic_flank
+            ).save(prefix, command_line);
         }
     };
     std::vector<std::string> intermediate_gfas;
@@ -380,7 +388,7 @@ void run_gapfill(int argc, char** argv, const std::string& command_line)
             const GfaGapfill::PrimaryPaths primary_paths = preliminary.save_samples(
                 cfg.gapfill.prefix, command_line
             );
-            save_primary_vcfs(*finder, primary_paths);
+            save_primary_outputs(preliminary, *finder, primary_paths);
             gapfill_complete = true;
         } else {
             const std::string ms_file = cfg.gapfill.prefix + ".gapfill.ms.gfa";
@@ -431,7 +439,7 @@ void run_gapfill(int argc, char** argv, const std::string& command_line)
         const GfaGapfill::PrimaryPaths primary_paths = G.save_samples(
             cfg.gapfill.prefix, command_line
         );
-        save_primary_vcfs(*finder, primary_paths);
+        save_primary_outputs(G, *finder, primary_paths);
     }
     cleanup_gapfill_intermediates();
 }

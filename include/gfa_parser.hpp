@@ -174,6 +174,8 @@ protected:
     /* ---------- nodes ---------- */
     std::vector<GfaNode>                       nodes_;
     std::unordered_map<std::string, uint64_t>  name_to_id_map_;     // segment name -> internal id (index in nodes_)
+    std::unordered_map<std::string, uint32_t>  original_name_to_id_;
+    bool                                       track_original_names_{false};
     std::vector<std::string>                   sample_id_to_name_;  // sample id -> sample name (tags in S-lines and from -n/--name)
     std::unordered_map<std::string, uint32_t>  sample_name_to_id_;  // sample name -> sample id (index in sample_id_to_name_)
 

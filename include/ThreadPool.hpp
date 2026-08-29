@@ -1,7 +1,9 @@
 #pragma once
+#include <algorithm>
 #include <vector>
 #include <thread>
 #include <future>
+#include <exception>
 #include <functional>
 #include <atomic>
 #include <iostream>
@@ -66,6 +68,38 @@ public:
         tasks_.push([task]{ (*task)(); });
 
         return fut;
+    }
+
+    // Workers fetch the next index when they finish, so one slow task cannot
+    // prevent the remaining threads from continuing with later work.
+    template<class F>
+    void parallel_for(size_t count, F&& function) {
+        if (count == 0) return;
+
+        std::atomic<size_t> next{0};
+        const size_t worker_count = std::min(count, n_threads_);
+        std::vector<std::future<void>> futures;
+        futures.reserve(worker_count);
+
+        for (size_t worker = 0; worker < worker_count; ++worker) {
+            futures.emplace_back(submit([&next, count, &function] {
+                while (true) {
+                    const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+                    if (index >= count) return;
+                    std::invoke(function, index);
+                }
+            }));
+        }
+
+        std::exception_ptr error;
+        for (auto& future : futures) {
+            try {
+                future.get();
+            } catch (...) {
+                if (!error) error = std::current_exception();
+            }
+        }
+        if (error) std::rethrow_exception(error);
     }
 
     /*-------------------------------------------------------------------

@@ -1,4 +1,5 @@
 #include "../include/gfa_bubble.hpp"
+#include "../include/gfa_bubble_annotation.hpp"
 #include "../include/progress_tracker.hpp"
 #include "../include/ThreadPool.hpp"
 
@@ -23,6 +24,34 @@ static std::vector<uint32_t> common_samples(
     out.reserve(std::min(a.size(), b.size()));
     std::set_intersection(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(out));
     return out;
+}
+
+static bool node_has_variant_type(const GfaGraph& graph, uint32_t sid, std::string_view type)
+{
+    const GfaNode* node = graph.getNode(sid);
+    if (!node || graph.getNodeDeleted(sid)) return false;
+
+    const uint8_t* tag = GfaAuxParser::get_aux_data(node->aux.aux_data, "VT");
+    if (!tag || *tag != 'Z') return false;
+
+    const std::string_view values(reinterpret_cast<const char*>(tag + 1));
+    size_t begin = 0;
+    while (begin <= values.size()) {
+        const size_t end = values.find(',', begin);
+        if (values.substr(begin, end == std::string_view::npos ? values.size() - begin : end - begin) == type) {
+            return true;
+        }
+        if (end == std::string_view::npos) break;
+        begin = end + 1;
+    }
+    return false;
+}
+
+static bool is_haplotype_sample(const GfaGraph& graph, uint32_t sample)
+{
+    if (sample >= graph.getSampleNames().size()) return false;
+    const std::string& name = graph.getSampleNames()[sample];
+    return name.ends_with(".hap1") || name.ends_with(".hap2");
 }
 
 GfaBubbleFinder::GfaBubbleFinder(const GfaGraph& graph, BubbleOpts params)
@@ -480,14 +509,23 @@ std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_bubble_paths_(
 ) const {
     hit_limits = false;
 
-    // A real contig path is authoritative. Synthetic component paths are not indexed.
+    // ------------------------------------------------ 1. Enumerate paths from P-lines in the GFA graph ------------------------------------------------
+    std::vector<std::vector<uint32_t>> guided_paths;
     if (!path_walker_.empty()) {
-        std::vector<std::vector<uint32_t>> paths = path_walker_.paths_between(
-            source, sink, params_.max_paths
-        );
-        if (paths.size() >= 2) return paths;
+        guided_paths = path_walker_.paths_between(source, sink, params_.max_paths);
     }
 
+    // ------------------------------------------------ 2. If there are any nodes is from a VCF variant (don't have P-line), so use enumerate paths with sample guidance ------------------------------------------------
+    bool vcf_hit_limits = false;
+    for (auto& path : enumerate_vcf_paths_(source, sink, region_set, max_depth, vcf_hit_limits)) {
+        if (std::find(guided_paths.begin(), guided_paths.end(), path) == guided_paths.end()) {
+            guided_paths.push_back(std::move(path));
+        }
+    }
+    hit_limits = hit_limits || vcf_hit_limits;
+    if (guided_paths.size() >= 2) return guided_paths;
+
+    // ------------------------------------------------ 3. If don't have any guided paths, use the original graph walk ------------------------------------------------
     const std::vector<uint32_t> samples = common_samples(graph_, source, sink);
     if (samples.empty()) {
         return graph_.enumerate_paths_greedy_DFS(
@@ -496,7 +534,7 @@ std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_bubble_paths_(
         );
     }
 
-    // Keep one sample fixed for the complete path, then merge samples fairly.
+    // // ------------------------------------------------ 4. Enumerate paths based on samples guided ------------------------------------------------
     std::vector<std::vector<std::vector<uint32_t>>> candidates;
     candidates.reserve(samples.size());
     size_t rounds = 0;
@@ -528,8 +566,7 @@ std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_bubble_paths_(
 
     if (paths.size() >= 2) return paths;
 
-    // No guide produced a complete bubble; keep the original graph walk as
-    // the final task-level fallback.
+    // ------------------------------------------------ 5. No guide produced a complete bubble; keep the original graph walk as ------------------------------------------------
     bool legacy_hit_limits = false;
     std::vector<std::vector<uint32_t>> legacy = graph_.enumerate_paths_greedy_DFS(
         source, sink, region_set, max_depth,
@@ -537,6 +574,57 @@ std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_bubble_paths_(
     );
     hit_limits = hit_limits || legacy_hit_limits;
     return legacy;
+}
+
+std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_vcf_paths_(
+    uint32_t source,
+    uint32_t sink,
+    const std::unordered_set<uint32_t>& region_set,
+    uint32_t max_depth,
+    bool& hit_limits
+) const {
+    hit_limits = false;
+
+    std::unordered_set<uint32_t> variants;
+    std::vector<uint32_t> samples;
+    variants.reserve(4);
+    samples.reserve(4);
+
+    for (uint32_t vertex : region_set) {
+        const uint32_t sid = Vertex::get_segment_id(vertex);
+        if (vertex == source || vertex == sink || !node_has_variant_type(graph_, sid, "V")) continue;
+        if (!variants.insert(sid).second) continue;
+
+        for (uint32_t sample : graph_.getNodeSampleIds(sid)) {
+            if (is_haplotype_sample(graph_, sample)) samples.push_back(sample);
+        }
+    }
+
+    std::sort(samples.begin(), samples.end());
+    samples.erase(std::unique(samples.begin(), samples.end()), samples.end());
+    if (variants.empty() || samples.empty()) return {};
+
+    const uint32_t variant_limit = static_cast<uint32_t>(variants.size()) + 1;
+    const uint32_t max_paths = params_.max_paths == 0 ? 0 : std::max<uint32_t>(params_.max_paths, variant_limit);
+
+    std::vector<std::vector<uint32_t>> paths;
+    for (uint32_t sample : samples) {
+        bool sample_hit_limits = false;
+        std::vector<std::vector<uint32_t>> sample_paths = graph_.enumerate_paths_greedy_DFS(
+            source, sink, region_set, max_depth, max_paths, params_.skip_comp,
+            sample_hit_limits, params_.DFS_guard, params_.stall_round_limit, sample
+        );
+        hit_limits = hit_limits || sample_hit_limits;
+
+        for (auto& path : sample_paths) {
+            const bool has_variant = std::any_of(path.begin(), path.end(), [&](uint32_t vertex) {
+                return variants.contains(Vertex::get_segment_id(vertex));
+            });
+            if (!has_variant || std::find(paths.begin(), paths.end(), path) != paths.end()) continue;
+            paths.push_back(std::move(path));
+        }
+    }
+    return paths;
 }
 
 Bubble GfaBubbleFinder::detect_closed_bubble_from_source_(Vertex v, uint64_t bfs_limit)
@@ -824,7 +912,7 @@ void GfaBubbleFinder::save_bubble_as_gfa(
     );
 }
 
-void GfaBubbleFinder::save_bubble_as_vcf(
+std::vector<MosaicSite> GfaBubbleFinder::save_bubble_as_vcf(
     const std::string& output_prefix,
     const std::string& paf_file,
     const std::string& ref_file,
@@ -832,8 +920,9 @@ void GfaBubbleFinder::save_bubble_as_vcf(
     uint32_t min_aln_len,
     const std::vector<ReferencePath>* reference_paths
 ) const {
-    BubbleWriter(graph_, bubbles_, homologous_paths_).save_vcf(
-        output_prefix, paf_file, ref_file, min_mapq, min_aln_len, reference_paths
+    return BubbleWriter(graph_, bubbles_, homologous_paths_).save_vcf(
+        output_prefix, paf_file, ref_file, min_mapq, min_aln_len,
+        reference_paths, params_.max_mosaic_freq
     );
 }
 
@@ -4058,9 +4147,17 @@ public:
         }
         occurrences_.reserve(anchor_vertices_.size());
 
-        std::unordered_map<std::string, uint32_t> sample_ids;
-        sample_ids.reserve(graph.getPaths().size());
+        std::unordered_map<std::string, uint32_t> sample_name_to_id;
+        sample_name_to_id.reserve(graph.getPaths().size() + graph.getSampleNames().size());
         paths_.reserve(graph.getPaths().size());
+
+        auto intern_sample = [&](const std::string& name) {
+            const auto [sample, inserted] = sample_name_to_id.emplace(
+                name, static_cast<uint32_t>(sample_names_.size())
+            );
+            if (inserted) sample_names_.push_back(name);
+            return sample->second;
+        };
 
         for (const GfaPath& path : graph.getPaths()) {
             if (path.segments.empty() || path.segments.size() > UINT32_MAX ||
@@ -4077,13 +4174,10 @@ public:
             if (!valid || paths_.size() >= UINT32_MAX) continue;
 
             const std::string& sample_name = path.sample.empty() ? path.name : path.sample;
-            auto [sample, inserted] = sample_ids.emplace(
-                sample_name, static_cast<uint32_t>(sample_names_.size())
-            );
-            if (inserted) sample_names_.push_back(sample_name);
+            const uint32_t sample = intern_sample(sample_name);
 
             const uint32_t path_id = static_cast<uint32_t>(paths_.size());
-            paths_.push_back({&path, sample->second});
+            paths_.push_back({&path, sample});
             for (uint32_t position = 0; position < path.segments.size(); ++position) {
                 const uint32_t vertex = vertex_at_(path, position);
                 if (anchor_vertices_.contains(vertex)) {
@@ -4091,11 +4185,33 @@ public:
                 }
             }
         }
+
+        graph_sample_to_path_sample_.assign(graph.getSampleNames().size(), UINT32_MAX);
+        for (uint32_t sample = 0; sample < graph.getSampleNames().size(); ++sample) {
+            if (is_haplotype_sample(graph, sample)) {
+                graph_sample_to_path_sample_[sample] = intern_sample(graph.getSampleNames()[sample]);
+            }
+        }
     }
 
     bool empty() const { return paths_.empty(); }
     size_t path_count() const { return paths_.size(); }
     const std::vector<std::string>& sample_names() const { return sample_names_; }
+
+    std::vector<uint32_t> map_graph_samples(const std::vector<uint32_t>& graph_samples) const
+    {
+        std::vector<uint32_t> out;
+        out.reserve(graph_samples.size());
+        for (uint32_t sample : graph_samples) {
+            if (sample < graph_sample_to_path_sample_.size() &&
+                graph_sample_to_path_sample_[sample] != UINT32_MAX) {
+                out.push_back(graph_sample_to_path_sample_[sample]);
+            }
+        }
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
 
     std::vector<std::vector<uint32_t>> match_samples(const Bubble& bubble) const
     {
@@ -4164,6 +4280,7 @@ private:
     std::vector<IndexedPath> paths_;
     std::unordered_set<uint32_t> anchor_vertices_;
     std::unordered_map<uint32_t, std::vector<Occurrence>> occurrences_;
+    std::vector<uint32_t> graph_sample_to_path_sample_;
 };
 
 // ------------------------------------------------ Primary path coordinate index ------------------------------------------------
@@ -4360,13 +4477,15 @@ private:
 
 } // namespace
 
-void BubbleWriter::save_vcf(
+
+std::vector<MosaicSite> BubbleWriter::save_vcf(
     const std::string& output_prefix,
     const std::string& paf_file,
     const std::string& ref_file,
     uint32_t min_mapq,
     uint32_t min_aln_len,
-    const std::vector<ReferencePath>* reference_paths
+    const std::vector<ReferencePath>* reference_paths,
+    double max_mosaic_freq
 ) const
 {
     // ------------------------------------------------ Initialization ------------------------------------------------
@@ -4446,6 +4565,8 @@ void BubbleWriter::save_vcf(
     oss << "##INFO=<ID=NC,Number=1,Type=Integer,Description=\"Number of inner nodes\">\n";
     oss << "##INFO=<ID=PN,Number=.,Type=String,Description=\"Path names in genotype order; reserved label separators are shown as |\">\n";
     oss << "##INFO=<ID=VT,Number=.,Type=String,Description=\"Variant categories from bubble nodes\">\n";
+    oss << "##INFO=<ID=MT,Number=R,Type=String,Description=\"Mutation type for REF and ALT alleles from tissue frequency\">\n";
+    oss << "##INFO=<ID=TF,Number=R,Type=Float,Description=\"Fraction of callable tissues carrying REF and ALT alleles\">\n";
     oss << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n";
     oss << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT";
     if (sample_names.empty()) {
@@ -4588,8 +4709,36 @@ void BubbleWriter::save_vcf(
         std::vector<std::vector<uint32_t>> path_sample_ids;
         std::vector<uint32_t> bubble_path_ids;
 
-        std::vector<std::vector<uint32_t>> p_path_sample_ids;
-        if (use_p_genotypes) p_path_sample_ids = contig_paths.match_samples(bb);
+        std::vector<std::vector<uint32_t>> allele_sample_ids = use_p_genotypes ?
+            contig_paths.match_samples(bb) :
+            std::vector<std::vector<uint32_t>>(bb.get_paths().size());
+
+        for (uint32_t path_id = 0; path_id < bb.get_paths().size(); ++path_id) {
+            const auto& path = bb.get_paths()[path_id];
+            if (!use_p_genotypes) {
+                allele_sample_ids[path_id] = path_sample_ids_(path, src_seg, sink_seg);
+            }
+
+            std::vector<uint32_t> vcf_samples;
+            for (uint32_t vertex : path) {
+                const uint32_t sid = Vertex::get_segment_id(vertex);
+                if (sid == src_seg || sid == sink_seg || !node_has_variant_type(graph_, sid, "V")) continue;
+                for (uint32_t sample : graph_.getNodeSampleIds(sid)) {
+                    if (is_haplotype_sample(graph_, sample)) vcf_samples.push_back(sample);
+                }
+            }
+
+            std::sort(vcf_samples.begin(), vcf_samples.end());
+            vcf_samples.erase(std::unique(vcf_samples.begin(), vcf_samples.end()), vcf_samples.end());
+
+            if (!vcf_samples.empty()) {
+                if (use_p_genotypes) vcf_samples = contig_paths.map_graph_samples(vcf_samples);
+                auto& samples = allele_sample_ids[path_id];
+                samples.insert(samples.end(), vcf_samples.begin(), vcf_samples.end());
+                std::sort(samples.begin(), samples.end());
+                samples.erase(std::unique(samples.begin(), samples.end()), samples.end());
+            }
+        }
 
         path_names.reserve(bb.get_paths().size());
         allele_seqs.reserve(bb.get_paths().size());
@@ -4602,8 +4751,7 @@ void BubbleWriter::save_vcf(
             if (p.empty()) continue;
 
             path_names.push_back(path_name_u32_(p, src_seg, sink_seg));
-            path_sample_ids.push_back(use_p_genotypes ?
-                p_path_sample_ids[path_id] : path_sample_ids_(p, src_seg, sink_seg));
+            path_sample_ids.push_back(allele_sample_ids[path_id]);
             bubble_path_ids.push_back(path_id);
 
             if (!use_ref_sequence) {
@@ -4682,7 +4830,7 @@ void BubbleWriter::save_vcf(
                 rec.ref = ".";
                 rec.alt = ".";
                 rec.gt_tokens.assign(rec.path_names.size(), ".");
-                rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size(), use_p_genotypes);
+                rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size());
                 vcf_records.push_back(std::move(rec));
                 continue;
             }
@@ -4718,7 +4866,7 @@ void BubbleWriter::save_vcf(
                 rec.alt = join_strings_(alt_alleles, ",");
             }
 
-            rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size(), use_p_genotypes);
+            rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size());
             vcf_records.push_back(std::move(rec));
             continue;
         }
@@ -4739,7 +4887,7 @@ void BubbleWriter::save_vcf(
             rec.ref = ".";
             rec.alt = ".";
             rec.gt_tokens.assign(rec.path_names.size(), ".");
-            rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size(), use_p_genotypes);
+            rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size());
             vcf_records.push_back(std::move(rec));
             continue;
         }
@@ -4827,7 +4975,7 @@ void BubbleWriter::save_vcf(
         rec.end = out_pos1 + static_cast<uint32_t>(ref_seq.size()) - 1;
         rec.ref = std::move(ref_seq);
         rec.alt = join_strings_(alt_alleles, ",");
-        rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size(), use_p_genotypes);
+        rec.sample_gt_tokens = sample_gt_tokens_(rec.gt_tokens, path_sample_ids, sample_names.size());
         vcf_records.push_back(std::move(rec));
     }
 
@@ -4861,8 +5009,18 @@ void BubbleWriter::save_vcf(
     }
     vcf_records.resize(kept);
 
+    BubbleAnnotation annotation(sample_names, max_mosaic_freq);
+    std::vector<MosaicSite> mosaic_sites;
     for (size_t i = 0; i < vcf_records.size(); ++i) {
         normalize_vcf_record_(vcf_records, i);
+        annotation.annotate(vcf_records[i]);
+        if (vcf_records[i].mosaic && vcf_records[i].pos > 0) {
+            mosaic_sites.push_back({
+                vcf_records[i].chrom,
+                vcf_records[i].pos - 1,
+                vcf_records[i].end
+            });
+        }
         saver.save(vcf_record_string_(vcf_records[i]));
     }
 
@@ -4879,6 +5037,7 @@ void BubbleWriter::save_vcf(
                      << before_merge - vcf_records.size() << "\n";
     }
     log_stream() << "  - Total VCF records written: " << vcf_records.size() << "\n\n";
+    return mosaic_sites;
 }
 
 std::string BubbleWriter::node_variant_types_(uint32_t sid) const
@@ -5118,8 +5277,7 @@ std::vector<uint32_t> BubbleWriter::path_sample_ids_(
 std::vector<std::string> BubbleWriter::sample_gt_tokens_(
     const std::vector<std::string>& path_gt_tokens,
     const std::vector<std::vector<uint32_t>>& path_sample_ids,
-    size_t sample_count,
-    bool haploid
+    size_t sample_count
 ) const {
     std::vector<std::vector<std::string>> by_sample(sample_count);
     const size_t n = std::min(path_gt_tokens.size(), path_sample_ids.size());
@@ -5146,7 +5304,7 @@ std::vector<std::string> BubbleWriter::sample_gt_tokens_(
             if (b == ".") return true;
             return std::stoi(a) < std::stoi(b);
         });
-        out.push_back(haploid && values.size() != 1 ? "." : join_strings_(values, "/"));
+        out.push_back(join_strings_(values, "/"));
     }
     return out;
 }
@@ -5233,6 +5391,8 @@ std::string BubbleWriter::vcf_record_string_(const VcfRecord& record)
         << ";NC=" << record.nc
         << ";PN=" << join_strings_(path_names, ",");
     if (!record.vt.empty()) out << ";VT=" << vcf_info_text_(record.vt, false);
+    if (!record.mt.empty()) out << ";MT=" << record.mt;
+    if (!record.tf.empty()) out << ";TF=" << record.tf;
     out << "\tGT\t" << join_strings_(gt, "\t") << '\n';
     return out.str();
 }

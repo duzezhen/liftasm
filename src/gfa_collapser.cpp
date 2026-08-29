@@ -6,7 +6,6 @@
 #include "../include/progress_tracker.hpp"
 
 #include <algorithm>
-#include <future>
 #include <limits>
 #include <cstdint>
 #include <numeric>
@@ -1743,6 +1742,7 @@ std::vector<GfaCollapser::AlignmentCandidate_> GfaCollapser::build_alignment_can
 
                 // Shared source/sink boundaries must not join adjacent bubbles.
                 if (pos == 0 || pos + 1 == path.size()) continue;
+                candidate.conflict_nodes.push_back(sid);
 
                 uint32_t component = sid < connectivity_index_.size() ? connectivity_index_[sid] : sid;
                 if (component == UINT32_MAX) component = sid;
@@ -1753,6 +1753,11 @@ std::vector<GfaCollapser::AlignmentCandidate_> GfaCollapser::build_alignment_can
                 span.end = std::max(span.end, rank);
             }
         }
+        std::sort(candidate.conflict_nodes.begin(), candidate.conflict_nodes.end());
+        candidate.conflict_nodes.erase(
+            std::unique(candidate.conflict_nodes.begin(), candidate.conflict_nodes.end()),
+            candidate.conflict_nodes.end()
+        );
         for (const auto& item : spans) candidate.spans.push_back(item.second);
         candidate.region_vertices = collect_candidate_region_(paths);
         candidates.push_back(std::move(candidate));
@@ -1782,6 +1787,7 @@ std::vector<GfaCollapser::AlignmentCandidate_> GfaCollapser::build_alignment_can
                 // SameSource paths share the first node. DiffSource paths have
                 // no shared boundary, so all their nodes define conflicts.
                 if (candidate.type == GfaBubble::Type::SameSource && pos == 0) continue;
+                candidate.conflict_nodes.push_back(sid);
 
                 uint32_t component = sid < connectivity_index_.size() ? connectivity_index_[sid] : sid;
                 if (component == UINT32_MAX) component = sid;
@@ -1793,6 +1799,11 @@ std::vector<GfaCollapser::AlignmentCandidate_> GfaCollapser::build_alignment_can
                 span.end = std::max(span.end, rank);
             }
         }
+        std::sort(candidate.conflict_nodes.begin(), candidate.conflict_nodes.end());
+        candidate.conflict_nodes.erase(
+            std::unique(candidate.conflict_nodes.begin(), candidate.conflict_nodes.end()),
+            candidate.conflict_nodes.end()
+        );
         for (const auto& item : spans) candidate.spans.push_back(item.second);
         candidate.region_vertices = collect_candidate_region_(
             homologous_paths[source].get_paths_u32()
@@ -1806,13 +1817,6 @@ std::vector<GfaCollapser::AlignmentCandidate_> GfaCollapser::build_alignment_can
 std::vector<std::vector<size_t>> GfaCollapser::group_alignment_candidates_(
     const std::vector<AlignmentCandidate_>& candidates
 ) const {
-    struct SpanRef {
-        uint32_t component;
-        uint32_t begin;
-        uint32_t end;
-        size_t candidate;
-    };
-
     std::vector<size_t> parent(candidates.size());
     std::vector<uint8_t> rank(candidates.size(), 0);
     std::iota(parent.begin(), parent.end(), 0);
@@ -1833,35 +1837,16 @@ std::vector<std::vector<size_t>> GfaCollapser::group_alignment_candidates_(
         if (rank[a] == rank[b]) ++rank[a];
     };
 
-    std::vector<SpanRef> spans;
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        for (const CandidateTopoSpan_& span : candidates[i].spans) {
-            spans.push_back({span.component, span.begin, span.end, i});
-        }
-    }
-    std::sort(spans.begin(), spans.end(), [](const SpanRef& a, const SpanRef& b) {
-        if (a.component != b.component) return a.component < b.component;
-        if (a.begin != b.begin) return a.begin < b.begin;
-        if (a.end != b.end) return a.end > b.end;
-        return a.candidate < b.candidate;
-    });
-
-    size_t i = 0;
-    while (i < spans.size()) {
-        size_t representative = spans[i].candidate;
-        uint32_t component = spans[i].component;
-        uint32_t covered_end = spans[i].end;
-        ++i;
-
-        while (i < spans.size() && spans[i].component == component) {
-            if (spans[i].begin > covered_end) {
-                representative = spans[i].candidate;
-                covered_end = spans[i].end;
+    // Candidates conflict only when they use the same non-boundary segment.
+    std::vector<uint32_t> owner(nodes_.size(), UINT32_MAX);
+    for (size_t candidate = 0; candidate < candidates.size(); ++candidate) {
+        for (uint32_t sid : candidates[candidate].conflict_nodes) {
+            if (sid >= owner.size()) continue;
+            if (owner[sid] == UINT32_MAX) {
+                owner[sid] = static_cast<uint32_t>(candidate);
             } else {
-                join(representative, spans[i].candidate);
-                covered_end = std::max(covered_end, spans[i].end);
+                join(candidate, owner[sid]);
             }
-            ++i;
         }
     }
 
@@ -2016,31 +2001,19 @@ void GfaCollapser::homologous_align_(
     const std::vector<std::vector<size_t>> groups = group_alignment_candidates_(candidates);
 
     log_stream() << "  - Alignment candidates: " << candidates.size() << "\n";
-    log_stream() << "  - Topological conflict groups: " << groups.size() << "\n";
+    log_stream() << "  - Node conflict groups: " << groups.size() << "\n";
 
     ThreadPool pool(alignment_options_.align.threads);
-    const size_t max_inflight = std::max<size_t>(1, alignment_options_.align.threads * 2);
-    std::deque<std::future<std::vector<BubbleAlignment>>> futures;
     ProgressTracker progress(candidates.size());
-    size_t submitted = 0;
+    std::vector<std::vector<BubbleAlignment>> group_alignments(groups.size());
+    pool.parallel_for(groups.size(), [this, &groups, &candidates, &bubbles, &homologous_paths, &progress, &group_alignments](size_t group_id) {
+        group_alignments[group_id] = align_candidate_group_(
+            groups[group_id], candidates, bubbles, homologous_paths
+        );
+        progress.add(groups[group_id].size());
+    });
 
-    while (submitted < groups.size() || !futures.empty()) {
-        while (submitted < groups.size() && futures.size() < max_inflight) {
-            const size_t group_id = submitted++;
-            futures.emplace_back(pool.submit(
-                [this, group_id, &groups, &candidates, &bubbles, &homologous_paths, &progress]() {
-                    std::vector<BubbleAlignment> result = align_candidate_group_(
-                        groups[group_id], candidates, bubbles, homologous_paths
-                    );
-                    progress.add(groups[group_id].size());
-                    return result;
-                }
-            ));
-        }
-
-        std::vector<BubbleAlignment> alignments = futures.front().get();
-        futures.pop_front();
-
+    for (std::vector<BubbleAlignment>& alignments : group_alignments) {
         for (BubbleAlignment& alignment : alignments) {
             const uint32_t sid_a = NodeHandle::get_segment_id(alignment.v_a);
             const uint32_t sid_b = NodeHandle::get_segment_id(alignment.v_b);
@@ -2168,42 +2141,33 @@ std::unordered_set<int32_t> LocalGraphComplexity::find_increasing_candidates() c
     }
 
     ThreadPool pool(collapser_.alignment_options_.align.threads);
-    const size_t max_inflight = std::max<size_t>(1, collapser_.alignment_options_.align.threads * 2);
-    std::deque<std::future<std::pair<int32_t, bool>>> futures;
-    size_t submitted = 0;
-
-    while (submitted < work.size() || !futures.empty()) {
-        while (submitted < work.size() && futures.size() < max_inflight) {
-            const size_t candidate_id = work[submitted++];
-            futures.emplace_back(pool.submit(
-                [this, candidate_id, &affected_segments, &rules_by_segment]() {
-                    const auto& candidate = collapser_.alignment_candidates_[candidate_id];
-                    SegReplace::RuleMap local_rules;
-                    for (uint32_t sid : affected_segments[candidate.idx]) {
-                        const auto found = rules_by_segment.find(sid);
-                        if (found == rules_by_segment.end()) continue;
-                        for (const auto& rule : found->second) {
-                            local_rules.emplace(rule.first, rule.second);
-                        }
-                    }
-
-                    SegReplace::Expander expander(
-                        local_rules,
-                        {},
-                        collapser_.params_.min_trans_len
-                    );
-                    expander.build_index();
-                    expander.filter_nonmonotonic_index();
-                    return std::make_pair(
-                        static_cast<int32_t>(candidate.idx),
-                        candidate_increases_(candidate_id, expander)
-                    );
-                }
-            ));
+    std::vector<std::pair<int32_t, bool>> results(work.size());
+    pool.parallel_for(work.size(), [this, &work, &affected_segments, &rules_by_segment, &results](size_t job) {
+        const size_t candidate_id = work[job];
+        const auto& candidate = collapser_.alignment_candidates_[candidate_id];
+        SegReplace::RuleMap local_rules;
+        for (uint32_t sid : affected_segments[candidate.idx]) {
+            const auto found = rules_by_segment.find(sid);
+            if (found == rules_by_segment.end()) continue;
+            for (const auto& rule : found->second) {
+                local_rules.emplace(rule.first, rule.second);
+            }
         }
 
-        const auto result = futures.front().get();
-        futures.pop_front();
+        SegReplace::Expander expander(
+            local_rules,
+            {},
+            collapser_.params_.min_trans_len
+        );
+        expander.build_index();
+        expander.filter_nonmonotonic_index();
+        results[job] = {
+            static_cast<int32_t>(candidate.idx),
+            candidate_increases_(candidate_id, expander)
+        };
+    });
+
+    for (const auto& result : results) {
         if (result.second) bad.insert(result.first);
     }
 
@@ -2535,27 +2499,18 @@ std::unordered_set<SegReplace::Seg, SegReplace::U128Hash, SegReplace::U128Eq> Gf
     const SegReplace::Expander& expander
 ) const {
     ThreadPool pool(graph_.alignment_options_.align.threads);
-    const size_t max_inflight = std::max<size_t>(1, graph_.alignment_options_.align.threads * 2);
-    std::deque<std::future<PathScan>> futures;
     std::unordered_set<SegReplace::Seg, SegReplace::U128Hash, SegReplace::U128Eq> bad;
     std::unordered_map<SegReplace::Seg, uint32_t, SegReplace::U128Hash, SegReplace::U128Eq> node_ids;
     std::unordered_set<uint64_t> edge_set;
     std::unordered_map<uint32_t, std::vector<SegReplace::Seg>> node_rules;
     ProgressTracker progress(paths.size());
-    size_t submitted = 0;
+    std::vector<PathScan> scans(paths.size());
+    pool.parallel_for(paths.size(), [this, &paths, &expander, &progress, &scans](size_t path_id) {
+        scans[path_id] = scan_path_(*paths[path_id], expander);
+        progress.hit();
+    });
 
-    while (submitted < paths.size() || !futures.empty()) {
-        while (submitted < paths.size() && futures.size() < max_inflight) {
-            const GfaPath* path = paths[submitted++];
-            futures.emplace_back(pool.submit([this, path, &expander, &progress]() {
-                PathScan result = scan_path_(*path, expander);
-                progress.hit();
-                return result;
-            }));
-        }
-
-        PathScan scan = futures.front().get();
-        futures.pop_front();
+    for (const PathScan& scan : scans) {
         bad.insert(scan.bad_rules.begin(), scan.bad_rules.end());
 
         std::vector<uint32_t> path_nodes;

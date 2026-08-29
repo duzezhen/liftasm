@@ -44,7 +44,7 @@ public:
     void filter_nested_bubbles();
     const std::vector<Bubble>& get_bubbles() const noexcept { return bubbles_; }
     void save_bubble_as_gfa(const std::string& output_file, const uint32_t min_len, const uint32_t min_num, bool write_seq = true, const std::string& command_line = "") const;
-    void save_bubble_as_vcf(
+    std::vector<MosaicSite> save_bubble_as_vcf(
         const std::string& output_prefix,
         const std::string& paf_file,
         const std::string& ref_file,
@@ -76,6 +76,13 @@ private:
 
     bool find_common_nearest_sink_(Vertex source, const std::vector<Vertex>& seeds, uint64_t bfs_limit, uint32_t& best_sink, std::unordered_set<uint32_t>& local_nodes);
     std::vector<std::vector<uint32_t>> enumerate_bubble_paths_(
+        uint32_t source,
+        uint32_t sink,
+        const std::unordered_set<uint32_t>& region_set,
+        uint32_t max_depth,
+        bool& hit_limits
+    ) const;
+    std::vector<std::vector<uint32_t>> enumerate_vcf_paths_(
         uint32_t source,
         uint32_t sink,
         const std::unordered_set<uint32_t>& region_set,
@@ -434,13 +441,14 @@ public:
         const std::string& command_line = ""
     ) const;
 
-    void save_vcf(
+    std::vector<MosaicSite> save_vcf(
         const std::string& output_prefix,
         const std::string& paf_file,
         const std::string& ref_file,
         uint32_t min_mapq,
         uint32_t min_aln_len,
-        const std::vector<ReferencePath>* reference_paths = nullptr
+        const std::vector<ReferencePath>* reference_paths,
+        double max_mosaic_freq
     ) const;
 
 private:
@@ -469,7 +477,7 @@ private:
     static bool can_trim_suffix_(const std::string& ref, const std::vector<std::string>& alleles);
     std::string path_root_(const std::string& path_name) const;
     std::vector<uint32_t> path_sample_ids_(const std::vector<uint32_t>& path, uint32_t src_seg, uint32_t sink_seg) const;
-    std::vector<std::string> sample_gt_tokens_(const std::vector<std::string>& path_gt_tokens, const std::vector<std::vector<uint32_t>>& path_sample_ids, size_t sample_count, bool haploid) const;
+    std::vector<std::string> sample_gt_tokens_(const std::vector<std::string>& path_gt_tokens, const std::vector<std::vector<uint32_t>>& path_sample_ids, size_t sample_count) const;
     static bool same_vcf_allele_(const VcfRecord& a, const VcfRecord& b);
     static std::string merge_genotypes_(std::string_view a, std::string_view b);
     static void merge_sample_genotypes_(VcfRecord& target, const VcfRecord& duplicate);

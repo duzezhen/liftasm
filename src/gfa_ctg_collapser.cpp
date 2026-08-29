@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <deque>
 #include <future>
 #include <iomanip>
 #include <map>
@@ -271,7 +270,8 @@ void GfaCtgCollapser::load_ctgs(
     const std::vector<std::string>& hap1_files,
     const std::vector<std::string>& hap2_files,
     const std::vector<std::string>& sample_names,
-    uint32_t min_contig_len
+    uint32_t min_contig_len,
+    bool map_original_names
 ) {
     std::vector<std::string> files;
     std::vector<std::string> names;
@@ -296,7 +296,10 @@ void GfaCtgCollapser::load_ctgs(
         duplicate_groups.push_back(static_cast<uint32_t>(i));
     }
 
+    track_original_names_ = map_original_names;
+    original_name_to_id_.clear();
     load_from_GFA(files, names, /*read_links=*/false, duplicate_groups);
+    track_original_names_ = false;
     paths_.clear();
     filter_short_contigs_(min_contig_len);
     index_origins_(samples);
@@ -1191,7 +1194,7 @@ void GfaCtgCollapser::collapse_ctgs(
     Stats variant_stats;
     if (!vcf_files.empty()) {
         variant_stats = read_vcfs_(vcf_files);
-        validate_variant_order_();
+        sort_variants_();
         create_alt_nodes_("V");
         variant_stats.alleles = alt_nodes_.size();
     }
@@ -1286,7 +1289,10 @@ std::vector<std::string> GfaCtgCollapser::collapse_samples(const CollapseOpts& o
 
         log_stream() << "Processing contig sample " << (i + 1) << '/' << hap1_files.size() << " (" << unique_name << ") ...\n\n";
         GfaCtgCollapser sample(*this);
-        sample.load_ctgs({hap1_files[i]}, {hap2_files[i]}, {unique_name}, options.ctg_min_len);
+        sample.load_ctgs(
+            {hap1_files[i]}, {hap2_files[i]}, {unique_name}, options.ctg_min_len,
+            !sample_vcf.empty()
+        );
         if (namespace_samples) sample.namespace_segment_names_("_" + std::to_string(i + 1));
         sample.collapse_ctgs(
             sample_vcf, sample_prefix, options.ctg_anchor_coverage,
@@ -1768,87 +1774,65 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     mm_mapopt_update(&round_options, index);
 
     ThreadPool pool(alignment_options_.align.threads);
-    struct PendingMap {
-        const ComponentBackbone* query = nullptr;
-        std::future<MapResult> future;
-    };
-    std::deque<PendingMap> futures;
-    const size_t max_pending = std::max<size_t>(
-        1, static_cast<size_t>(alignment_options_.align.threads) * 2
-    );
     ProgressTracker progress(queries.size());
+    std::vector<MapResult> results(queries.size());
+    pool.parallel_for(queries.size(), [this, index, round_options, &references, &queries, query_components, &progress, &results](size_t query_id) {
+        const ComponentBackbone* query = queries[query_id];
+        MapResult& result = results[query_id];
+        mm_mapopt_t query_options = round_options;
+        mm_tbuf_t* buffer = mm_tbuf_init();
+        int count = 0;
+        mm_reg1_t* regs = mm_map(
+            index, static_cast<int>(query->sequence.size()), query->sequence.c_str(),
+            &count, buffer, &query_options, query->name.c_str()
+        );
+        result.hits.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            const mm_reg1_t& hit = regs[i];
+            if (!hit.p || hit.rid < 0 || static_cast<size_t>(hit.rid) >= references.size()) continue;
+            if (hit.mapq < params_.min_mapq || hit.parent != hit.id) continue;  // filter based on mapping quality
+            const mm_extra_t* extra = static_cast<const mm_extra_t*>(hit.p);
+            if (!extra || extra->n_cigar == 0) continue;
 
-    for (const ComponentBackbone* query : queries) {
-        futures.push_back({query, pool.submit([this, index, round_options, &references, query, query_components, &progress]() mutable {
-                MapResult result;
-                mm_tbuf_t* buffer = mm_tbuf_init();
-                int count = 0;
-                mm_reg1_t* regs = mm_map(
-                    index, static_cast<int>(query->sequence.size()), query->sequence.c_str(),
-                    &count, buffer, &round_options, query->name.c_str()
-                );
-                result.hits.reserve(count);
-                for (int i = 0; i < count; ++i) {
-                    const mm_reg1_t& hit = regs[i];
-                    if (!hit.p || hit.rid < 0 || static_cast<size_t>(hit.rid) >= references.size()) continue;
-                    if (hit.mapq < params_.min_mapq || hit.parent != hit.id) continue;  // filter based on mapping quality
-                    const mm_extra_t* extra = static_cast<const mm_extra_t*>(hit.p);
-                    if (!extra || extra->n_cigar == 0) continue;
+            ComponentHit candidate;
+            candidate.rid = static_cast<uint32_t>(hit.rid);
+            candidate.ref_beg = static_cast<uint32_t>(hit.rs);
+            candidate.ref_end = static_cast<uint32_t>(hit.re);
+            candidate.raw_query_beg = static_cast<uint32_t>(hit.qs);
+            candidate.raw_query_end = static_cast<uint32_t>(hit.qe);
+            candidate.reverse = hit.rev;
+            candidate.query_beg = hit.rev ? static_cast<uint32_t>(query->sequence.size() - hit.qe) : candidate.raw_query_beg;
+            candidate.query_end = hit.rev ? static_cast<uint32_t>(query->sequence.size() - hit.qs) : candidate.raw_query_end;
+            candidate.matches = static_cast<uint32_t>(hit.mlen);
+            candidate.block_len = static_cast<uint32_t>(hit.blen);
+            candidate.mapq = hit.mapq;
+            candidate.cigar = CIGAR::to_string(extra->cigar, extra->n_cigar);
+            candidate.ops = CIGAR::parse(candidate.cigar);
+            if (candidate.ops.empty() || CIGAR::match_ratio(candidate.cigar) < params_.min_match_ratio) continue;  // filter based on match ratio
+            if (!CIGAR::mask_short_matches(candidate.ops, static_cast<uint32_t>(params_.min_eq))) continue;
 
-                    ComponentHit candidate;
-                    candidate.rid = static_cast<uint32_t>(hit.rid);
-                    candidate.ref_beg = static_cast<uint32_t>(hit.rs);
-                    candidate.ref_end = static_cast<uint32_t>(hit.re);
-                    candidate.raw_query_beg = static_cast<uint32_t>(hit.qs);
-                    candidate.raw_query_end = static_cast<uint32_t>(hit.qe);
-                    candidate.reverse = hit.rev;
-                    candidate.query_beg = hit.rev ? static_cast<uint32_t>(query->sequence.size() - hit.qe) : candidate.raw_query_beg;
-                    candidate.query_end = hit.rev ? static_cast<uint32_t>(query->sequence.size() - hit.qs) : candidate.raw_query_end;
-                    candidate.matches = static_cast<uint32_t>(hit.mlen);
-                    candidate.block_len = static_cast<uint32_t>(hit.blen);
-                    candidate.mapq = hit.mapq;
-                    candidate.cigar = CIGAR::to_string(extra->cigar, extra->n_cigar);
-                    candidate.ops = CIGAR::parse(candidate.cigar);
-                    if (candidate.ops.empty() || CIGAR::match_ratio(candidate.cigar) < params_.min_match_ratio) continue;  // filter based on match ratio
-                    if (!CIGAR::mask_short_matches(candidate.ops, static_cast<uint32_t>(params_.min_eq))) continue;
-
-                    const ComponentBackbone& ref = *references[candidate.rid];
-                    if (query_components && ref.component == query->component) continue;
-                    const uint32_t span = std::max(
-                        candidate.ref_end - candidate.ref_beg,
-                        candidate.query_end - candidate.query_beg
-                    );
-                    const uint64_t shorter = std::min(ref.sequence.size(), query->sequence.size());
-                    if (shorter > 0 && static_cast<double>(span) / shorter < params_.min_ali_ratio) continue;  // filter based on alignment ratio
-                    candidate.rid = ref.id;
-                    result.hits.push_back(std::move(candidate));
-                }
-                if (regs) {
-                    for (int i = 0; i < count; ++i) std::free(regs[i].p);
-                    std::free(regs);
-                }
-                mm_tbuf_destroy(buffer);
-                progress.hit();
-                return result;
-        })});
-
-        if (futures.size() >= max_pending) {
-            PendingMap pending = std::move(futures.front());
-            futures.pop_front();
-            MapResult result = pending.future.get();
-            std::vector<ComponentHit>& query_hits = all_hits[pending.query->id];
-            query_hits.insert(
-                query_hits.end(),
-                std::make_move_iterator(result.hits.begin()),
-                std::make_move_iterator(result.hits.end())
+            const ComponentBackbone& ref = *references[candidate.rid];
+            if (query_components && ref.component == query->component) continue;
+            const uint32_t span = std::max(
+                candidate.ref_end - candidate.ref_beg,
+                candidate.query_end - candidate.query_beg
             );
+            const uint64_t shorter = std::min(ref.sequence.size(), query->sequence.size());
+            if (shorter > 0 && static_cast<double>(span) / shorter < params_.min_ali_ratio) continue;  // filter based on alignment ratio
+            candidate.rid = ref.id;
+            result.hits.push_back(std::move(candidate));
         }
-    }
-    while (!futures.empty()) {
-        PendingMap pending = std::move(futures.front());
-        futures.pop_front();
-        MapResult result = pending.future.get();
-        std::vector<ComponentHit>& query_hits = all_hits[pending.query->id];
+        if (regs) {
+            for (int i = 0; i < count; ++i) std::free(regs[i].p);
+            std::free(regs);
+        }
+        mm_tbuf_destroy(buffer);
+        progress.hit();
+    });
+
+    for (size_t query_id = 0; query_id < queries.size(); ++query_id) {
+        std::vector<ComponentHit>& query_hits = all_hits[queries[query_id]->id];
+        MapResult& result = results[query_id];
         query_hits.insert(
             query_hits.end(),
             std::make_move_iterator(result.hits.begin()),

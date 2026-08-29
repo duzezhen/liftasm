@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.1.3-r30 (2026-08-28)
+
+### Added
+
+- Added VCF augmentation for renamed CTG inputs, overlapping variants, and sample-specific variant paths.
+- Added `MT`/`TF` bubble annotations and primary haplotype mosaic-focused graphs.
+
+### Fixed
+
+- Fixed stale repeat-path edges and boundary-node inflation of homologous alignment conflict groups.
+
+### Improved
+
+- Improved parallel scheduling to avoid FIFO head-of-line blocking.
+
 ## v0.1.3-r29 (2026-08-27)
 
 ### Improved
