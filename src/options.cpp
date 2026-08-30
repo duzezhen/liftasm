@@ -23,6 +23,7 @@ AlignmentOptions init_opts(const InitParams& params) {
     c.w = params.w;
     c.threads = params.threads;
     c.mid_occ_frac = 2e-4f;
+    c.max_mid_occ = 500;
     c.q_occ_frac = 0.01f;
     c.bw = 500;
     c.max_skip = 25;
@@ -109,8 +110,6 @@ void Preset::map_asm_5(ChainOpts& c, AnchorOpts& a, ExtendOpts& e, AlignOpts& al
     c.min_sc      = 10;
     c.chn_pen_gap = 3.0f;
     c.chn_pen_skip= 0.0f;
-    c.mid_occ_frac = 1e-3f;
-
     c.is_cdna = 0; c.n_seg = 1;
 
     a.small_gap  = 1.5e4;

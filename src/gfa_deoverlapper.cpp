@@ -532,6 +532,10 @@ std::vector<GfaDeoverlapper::MmWfaHit> GfaDeoverlapper::align_mm2_(
 
     opt.best_n = (short)alignment_options_.anchor.max_kept;
     opt.zdrop = alignment_options_.extend.dyn_zdrop;
+    opt.mid_occ_frac = alignment_options_.chain.mid_occ_frac;
+    opt.min_mid_occ = std::min(opt.min_mid_occ, alignment_options_.chain.max_mid_occ - 1);
+    opt.max_mid_occ = alignment_options_.chain.max_mid_occ;
+    opt.mid_occ = 0;
 
     const char* ref_seqs[1]  = { v_seq_slice.c_str() };
     const char* ref_names[1] = { v_name.c_str() };

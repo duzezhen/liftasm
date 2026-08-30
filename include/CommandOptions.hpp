@@ -118,6 +118,7 @@ struct CollapseOpts {
     int min_eq = 3;
     double min_match_ratio = 0.9;
     double min_ali_ratio = 0.001;
+    uint32_t min_ali_len = 10'000;  // minimum homologous alignment length; collapse only
     uint8_t min_mapq = 30;
     uint32_t trim_min_len = 5'000'000;
     double trim_max_overlap = 0.05;
@@ -263,6 +264,8 @@ struct MapOpts {
 
     bool use_wfa   = false; // whether to use WFA for alignment, if not use minimap2
 
+    double minimizer_freq = 2e-4;
+    int32_t max_occ = 100;
     int  zdrop     = 5e3;
     bool zdrop_set = false;
 

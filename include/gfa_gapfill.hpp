@@ -228,6 +228,8 @@ private:
         uint16_t k{25}, w{30};
         uint16_t best_n{5};
         int zdrop{5000};
+        float minimizer_freq{2e-4f};
+        int32_t max_occ{100};
         double min_match{0.9};
         double min_ali_ratio{0.05};
         uint8_t min_mapq{30};

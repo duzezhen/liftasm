@@ -81,6 +81,23 @@ protected:
     CollapseOpts collapser_params_;
     const minimizerdna::Options mm_opt_;     // Used to calculate Jaccard similarity between two homologous paths
 
+    static uint32_t aligned_length_(
+        uint32_t beg_a, uint32_t end_a,
+        uint32_t beg_b, uint32_t end_b
+    ) noexcept;
+
+    bool keep_homologous_alignment_(
+        uint32_t aligned_len,
+        uint64_t ref_len,
+        uint64_t qry_len
+    ) const noexcept;
+
+    void filter_short_homologous_alignments_(
+        std::vector<BubbleAlignment>& alignments,
+        uint64_t ref_len,
+        uint64_t qry_len
+    ) const;
+
 private:
     friend class LocalGraphComplexity;
     friend class GfaPathCycleGuard;

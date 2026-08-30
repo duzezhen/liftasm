@@ -860,6 +860,7 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_block_(cons
         block.a_beg, block.a_end,
         block.b_beg, block.b_end
     );
+    filter_short_homologous_alignments_(alignments, a_seq.size(), b_seq.size());
     CtgCollapseDebugger::alignment(*this, block, alignments.size());
     return alignments;
 }
@@ -1705,6 +1706,10 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
     map_options.flag |= MM_F_CIGAR | MM_F_EQX;
     map_options.best_n = static_cast<short>(alignment_options_.anchor.max_kept);
     map_options.zdrop = alignment_options_.extend.dyn_zdrop;
+    map_options.mid_occ_frac = alignment_options_.chain.mid_occ_frac;
+    map_options.min_mid_occ = std::min(map_options.min_mid_occ, alignment_options_.chain.max_mid_occ - 1);
+    map_options.max_mid_occ = alignment_options_.chain.max_mid_occ;
+    map_options.mid_occ = 0;
 
     SAVE paf(prefix + ".paf");
     SAVE paf_all(prefix + ".all.paf");
@@ -1817,6 +1822,13 @@ std::vector<GfaCtgCollapser::BubbleAlignment> GfaCtgCollapser::align_component_b
                 candidate.ref_end - candidate.ref_beg,
                 candidate.query_end - candidate.query_beg
             );
+            const uint32_t aligned_len = aligned_length_(
+                candidate.ref_beg, candidate.ref_end,
+                candidate.query_beg, candidate.query_end
+            );
+            if (!keep_homologous_alignment_(
+                aligned_len, ref.sequence.size(), query->sequence.size()
+            )) continue;
             const uint64_t shorter = std::min(ref.sequence.size(), query->sequence.size());
             if (shorter > 0 && static_cast<double>(span) / shorter < params_.min_ali_ratio) continue;  // filter based on alignment ratio
             candidate.rid = ref.id;

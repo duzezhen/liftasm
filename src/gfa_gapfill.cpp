@@ -141,6 +141,8 @@ GfaGapfill::GfaGapfill(GapfillOpts options) : params_(std::move(options)) {
     mm2_.w = params_.alignment_options.chain.w;
     mm2_.best_n = params_.alignment_options.anchor.max_kept;
     mm2_.zdrop = params_.alignment_options.extend.dyn_zdrop;
+    mm2_.minimizer_freq = params_.alignment_options.chain.mid_occ_frac;
+    mm2_.max_occ = params_.alignment_options.chain.max_mid_occ;
     mm2_.preset = params_.mm2_preset;
     mm2_.min_match = params_.min_match;
     mm2_.min_ali_ratio = params_.min_ali_ratio;
@@ -2322,6 +2324,10 @@ double GfaGapfill::mm2_similarity_(
     map_options.flag |= MM_F_CIGAR | MM_F_EQX;
     map_options.best_n = static_cast<short>(mm2_.best_n);
     map_options.zdrop = mm2_.zdrop;
+    map_options.mid_occ_frac = mm2_.minimizer_freq;
+    map_options.min_mid_occ = std::min(map_options.min_mid_occ, mm2_.max_occ - 1);
+    map_options.max_mid_occ = mm2_.max_occ;
+    map_options.mid_occ = 0;
 
     const char* reference_sequences[1] = {reference.c_str()};
     const char* reference_names[1] = {"gap"};
@@ -2595,6 +2601,10 @@ GfaGapfill::ChainRefs GfaGapfill::unmatched_small_primary_chains_(
     if (mm_set_opt(mm2_.preset.c_str(), &index_options, &default_map_options) < 0) return small_chains;
     index_options.k = static_cast<short>(mm2_.k);
     index_options.w = static_cast<short>(mm2_.w);
+    default_map_options.mid_occ_frac = mm2_.minimizer_freq;
+    default_map_options.min_mid_occ = std::min(default_map_options.min_mid_occ, mm2_.max_occ - 1);
+    default_map_options.max_mid_occ = mm2_.max_occ;
+    default_map_options.mid_occ = 0;
 
     // ------------------------------------------------ Check each haplotype separately ------------------------------------------------
     for (uint8_t hap = 0; hap < 2; ++hap) {

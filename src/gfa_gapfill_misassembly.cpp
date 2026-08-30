@@ -298,6 +298,10 @@ void GfaGapfillMisassembly::confirm_terminals_(const std::vector<uint32_t>& refe
         std::numeric_limits<short>::max(), std::max<size_t>(graph_.mm2_.best_n, terminals_.size())
     ));
     map_options.zdrop = graph_.mm2_.zdrop;
+    map_options.mid_occ_frac = graph_.mm2_.minimizer_freq;
+    map_options.min_mid_occ = std::min(map_options.min_mid_occ, graph_.mm2_.max_occ - 1);
+    map_options.max_mid_occ = graph_.mm2_.max_occ;
+    map_options.mid_occ = 0;
     mm_mapopt_update(&map_options, index);
 
     // Keep long, repetitive contigs from becoming single-thread bottlenecks.

@@ -1071,6 +1071,43 @@ void GfaCollapser::merge_linear_chains() {
 
 
 /* -------------------------------------------- Collapse Homologous Sequences -------------------------------------------- */
+uint32_t GfaCollapser::aligned_length_(
+    uint32_t beg_a, uint32_t end_a,
+    uint32_t beg_b, uint32_t end_b
+) noexcept {
+    return std::min(end_a - beg_a, end_b - beg_b);
+}
+
+bool GfaCollapser::keep_homologous_alignment_(
+    uint32_t aligned_len,
+    uint64_t ref_len,
+    uint64_t qry_len
+) const noexcept {
+    if (collapser_params_.min_ali_len == 0 || aligned_len >= collapser_params_.min_ali_len) return true;
+
+    const uint64_t shorter_len = std::min(ref_len, qry_len);
+    return shorter_len > 0 && shorter_len <= collapser_params_.min_ali_len &&
+        static_cast<double>(aligned_len) / shorter_len >= collapser_params_.min_jaccard;
+}
+
+void GfaCollapser::filter_short_homologous_alignments_(
+    std::vector<BubbleAlignment>& alignments,
+    uint64_t ref_len,
+    uint64_t qry_len
+) const {
+    if (collapser_params_.min_ali_len == 0) return;
+
+    alignments.erase(
+        std::remove_if(alignments.begin(), alignments.end(), [&](const BubbleAlignment& alignment) {
+            return !keep_homologous_alignment_(aligned_length_(
+                alignment.beg_a, alignment.end_a,
+                alignment.beg_b, alignment.end_b
+            ), ref_len, qry_len);
+        }),
+        alignments.end()
+    );
+}
+
 std::vector<GfaCollapser::BubbleAlignment> GfaCollapser::align_subpaths_(
     const std::vector<uint32_t>& subA,
     const std::vector<uint32_t>& subB,
@@ -1354,6 +1391,7 @@ std::vector<GfaCollapser::BubbleAlignment> GfaCollapser::align_subpaths_(
         0, static_cast<uint32_t>(seq_a.size()),
         0, static_cast<uint32_t>(seq_b.size())
     );
+    filter_short_homologous_alignments_(big, seq_a.size(), seq_b.size());
 
     const std::vector<uint64_t> repeat_mask_a = build_tandem_repeat_mask_(seq_a, collapser_params_.repeat_mask_min_len, collapser_params_.repeat_mask_max_period, collapser_params_.repeat_mask_max_mismatch);
     const std::vector<uint64_t> repeat_mask_b = build_tandem_repeat_mask_(seq_b, collapser_params_.repeat_mask_min_len, collapser_params_.repeat_mask_max_period, collapser_params_.repeat_mask_max_mismatch);

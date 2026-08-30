@@ -413,6 +413,7 @@ void run_gapfill(int argc, char** argv, const std::string& command_line)
             cfg.gapfill.min_ali_ratio
         );
         collapse_params.min_mapq = cfg.gapfill.min_mapq;
+        collapse_params.min_ali_len = 0;
         GfaCtgCollapser collapser(std::move(collapse_params));
         collapser.set_opts(graph_alignment_options(cfg));
         collapser.set_complex_marking(false);

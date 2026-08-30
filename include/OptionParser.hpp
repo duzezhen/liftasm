@@ -18,7 +18,7 @@ void help_gfa2fa(char** argv);
 
 // compute depth information from sequencing data for a GFA
 AppConfig main_depth(int argc, char** argv);
-void help_depth(char** argv);
+void help_depth(char** argv, bool advanced=false);
 
 // identify bubble in graph
 AppConfig main_bubble(int argc, char** argv);
@@ -46,7 +46,7 @@ void help_mapq_boost(char** argv, bool advanced=false);
 
 // align reads to graph (requires no-overlap graph, output by collapse)
 AppConfig main_align(int argc, char** argv);
-void help_align(char** argv);
+void help_align(char** argv, bool advanced=false);
 
 // restrict cuts
 AppConfig main_res_cut(int argc, char** argv);
@@ -62,10 +62,10 @@ void help_augment(char** argv, bool advanced=false);
 
 // remove weak UTG links using contig read components
 AppConfig main_clean(int argc, char** argv);
-void help_clean(char** argv);
+void help_clean(char** argv, bool advanced=false);
 
 // fill sample contig gaps from cross-sample paths
 AppConfig main_gapfill(int argc, char** argv);
-void help_gapfill(char** argv);
+void help_gapfill(char** argv, bool advanced=false);
 
 void finalize_opt_cfg(AppConfig& cfg);
