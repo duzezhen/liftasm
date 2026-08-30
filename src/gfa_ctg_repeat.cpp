@@ -7,9 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <deque>
-#include <future>
 #include <map>
-#include <numeric>
 #include <unordered_set>
 
 namespace {
@@ -247,32 +245,26 @@ void CtgRepeatNormalizer::annotate_paths_() {
         return;
     }
 
-    // Bound temporary sequence and bit-mask memory while still processing contigs in parallel.
-    constexpr uint64_t memory_budget = 512ULL << 20;
+    // Bound temporary sequence and bit-mask memory while processing contigs in parallel.
+    constexpr uint64_t memory_budget = 100ULL << 30;  // Max memory budget (100 GB)
     const uint64_t bytes_per_worker = max_path_length + ((max_path_length + 7) >> 3) + 1;
-    const uint32_t memory_workers = static_cast<uint32_t>(std::max<uint64_t>(1, memory_budget / bytes_per_worker));
-    const uint32_t threads = std::max<uint32_t>(1, std::min<uint32_t>(bubble_options_.threads, memory_workers));
+    const size_t threads = static_cast<size_t>(std::max<uint64_t>(
+        1, std::min<uint64_t>(bubble_options_.threads, memory_budget / bytes_per_worker)
+    ));
 
     ThreadPool pool(threads);
     ProgressTracker progress(path_ids.size());
-    std::vector<std::future<std::pair<size_t, PathAnnotation>>> futures;
-    futures.reserve(path_ids.size());
-
-    for (size_t path_id : path_ids) {
-        futures.emplace_back(pool.submit([this, path_id, &progress]() {
-            PathAnnotation annotation = annotate_path_(path_id);
-            progress.hit();
-            return std::make_pair(path_id, std::move(annotation));
-        }));
-    }
-    size_t annotated = 0;
-    for (auto& future : futures) {
-        auto result = future.get();
-        annotated += result.second.valid;
-        annotations_[result.first] = std::move(result.second);
-    }
+    pool.parallel_for(path_ids.size(), [this, &path_ids, &progress](size_t index) {
+        const size_t path_id = path_ids[index];
+        annotations_[path_id] = annotate_path_(path_id);
+        progress.hit();
+    });
     pool.stop();
     progress.finish();
+
+    const size_t annotated = std::count_if(path_ids.begin(), path_ids.end(), [this](size_t path_id) {
+        return annotations_[path_id].valid;
+    });
     log_stream() << "  - Contig paths annotated: " << annotated << "\n\n";
 }
 

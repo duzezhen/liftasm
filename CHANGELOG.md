@@ -1,11 +1,15 @@
 # Changelog
 
-## v0.1.3-r31 (2026-08-29)
+## v0.1.3-r31 (2026-08-30)
 
 ### Added
 
 - Added `--min_freq` and `--max_occ` to filter frequent minimizers and speed up alignment.
 - Added `--min_ali_len` to filter short, potentially false alignments.
+
+### Improved
+
+- Increased the tandem-repeat annotation memory limit to 100 GiB and improved parallel path scheduling.
 
 ## v0.1.3-r30 (2026-08-28)
 
