@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.3-r32 (2026-09-01)
+
+### Improved
+
+- Simplified standalone VCF augmentation with optional genotype-derived `SN` and `INFO/MT`-derived `VT` tags.
+- Added haploid, diploid, and polyploid genotype support while retaining reference-allele samples in bubbles.
+
 ## v0.1.3-r31 (2026-08-30)
 
 ### Added

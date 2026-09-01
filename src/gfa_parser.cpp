@@ -2210,7 +2210,7 @@ void GfaGraph::save_to_disk(
     oss << "H\tCO:Z:  LN:i   segment length\n";
     oss << "H\tCO:Z:  CX:i   complex node flag\n";
     oss << "H\tCO:Z:  SN:Z   node source/sample names\n";
-    oss << "H\tCO:Z:  VT:Z   VCF-added variant category (--tag value)\n";
+    oss << "H\tCO:Z:  VT:Z   VCF allele category from INFO/MT\n";
     oss << "H\tCO:Z:  VI:Z   VCF variant ID\n";
     oss << "H\tCO:Z:  GF:Z   gap-filled intervals (0-based, half-open)\n";
     saver.save(oss.str());

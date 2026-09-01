@@ -26,32 +26,24 @@ static std::vector<uint32_t> common_samples(
     return out;
 }
 
-static bool node_has_variant_type(const GfaGraph& graph, uint32_t sid, std::string_view type)
+static bool node_is_vcf_variant(const GfaGraph& graph, uint32_t sid)
 {
     const GfaNode* node = graph.getNode(sid);
     if (!node || graph.getNodeDeleted(sid)) return false;
 
     const uint8_t* tag = GfaAuxParser::get_aux_data(node->aux.aux_data, "VT");
-    if (!tag || *tag != 'Z') return false;
-
-    const std::string_view values(reinterpret_cast<const char*>(tag + 1));
-    size_t begin = 0;
-    while (begin <= values.size()) {
-        const size_t end = values.find(',', begin);
-        if (values.substr(begin, end == std::string_view::npos ? values.size() - begin : end - begin) == type) {
-            return true;
-        }
-        if (end == std::string_view::npos) break;
-        begin = end + 1;
-    }
-    return false;
+    return tag && *tag == 'Z' && *(tag + 1) != '\0';
 }
 
 static bool is_haplotype_sample(const GfaGraph& graph, uint32_t sample)
 {
     if (sample >= graph.getSampleNames().size()) return false;
     const std::string& name = graph.getSampleNames()[sample];
-    return name.ends_with(".hap1") || name.ends_with(".hap2");
+    const size_t marker = name.rfind(".hap");
+    return marker != std::string::npos && marker + 4 < name.size() &&
+        std::all_of(name.begin() + marker + 4, name.end(), [](unsigned char c) {
+            return std::isdigit(c);
+        });
 }
 
 GfaBubbleFinder::GfaBubbleFinder(const GfaGraph& graph, BubbleOpts params)
@@ -592,12 +584,10 @@ std::vector<std::vector<uint32_t>> GfaBubbleFinder::enumerate_vcf_paths_(
 
     for (uint32_t vertex : region_set) {
         const uint32_t sid = Vertex::get_segment_id(vertex);
-        if (vertex == source || vertex == sink || !node_has_variant_type(graph_, sid, "V")) continue;
+        if (vertex == source || vertex == sink || !node_is_vcf_variant(graph_, sid)) continue;
         if (!variants.insert(sid).second) continue;
 
-        for (uint32_t sample : graph_.getNodeSampleIds(sid)) {
-            if (is_haplotype_sample(graph_, sample)) samples.push_back(sample);
-        }
+        for (uint32_t sample : graph_.getNodeSampleIds(sid)) samples.push_back(sample);
     }
 
     std::sort(samples.begin(), samples.end());
@@ -4722,10 +4712,8 @@ std::vector<MosaicSite> BubbleWriter::save_vcf(
             std::vector<uint32_t> vcf_samples;
             for (uint32_t vertex : path) {
                 const uint32_t sid = Vertex::get_segment_id(vertex);
-                if (sid == src_seg || sid == sink_seg || !node_has_variant_type(graph_, sid, "V")) continue;
-                for (uint32_t sample : graph_.getNodeSampleIds(sid)) {
-                    if (is_haplotype_sample(graph_, sample)) vcf_samples.push_back(sample);
-                }
+                if (sid == src_seg || sid == sink_seg || !node_is_vcf_variant(graph_, sid)) continue;
+                for (uint32_t sample : graph_.getNodeSampleIds(sid)) vcf_samples.push_back(sample);
             }
 
             std::sort(vcf_samples.begin(), vcf_samples.end());

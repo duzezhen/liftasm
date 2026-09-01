@@ -759,24 +759,16 @@ static void validate_and_print(int argc, char** argv, AppConfig& cfg) {
 
         case ToolMode::augment:
             ensure(
-                !cfg.augment.gfa_files.empty(), 
+                !cfg.augment.gfa_file.empty(),
                 "-g/--gfa is required"
             );
             ensure(
-                !cfg.augment.vcf_files.empty(), 
+                !cfg.augment.vcf_file.empty(),
                 "-v/--vcf is required"
             );
             ensure(
-                cfg.augment.gfa_names.empty() || cfg.augment.gfa_names.size() == cfg.augment.gfa_files.size(),
-                   "-n/--name must have the same number of values as -g/--gfa"
-                );
-            ensure(
                 !cfg.augment.prefix.empty(), 
                 "-p/--prefix is required"
-            );
-            ensure(
-                !cfg.augment.tag.empty(), 
-                "--tag must not be empty"
             );
             ensure(
                 cfg.collapse.min_match_ratio >= 0.0 && cfg.collapse.min_match_ratio <= 1.0,
@@ -3284,18 +3276,18 @@ AppConfig main_split(int argc, char** argv) {
 void help_augment(char** argv, bool advanced) {
     HelpPrinter hp(std::cerr, 20, 13);
     std::cerr
-        << "Usage: " << argv[0] << " " << argv[1] << " -g FILE ... -v FILE ... [options]\n\n"
+        << "Usage: " << argv[0] << " " << argv[1] << " -g FILE -v FILE [options]\n\n"
         << "Augment GFA segments with VCF alleles as variant bubbles\n";
 
     hp.blank();
 
     hp.section("Input/Output");
-    hp.line("-g, --gfa", "FILE ...", "input GFA file(s)");
-    hp.line("-n, --name", "STR ...", "sample names; otherwise reuse liftasm tags or use filename prefixes");
-    hp.line("-v, --vcf", "FILE ...", "input VCF or VCF.GZ file(s)");
+    hp.line("-g, --gfa", "FILE", "input GFA file");
+    hp.line("-v, --vcf", "FILE", "input VCF or VCF.GZ file");
     hp.line("-p, --prefix", "STR", "output prefix [" + AugmentOpts().prefix + "]");
     hp.note(" * <prefix>.augment.{gfa,noseq.gfa,map}");
-    hp.line("--tag", "STR", "VT:Z tag value written on augmented ALT nodes [" + AugmentOpts().tag + "]");
+    hp.note(" * all literal ALT alleles are added; SN tags use VCF genotypes when present");
+    hp.note(" * VCF INFO/MT values are written as VT:Z tags on allele nodes");
     
     hp.blank();
     
@@ -3344,10 +3336,8 @@ AppConfig main_augment(int argc, char** argv) {
     cfg.mode = ToolMode::augment;
     const struct option long_opts[] = {
         {"gfa",           required_argument, nullptr, 'g'},
-        {"name",          required_argument, nullptr, 'n'},
         {"vcf",           required_argument, nullptr, 'v'},
         {"prefix",        required_argument, nullptr, 'p'},
-        {"tag",           required_argument, nullptr, 0001},
 
         {"kmer",          required_argument, nullptr, 'k'},
         {"window",        required_argument, nullptr, 'w'},
@@ -3370,35 +3360,23 @@ AppConfig main_augment(int argc, char** argv) {
         {"advanced",      no_argument,      nullptr, 'H'},
         {0,0,0,0}
     };
-    const char* short_opts = "g:n:v:p:k:w:x:z:t:dhH";
+    const char* short_opts = "g:v:p:k:w:x:z:t:dhH";
 
     int idx = 0, c;
     while ((c = getopt_long(argc, argv, short_opts, long_opts, &idx)) != -1) {
         switch (c) {
             case 'g': {
-                cfg.augment.gfa_files.emplace_back(optarg);
-                while (optind < argc && !is_flag_(argv[optind])) cfg.augment.gfa_files.emplace_back(argv[optind++]);
-                break;
-            }
-            case 'n': {
-                cfg.augment.gfa_names.emplace_back(optarg);
-                while (optind < argc && !is_flag_(argv[optind])) cfg.augment.gfa_names.emplace_back(argv[optind++]);
+                cfg.augment.gfa_file = optarg;
                 break;
             }
             case 'v': {
-                cfg.augment.vcf_files.emplace_back(optarg);
-                while (optind < argc && !is_flag_(argv[optind])) cfg.augment.vcf_files.emplace_back(argv[optind++]);
+                cfg.augment.vcf_file = optarg;
                 break;
             }
             case 'p': {
                 cfg.augment.prefix = optarg; 
                 break;
             }
-            case 0001: {
-                cfg.augment.tag = optarg; 
-                break;
-            }
-
             case 'k': {
                 cfg.global.kmerLen = std::max(1, std::stoi(optarg)); 
                 break;

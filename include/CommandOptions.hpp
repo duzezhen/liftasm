@@ -290,11 +290,9 @@ struct SplitOpts {
 };
 
 struct AugmentOpts {
-    std::vector<std::string> gfa_files;
-    std::vector<std::string> gfa_names;
-    std::vector<std::string> vcf_files;
+    std::string gfa_file;
+    std::string vcf_file;
     std::string prefix = "out";
-    std::string tag = "VCF";
 };
 
 struct CleanOpts {

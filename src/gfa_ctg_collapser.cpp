@@ -1194,9 +1194,9 @@ void GfaCtgCollapser::collapse_ctgs(
 
     Stats variant_stats;
     if (!vcf_files.empty()) {
-        variant_stats = read_vcfs_(vcf_files);
+        variant_stats = read_vcfs_(vcf_files, VcfSampleMode::SourceNode);
         sort_variants_();
-        create_alt_nodes_("V");
+        create_alt_nodes_();
         variant_stats.alleles = alt_nodes_.size();
     }
 

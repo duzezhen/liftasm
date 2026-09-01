@@ -43,13 +43,20 @@ std::vector<CIGAR::COp> allele_ops(uint32_t ref_len, uint32_t alt_len) {
 
 } // namespace
 
-GfaAugmenter::Stats GfaAugmenter::read_vcfs_(const std::vector<std::string>& files) {
+GfaAugmenter::Stats GfaAugmenter::read_vcfs_(
+    const std::vector<std::string>& files,
+    VcfSampleMode sample_mode
+) {
     variants_.assign(nodes_.size(), {});
     Stats stats;
+    const bool read_genotypes = sample_mode == VcfSampleMode::Genotype;
 
     for (const std::string& file : files) {
         kvcf::Reader reader(file);
         kvcf::Record rec;
+        std::vector<uint32_t> sample_ids;
+        std::vector<std::vector<uint32_t>> haplotype_ids;
+
         while (reader.next(rec)) {
             uint32_t sid = UINT32_MAX;
             const auto original_it = original_name_to_id_.find(rec.chrom);
@@ -95,7 +102,70 @@ GfaAugmenter::Stats GfaAugmenter::read_vcfs_(const std::vector<std::string>& fil
                 std::exit(1);
             }
 
-            variants_[sid].push_back({beg, end, rec.id, ref, rec.alts});
+            const bool mt_is_ref = rec.mutation_types.size() == rec.alts.size() + 1;
+            const bool mt_is_alt = rec.mutation_types.size() == rec.alts.size();
+
+            std::vector<AltInput> alts;
+            alts.reserve(rec.alts.size());
+            for (size_t i = 0; i < rec.alts.size(); ++i) {
+                const size_t mt_index = i + (mt_is_ref ? 1 : 0);
+                std::string type;
+                if (mt_is_ref || mt_is_alt) type = rec.mutation_types[mt_index];
+                alts.push_back({
+                    rec.alts[i],
+                    read_genotypes ? std::vector<uint32_t>{} : node.sample_ids,
+                    std::move(type)
+                });
+            }
+
+            std::vector<uint32_t> ref_sample_ids;
+            std::string ref_type;
+            if (read_genotypes) {
+                const std::vector<std::string>& samples = reader.samples();
+                if (sample_ids.empty()) {
+                    sample_ids.assign(samples.size(), UINT32_MAX);
+                    haplotype_ids.resize(samples.size());
+                }
+                for (const kvcf::AlleleCall& call : rec.allele_calls) {
+                    if (call.sample >= samples.size() || call.allele > alts.size()) {
+                        error_stream() << file + ":" + std::to_string(rec.line_no) + ": GT allele exceeds the ALT count" << std::endl;
+                        std::exit(1);
+                    }
+
+                    uint32_t id = UINT32_MAX;
+                    if (call.ploidy == 1) {
+                        id = sample_ids[call.sample];
+                        if (id == UINT32_MAX) {
+                            id = sample_ids[call.sample] = intern_sample_(samples[call.sample]);
+                        }
+                    } else {
+                        std::vector<uint32_t>& ids = haplotype_ids[call.sample];
+                        if (ids.size() <= call.haplotype) ids.resize(call.haplotype + 1, UINT32_MAX);
+                        id = ids[call.haplotype];
+                        if (id == UINT32_MAX) {
+                            id = ids[call.haplotype] = intern_sample_(
+                                samples[call.sample] + ".hap" + std::to_string(call.haplotype + 1)
+                            );
+                        }
+                    }
+                    std::vector<uint32_t>& ids = call.allele == 0 ?
+                        ref_sample_ids : alts[call.allele - 1].sample_ids;
+                    ids.push_back(id);
+                }
+
+                std::sort(ref_sample_ids.begin(), ref_sample_ids.end());
+                ref_sample_ids.erase(std::unique(ref_sample_ids.begin(), ref_sample_ids.end()), ref_sample_ids.end());
+                for (AltInput& alt : alts) {
+                    std::sort(alt.sample_ids.begin(), alt.sample_ids.end());
+                    alt.sample_ids.erase(std::unique(alt.sample_ids.begin(), alt.sample_ids.end()), alt.sample_ids.end());
+                }
+                if (mt_is_ref) ref_type = rec.mutation_types.front();
+            }
+
+            variants_[sid].push_back({
+                beg, end, rec.id, ref,
+                std::move(ref_sample_ids), std::move(ref_type), std::move(alts)
+            });
             ++stats.records;
         }
     }
@@ -110,23 +180,24 @@ void GfaAugmenter::sort_variants_() {
     }
 }
 
-void GfaAugmenter::create_alt_nodes_(const std::string& tag) {
+void GfaAugmenter::create_alt_nodes_() {
     alt_nodes_.clear();
     uint64_t serial = 1;
 
     for (uint32_t sid = 0; sid < variants_.size(); ++sid) {
         for (const VariantInput& variant : variants_[sid]) {
-            for (const std::string& raw_alt : variant.alts) {
-                const std::string alt = upper(raw_alt);
+            for (const AltInput& input : variant.alts) {
+                const std::string alt = upper(input.sequence);
                 if (alt == variant.ref) continue;
 
                 std::string temporary_name;
                 do { temporary_name = "__fuguasm_vcf_" + std::to_string(serial++); }
                 while (name_to_id_map_.find(temporary_name) != name_to_id_map_.end());
 
-                const std::vector<uint32_t> sample_ids = nodes_[sid].sample_ids;
-                const uint32_t alt_sid = add_segment(temporary_name, alt, true, sample_ids);
-                GfaAuxParser::append_str_tag(nodes_[alt_sid].aux.aux_data, "VT", tag);
+                const uint32_t alt_sid = add_segment(temporary_name, alt, true, input.sample_ids);
+                if (!input.type.empty()) {
+                    GfaAuxParser::append_str_tag(nodes_[alt_sid].aux.aux_data, "VT", input.type);
+                }
                 if (!variant.id.empty() && variant.id != ".") {
                     GfaAuxParser::append_str_tag(nodes_[alt_sid].aux.aux_data, "VI", variant.id);
                 }
@@ -152,31 +223,59 @@ void GfaAugmenter::inject_variant_alignments_() {
     }
 }
 
-void GfaAugmenter::connect_alt_nodes_(const SegReplace::Expander& expander) {
+uint32_t GfaAugmenter::materialized_vertex_(SegReplace::Seg interval) const {
     gfaName namer;
+    const uint32_t sid = static_cast<uint32_t>(SegReplace::Interval::seg_id(interval));
+    if (sid >= nodes_.size()) {
+        error_stream() << "invalid canonical VCF interval segment" << std::endl;
+        std::exit(1);
+    }
 
-    auto materialized_vertex = [&](SegReplace::Seg interval) -> uint32_t {
-        const uint32_t sid = static_cast<uint32_t>(SegReplace::Interval::seg_id(interval));
-        if (sid >= nodes_.size()) {
-            error_stream() << "invalid canonical VCF interval segment" << std::endl;
+    uint32_t output_sid = sid;
+    const uint32_t beg = SegReplace::Interval::beg(interval);
+    const uint32_t end = SegReplace::Interval::end(interval);
+    if (beg != 0 || end != nodes_[sid].length) {
+        const std::string name = namer.format_interval_name(nodes_[sid].name, beg, end, false);
+        const auto it = name_to_id_map_.find(name);
+        if (it == name_to_id_map_.end()) {
+            error_stream() << "canonical VCF interval was not materialized: " + name << std::endl;
             std::exit(1);
         }
-        const uint32_t beg = SegReplace::Interval::beg(interval);
-        const uint32_t end = SegReplace::Interval::end(interval);
-        const bool rev = SegReplace::Interval::is_reverse(interval);
+        output_sid = static_cast<uint32_t>(it->second);
+    }
+    return Vertex::make_vertex(output_sid, SegReplace::Interval::is_reverse(interval));
+}
 
-        uint32_t output_sid = sid;
-        if (beg != 0 || end != nodes_[sid].length) {
-            const std::string name = namer.format_interval_name(nodes_[sid].name, beg, end, false);
-            const auto it = name_to_id_map_.find(name);
-            if (it == name_to_id_map_.end()) {
-                error_stream() << "canonical VCF interval was not materialized: " + name << std::endl;
+void GfaAugmenter::annotate_ref_nodes_(const SegReplace::Expander& expander) {
+    for (uint32_t sid = 0; sid < variants_.size(); ++sid) {
+        const std::vector<uint32_t>& cuts = cuts_[sid].v;
+        for (const VariantInput& variant : variants_[sid]) {
+            if (variant.ref_sample_ids.empty()) continue;
+
+            const auto first = std::lower_bound(cuts.begin(), cuts.end(), variant.beg);
+            const auto last = std::lower_bound(cuts.begin(), cuts.end(), variant.end);
+            if (first == cuts.end() || last == cuts.end() || *first != variant.beg || *last != variant.end) {
+                error_stream() << "missing VCF interval cut points" << std::endl;
                 std::exit(1);
             }
-            output_sid = static_cast<uint32_t>(it->second);
+
+            GfaAux tags;
+            if (!variant.ref_type.empty()) {
+                GfaAuxParser::append_str_tag(tags.aux_data, "VT", variant.ref_type);
+            }
+            for (auto cut = first; cut != last; ++cut) {
+                const SegReplace::Seg piece = SegReplace::Interval::pack(sid, *cut, *std::next(cut), false);
+                for (SegReplace::Seg interval : expander.query(piece)) {
+                    GfaNode& node = nodes_[Vertex::get_segment_id(materialized_vertex_(interval))];
+                    merge_sample_ids_into(node.sample_ids, variant.ref_sample_ids);
+                    if (!variant.ref_type.empty()) merge_variant_tags_into(node.aux, tags);
+                }
+            }
         }
-        return Vertex::make_vertex(output_sid, rev);
-    };
+    }
+}
+
+void GfaAugmenter::connect_alt_nodes_(const SegReplace::Expander& expander) {
 
     for (const AltNode& alt : alt_nodes_) {
         const auto& cuts = cuts_[alt.ref_sid].v;
@@ -201,8 +300,8 @@ void GfaAugmenter::connect_alt_nodes_(const SegReplace::Expander& expander) {
             std::exit(1);
         }
 
-        const uint32_t first = materialized_vertex(first_expansion.front());
-        const uint32_t last = materialized_vertex(last_expansion.back());
+        const uint32_t first = materialized_vertex_(first_expansion.front());
+        const uint32_t last = materialized_vertex_(last_expansion.back());
         const uint32_t alt_vertex = Vertex::make_vertex(alt.alt_sid, false);
 
         std::vector<uint32_t> incoming;
@@ -255,26 +354,21 @@ void GfaAugmenter::run_augment_pipeline_(const std::string& prefix) {
     SegReplace::Expander expander = build_SegReplace_();
     expander.save_map(prefix + ".augment.map");
     expand_and_rewire_edges_(expander);
+    annotate_ref_nodes_(expander);
     connect_alt_nodes_(expander);
     remove_unused_nodes_();
 }
 
 GfaAugmenter::Stats GfaAugmenter::augment(
-    const std::vector<std::string>& files,
-    const std::string& prefix,
-    const std::string& tag
+    const std::string& file,
+    const std::string& prefix
 ) {
     log_stream() << "Augmenting GFA graph with VCF ALT alleles ...\n\n";
 
-    if (tag.empty() || tag.find_first_of("\t\r\n") != std::string::npos) {
-        error_stream() << "variant tag must be non-empty and contain no tabs or newlines" << std::endl;
-        std::exit(1);
-    }
-
-    Stats stats = read_vcfs_(files);
+    Stats stats = read_vcfs_({file}, VcfSampleMode::Genotype);
     if (stats.records == 0) return stats;
     sort_variants_();
-    create_alt_nodes_(tag);
+    create_alt_nodes_();
     stats.alleles = alt_nodes_.size();
     stats.split_segments = std::count_if(variants_.begin(), variants_.end(), [](const auto& v) { return !v.empty(); });
     if (alt_nodes_.empty()) return stats;

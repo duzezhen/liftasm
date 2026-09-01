@@ -548,8 +548,8 @@ void run_augment(int argc, char** argv, const std::string& command_line)
     AppConfig cfg = main_augment(argc, argv);
     GfaAugmenter G(cfg.collapse);
     G.set_opts(graph_alignment_options(cfg));
-    G.load_from_GFA(cfg.augment.gfa_files, cfg.augment.gfa_names);
-    G.augment(cfg.augment.vcf_files, cfg.augment.prefix, cfg.augment.tag);
+    G.load_from_GFA({cfg.augment.gfa_file});
+    G.augment(cfg.augment.vcf_file, cfg.augment.prefix);
     G.save_to_disk(cfg.augment.prefix + ".augment.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/true, command_line);
     G.save_to_disk(cfg.augment.prefix + ".augment.noseq.gfa", /*write_paths=*/false, /*write_align=*/false, /*write_seq=*/false, command_line);
 }
