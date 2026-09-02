@@ -2322,7 +2322,7 @@ void help_file2map(char** argv) {
         << "convert GFA/PAF to map format for liftover\n\n"
         << "PAF input notes:\n"
         << "  * For PAF input, generate PAF with minimap2 in 1-to-1 mode:\n"
-        << "     - minimap2 -t8 --eqx -cx asm5 --secondary=no reference.fa query.fa > aln.paf\n"
+        << "     - minimap2 -t8 --eqx -cx asm5 --secondary=no reference.fa query.fa -o aln.paf\n"
         << "  * IMPORTANT: reference and query sequence names must be different.\n"
         << "     - For example, avoid using the same name like 'chr1' in both files.\n"
         << "       Rename them to something like 'chr1_ref' and 'chr1_qry'.\n"

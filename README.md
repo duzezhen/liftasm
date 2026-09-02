@@ -174,10 +174,15 @@ liftasm liftover \
 `mapq_boost` is used when reads are aligned to their own diploid genome and homologous sequence between haplotypes causes MAPQ to fall to 0. It uses a homology map to correct this homology-driven ambiguity. The input must contain all secondary alignments for each read, either as separate secondary records or in alternative-alignment tags such as BWA's `XA`. Alignments for the same read must be adjacent; use `samtools sort -n` if necessary.
 
 ```bash
+# Align hap2 to hap1 and convert the PAF to a homology map
+minimap2 -t8 --eqx -cx asm5 --secondary=no hap1.fa hap2.fa -o hap1_hap2.paf
+liftasm file2map -i hap1_hap2.paf -o hap1_hap2.map
+
+# Sort the read alignments by read name, then boost MAPQ
 samtools sort -n -@ 8 -o reads.namesort.bam reads.bam
 liftasm mapq_boost \
   -t 8 --io_threads 8 --name_check \
-  -m out.iter1.collapse.map out.iter2.collapse.map out.iter3.collapse.map \
+  -m hap1_hap2.map \
   -i reads.namesort.bam \
   -o reads.boosted.bam
 ```
